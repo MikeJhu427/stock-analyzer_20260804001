@@ -153,8 +153,6 @@ def get_stock_data(symbol):
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 st.title("📈 台股 K線型態與位階深度解析系統")
 
-import streamlit as st
-
 # 隱藏右上角工具列（包含 GitHub 連結）
 st.markdown(
     """
@@ -164,7 +162,6 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
 
 tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場掃描 (低檔反轉+背離)"])
 
@@ -391,15 +388,15 @@ with tab2:
         st.markdown("**1. 基礎掃描參數**")
         col_a, col_b, col_c = st.columns(3)
         with col_a:
-            # 修改為區間設定
+            # 將最大值放寬至 1000
             lookback_end = st.number_input(
                 "掃描區間：從幾天前起算？ (最新為 0)", 
-                min_value=0, max_value=50, value=0, step=1,
+                min_value=0, max_value=1000, value=0, step=1,
                 help="例如設定 0 表示從最新交易日開始往回掃描。"
             )
             lookback_start = st.number_input(
                 "掃描區間：最多回推至幾天前？", 
-                min_value=0, max_value=50, value=0, step=1,
+                min_value=0, max_value=1000, value=0, step=1,
                 help="若此數值大於起算天數，系統會掃描該段期間(多日)內任何曾觸發反轉訊號的股票。"
             )
             # 防呆：確保回推天數 >= 起算天數
@@ -436,14 +433,41 @@ with tab2:
 
     st.markdown("---")
     
-    if st.button("🚀 開始智慧區間掃描 (需時約 1~2 分鐘)", type="primary"):
+    if st.button("🚀 開始智慧區間掃描", type="primary"):
+        # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數)
+        buffer_days = div_older_w + 30 
+        total_needed_days = lookback_start + buffer_days
+        
+        # 根據所需天數，決定 yfinance 下載的 period，避免抓取過多無用資料
+        if total_needed_days <= 60:
+            dl_period = "3mo"
+        elif total_needed_days <= 120:
+            dl_period = "6mo"
+        elif total_needed_days <= 250:
+            dl_period = "1y"
+        elif total_needed_days <= 500:
+            dl_period = "2y"
+        elif total_needed_days <= 1250:
+            dl_period = "5y"
+        else:
+            dl_period = "10y"
+            
+        # 針對 60分K 動態優化 (最高限制為 730d)
+        if total_needed_days <= 60:
+            dl_period_60m = "3mo"
+        elif total_needed_days <= 120:
+            dl_period_60m = "6mo"
+        else:
+            dl_period_60m = "730d"
+
         stock_dict = get_all_tw_stocks()
         if not stock_dict:
             st.error("❌ 無法取得台股清單，請檢查網路連線。")
         else:
             tickers = list(stock_dict.keys())
-            reversal_candidates = {} # 改用 dict 來避免同一檔股票重複入選
+            reversal_candidates = {} 
             
+            st.info(f"💡 系統偵測您的回推設定，自動將資料下載區間最佳化為：**{dl_period}**，以提升掃描效率。")
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -455,7 +479,8 @@ with tab2:
                 chunk = tickers[i:i+chunk_size]
                 status_text.text(f"[階段一] 正在全市場區間掃描：進度 {i} / {len(tickers)} 檔...")
                 try:
-                    data = yf.download(chunk, period="3mo", threads=True, progress=False)
+                    # 使用動態算出的 dl_period 取代固定的 "5y" 或 "3mo"
+                    data = yf.download(chunk, period=dl_period, threads=True, progress=False)
                     for ticker in chunk:
                         try:
                             if len(chunk) == 1:
@@ -469,7 +494,7 @@ with tab2:
                                     'Volume': data['Volume'][ticker]
                                 }).dropna()
                             
-                            # 確保資料長度足夠涵蓋掃描區間
+                            # 確保資料長度足夠涵蓋掃描區間與緩衝天數
                             if len(df) <= lookback_start + 20: 
                                 continue
                                 
@@ -546,14 +571,14 @@ with tab2:
                 for idx, item in enumerate(reversal_list):
                     try:
                         ticker = item.pop("_Full_Ticker")
-                        # 依照每一檔觸發訊號的那天去截斷未來的 K 線
                         specific_offset = item.pop("_Offset") 
                         
-                        # 1. 處理日K背離
-                        daily_df = yf.Ticker(ticker).history(period="6mo")
+                        # 1. 處理日K背離 (套用動態算出的 dl_period)
+                        daily_df = yf.Ticker(ticker).history(period=dl_period)
                         if daily_df.empty:
                             continue
-                            
+                        
+                        # 【重要】把指定的歷史那一天當作「今天」，將該天以後的未來資料全數截掉
                         if specific_offset > 0 and len(daily_df) > specific_offset:
                             daily_df = daily_df.iloc[:-specific_offset]
                             
@@ -568,10 +593,11 @@ with tab2:
                         if d_macd_div: d_res.append("MACD")
                         item["日K底背離"] = "+".join(d_res) if d_res else "無"
                         
-                        # 2. 處理 60分K 背離
-                        m60_df = yf.Ticker(ticker).history(period="3mo", interval="60m")
+                        # 2. 處理 60分K 背離 (套用動態算出的 60m 最佳區間)
+                        m60_df = yf.Ticker(ticker).history(period=dl_period_60m, interval="60m")
                         if specific_offset > 0 and not daily_df.empty:
                             target_date = daily_df.index[-1].date()
+                            # 將未來資料截掉，把當時那一天當作「今天」
                             mask = [d.date() <= target_date for d in m60_df.index]
                             m60_df = m60_df[mask]
                             
