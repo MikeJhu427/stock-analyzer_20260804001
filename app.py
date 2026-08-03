@@ -382,13 +382,12 @@ with tab1:
 # 頁籤 2：全市場掃描 (新增功能 - 雙階段過濾)
 # ----------------------------------------------------
 with tab2:
-    st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測技術底背離。")
+    st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測多組技術底背離。")
     
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         st.markdown("**1. 基礎掃描參數**")
         col_a, col_b, col_c = st.columns(3)
         with col_a:
-            # 將最大值放寬至 1000
             lookback_end = st.number_input(
                 "掃描區間：從幾天前起算？ (最新為 0)", 
                 min_value=0, max_value=1000, value=0, step=1,
@@ -399,7 +398,6 @@ with tab2:
                 min_value=0, max_value=1000, value=0, step=1,
                 help="若此數值大於起算天數，系統會掃描該段期間(多日)內任何曾觸發反轉訊號的股票。"
             )
-            # 防呆：確保回推天數 >= 起算天數
             if lookback_start < lookback_end:
                 st.warning("⚠️ 「最多回推天數」不能小於「起算天數」，已自動為您修正。")
                 lookback_start = lookback_end
@@ -407,8 +405,8 @@ with tab2:
         with col_b:
             min_score = st.number_input(
                 "最低反轉權重分數", 
-                min_value=1.0, max_value=30.0, value=10.0, step=1.0,
-                help="【已最佳化】預設 10.0，嚴格過濾弱勢小紅K，確保底部成型力道強勁。"
+                min_value=1.0, max_value=30.0, value=8.0, step=1.0,
+                help="【已最佳化】預設 8.0，過濾弱勢小紅K，確保底部成型力道。"
             )
         with col_c:
             min_vol_ma20 = st.number_input(
@@ -417,25 +415,18 @@ with tab2:
                 help="【已最佳化】預設 1000 張，避開流動性不佳的殭屍股。"
             )
         
-        st.markdown("**2. 背離檢測參數**")
-        col_d, col_e = st.columns(2)
-        with col_d:
-            div_recent_w = st.number_input(
-                "第一低點(近波) 檢測範圍 (K棒數)", 
-                min_value=5, max_value=40, value=20, step=1
-            )
-        with col_e:
-            div_older_w = st.number_input(
-                "第二低點(前波) 回溯範圍 (K棒數)", 
-                min_value=21, max_value=120, value=60, step=1,
-                help="必須大於近波範圍。系統會在 [前波] 到 [近波] 之間尋找第二低點。"
-            )
+        st.markdown("**2. 背離檢測參數 (已升級為多組週期自動檢測)**")
+        st.info("💡 系統將自動同時比對三組週期參數：`(5, 20)`、`(5, 60)` 與 `(20, 60)`，完整捕捉各級別底背離訊號，並匯總呈現於表格中。")
 
     st.markdown("---")
     
     if st.button("🚀 開始智慧區間掃描", type="primary"):
+        # 設定固定檢測的三組背離參數 (近波, 前波)
+        div_pairs = [(5, 20), (5, 60), (20, 60)]
+        max_older_w = max(pair[1] for pair in div_pairs)
+        
         # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數)
-        buffer_days = div_older_w + 30 
+        buffer_days = max_older_w + 30 
         total_needed_days = lookback_start + buffer_days
         
         # 根據所需天數，決定 yfinance 下載的 period，避免抓取過多無用資料
@@ -479,7 +470,6 @@ with tab2:
                 chunk = tickers[i:i+chunk_size]
                 status_text.text(f"[階段一] 正在全市場區間掃描：進度 {i} / {len(tickers)} 檔...")
                 try:
-                    # 使用動態算出的 dl_period 取代固定的 "5y" 或 "3mo"
                     data = yf.download(chunk, period=dl_period, threads=True, progress=False)
                     for ticker in chunk:
                         try:
@@ -519,13 +509,10 @@ with tab2:
                             df.loc[cond_low_pin, 'Candle_Score'] = 7 * (df['Lower_Shadow'] / df['Total_Range']) * df['Vol_Mult']
                             df.loc[cond_low_red, 'Candle_Score'] = 5 * df['Vol_Mult']
                             
-                            # 針對設定的日期區間進行迴圈掃描
                             best_score_in_range = -1
                             best_target_row = None
                             offset_for_best_row = 0
                             
-                            # 注意：iloc 取值時，-1 是最新一天。
-                            # 若 range(0, 3)，代表取 offset 為 0, 1, 2
                             for offset in range(lookback_end, lookback_start + 1):
                                 target_idx = -1 - offset
                                 target_row = df.iloc[target_idx]
@@ -538,12 +525,11 @@ with tab2:
                                         best_target_row = target_row
                                         offset_for_best_row = offset
                             
-                            # 如果這個區間內有觸發訊號，將「最高分那一天」存入字典
                             if best_target_row is not None:
                                 clean_ticker = ticker.replace(".TW", "").replace(".TWO", "")
                                 reversal_candidates[ticker] = {
                                     "_Full_Ticker": ticker,
-                                    "_Offset": offset_for_best_row, # 記錄觸發那天的偏移量，供後續截斷使用
+                                    "_Offset": offset_for_best_row, 
                                     "股票代號": clean_ticker,
                                     "股票名稱": stock_dict[ticker],
                                     "觸發日期": best_target_row.name.strftime('%Y-%m-%d'),
@@ -557,15 +543,14 @@ with tab2:
                     pass
                 progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
             
-            # 轉換為 List 以便後續迴圈處理
             reversal_list = list(reversal_candidates.values())
             
             # ----------------------------------------------------
-            # 第二階段：針對入選標的進行 日K/60分K 背離深度檢測
+            # 第二階段：針對入選標的進行 日K/60分K 多組背離深度檢測
             # ----------------------------------------------------
             if reversal_list:
                 progress_bar.progress(0)
-                status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的的技術背離特徵...")
+                status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵...")
                 
                 final_results = []
                 for idx, item in enumerate(reversal_list):
@@ -573,31 +558,39 @@ with tab2:
                         ticker = item.pop("_Full_Ticker")
                         specific_offset = item.pop("_Offset") 
                         
-                        # 1. 處理日K背離 (套用動態算出的 dl_period)
+                        has_daily_div = False
+                        has_m60_div = False
+                        
+                        # ================= 1. 日K背離判定 =================
                         daily_df = yf.Ticker(ticker).history(period=dl_period)
-                        if daily_df.empty:
-                            continue
-                        
-                        # 【重要】把指定的歷史那一天當作「今天」，將該天以後的未來資料全數截掉
-                        if specific_offset > 0 and len(daily_df) > specific_offset:
-                            daily_df = daily_df.iloc[:-specific_offset]
+                        if not daily_df.empty:
+                            if specific_offset > 0 and len(daily_df) > specific_offset:
+                                daily_df = daily_df.iloc[:-specific_offset]
+                                
+                            daily_df = TechnicalIndicators.add_kd(daily_df)
+                            daily_df = TechnicalIndicators.add_macd(daily_df)
                             
-                        daily_df = TechnicalIndicators.add_kd(daily_df)
-                        daily_df = TechnicalIndicators.add_macd(daily_df)
+                            for r_w, o_w in div_pairs:
+                                d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w)
+                                d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w)
+                                
+                                res = []
+                                if d_kd: res.append("KD")
+                                if d_macd: res.append("MACD")
+                                
+                                if res:
+                                    item[f"日K背離({r_w},{o_w})"] = "+".join(res)
+                                    has_daily_div = True
+                                else:
+                                    item[f"日K背離({r_w},{o_w})"] = "無"
+                        else:
+                            for r_w, o_w in div_pairs:
+                                item[f"日K背離({r_w},{o_w})"] = "無資料"
                         
-                        d_kd_div = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', div_recent_w, div_older_w)
-                        d_macd_div = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', div_recent_w, div_older_w)
-                        
-                        d_res = []
-                        if d_kd_div: d_res.append("KD")
-                        if d_macd_div: d_res.append("MACD")
-                        item["日K底背離"] = "+".join(d_res) if d_res else "無"
-                        
-                        # 2. 處理 60分K 背離 (套用動態算出的 60m 最佳區間)
+                        # ================= 2. 60分K背離判定 =================
                         m60_df = yf.Ticker(ticker).history(period=dl_period_60m, interval="60m")
                         if specific_offset > 0 and not daily_df.empty:
                             target_date = daily_df.index[-1].date()
-                            # 將未來資料截掉，把當時那一天當作「今天」
                             mask = [d.date() <= target_date for d in m60_df.index]
                             m60_df = m60_df[mask]
                             
@@ -605,30 +598,38 @@ with tab2:
                             m60_df = TechnicalIndicators.add_kd(m60_df)
                             m60_df = TechnicalIndicators.add_macd(m60_df)
                             
-                            m60_kd_div = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', div_recent_w, div_older_w)
-                            m60_macd_div = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', div_recent_w, div_older_w)
-                            
-                            m60_res = []
-                            if m60_kd_div: m60_res.append("KD")
-                            if m60_macd_div: m60_res.append("MACD")
-                            item["60分K底背離"] = "+".join(m60_res) if m60_res else "無"
+                            for r_w, o_w in div_pairs:
+                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w)
+                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w)
+                                
+                                res = []
+                                if m_kd: res.append("KD")
+                                if m_macd: res.append("MACD")
+                                
+                                if res:
+                                    item[f"60分K背離({r_w},{o_w})"] = "+".join(res)
+                                    has_m60_div = True
+                                else:
+                                    item[f"60分K背離({r_w},{o_w})"] = "無"
                         else:
-                            item["60分K底背離"] = "無資料"
+                            for r_w, o_w in div_pairs:
+                                item[f"60分K背離({r_w},{o_w})"] = "無資料"
 
-                        # 3. 綜合背離分類建議
-                        if item["日K底背離"] != "無" and item["60分K底背離"] not in ["無", "無資料"]:
-                            item["背離分類建議"] = "⭐⭐⭐ 雙級別共振 (強烈建議)"
-                        elif item["日K底背離"] != "無":
-                            item["背離分類建議"] = "⭐⭐ 波段佈局 (日K背離)"
-                        elif item["60分K底背離"] not in ["無", "無資料"]:
-                            item["背離分類建議"] = "⭐ 短線進場 (60分K背離)"
+                        # ================= 3. 綜合背離分類建議 =================
+                        if has_daily_div and has_m60_div:
+                            item["背離分類建議"] = "⭐⭐⭐ 雙級別多週期共振 (強烈建議)"
+                        elif has_daily_div:
+                            item["背離分類建議"] = "⭐⭐ 波段佈局 (日K級別共振)"
+                        elif has_m60_div:
+                            item["背離分類建議"] = "⭐ 短線進場 (60分K級別共振)"
                         else:
                             item["背離分類建議"] = "一般反轉 (無背離)"
                         
                         final_results.append(item)
                     except Exception as e:
-                        item["日K底背離"] = "資料異常"
-                        item["60分K底背離"] = "資料異常"
+                        for r_w, o_w in div_pairs:
+                            item[f"日K背離({r_w},{o_w})"] = "資料異常"
+                            item[f"60分K背離({r_w},{o_w})"] = "資料異常"
                         item["背離分類建議"] = "一般反轉 (無背離)"
                         final_results.append(item)
                         
