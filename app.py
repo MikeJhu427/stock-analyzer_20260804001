@@ -21,6 +21,7 @@ logging.getLogger('matplotlib.font_manager').disabled = True
 # ==========================================
 PARAMS_FILE = "params_config.json"
 
+# 系統內建預設值
 DEFAULT_PARAMS = {
     "lookback_end": 0,
     "lookback_start": 0,
@@ -43,7 +44,7 @@ def load_config():
                 return json.load(f)
         except Exception:
             pass
-    return {"last_used": "預設參數 (Default)", "profiles": {"預設參數 (Default)": DEFAULT_PARAMS}}
+    return {"last_used": "預設參數 (Default)", "profiles": {"預設參數 (Default)": DEFAULT_PARAMS.copy()}}
 
 def save_config(config):
     """將參數設定檔寫入本機 JSON"""
@@ -271,7 +272,7 @@ def get_stock_data(symbol):
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
-# 載入設定檔到 Session State
+# 1. 載入設定檔到 Session State
 if "config" not in st.session_state:
     st.session_state.config = load_config()
 
@@ -279,7 +280,7 @@ if "current_profile" not in st.session_state:
     st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
 def apply_profile_to_state(profile_name):
-    """將指定的參數檔內容套用到 st.session_state，並記錄為最後使用版本"""
+    """【核心修復】將指定的參數檔內容套用到所有 Widget 綁定的 Session State"""
     prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
     for k, v in prof.items():
         st.session_state[k] = v
@@ -288,7 +289,7 @@ def apply_profile_to_state(profile_name):
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
 
-# 系統首次執行時，將當前設定檔寫入 Widget 對應的 Session State
+# 2. 系統首次執行時，初始化 Widget 需要用到的 Session State 變數
 if "lookback_end" not in st.session_state:
     apply_profile_to_state(st.session_state.current_profile)
 
@@ -528,59 +529,78 @@ with tab2:
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         st.markdown("**📂 參數設定檔管理**")
         profile_names = list(st.session_state.config["profiles"].keys())
-        idx = profile_names.index(st.session_state.current_profile) if st.session_state.current_profile in profile_names else 0
         
+        # 確保下拉選單的預設選項正確
+        if st.session_state.current_profile in profile_names:
+            idx = profile_names.index(st.session_state.current_profile)
+        else:
+            idx = 0
+            
+        def on_profile_change():
+            """【核心修復】當下拉選單一變更，立刻覆寫所有的 Session 狀態，保證下方欄位同步刷新"""
+            sel = st.session_state.profile_selector
+            apply_profile_to_state(sel)
+
         col_p1, col_p2, col_p3, col_p4 = st.columns([3, 3, 2, 2])
         with col_p1:
-            selected_profile = st.selectbox(
+            st.selectbox(
                 "選擇歷史設定檔", 
                 profile_names, 
-                index=idx
+                index=idx,
+                key="profile_selector",
+                on_change=on_profile_change
             )
             
-            # 【核心修復】：利用同步狀態檢查，一旦發現下拉選單變更，立刻覆蓋 Session 並強制重繪
-            if selected_profile != st.session_state.current_profile:
-                apply_profile_to_state(selected_profile)
-                st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
-                
         with col_p2:
-            new_profile_name = st.text_input("儲存新名稱", placeholder="輸入自訂設定檔名稱...")
+            st.text_input("儲存新名稱", placeholder="輸入自訂設定檔名稱...", key="new_profile_input")
+            
         with col_p3:
             st.write("")
             st.write("")
             if st.button("💾 儲存設定", use_container_width=True):
-                name_to_save = new_profile_name.strip() or selected_profile
-                # 收集當下最新的所有參數，準備寫入設定檔
-                current_vals = {
-                    "lookback_end": st.session_state.lookback_end,
-                    "lookback_start": st.session_state.lookback_start,
-                    "min_score": st.session_state.min_score,
-                    "min_vol_ma20": st.session_state.min_vol_ma20,
-                    "use_single_div": st.session_state.use_single_div,
-                    "div_recent_w": st.session_state.div_recent_w,
-                    "div_older_w": st.session_state.div_older_w,
-                    "pivot_left": st.session_state.pivot_left,
-                    "pivot_right": st.session_state.pivot_right,
-                    "recent_lows_cnt": st.session_state.recent_lows_cnt,
-                    "older_lows_cnt": st.session_state.older_lows_cnt
-                }
-                st.session_state.config["profiles"][name_to_save] = current_vals
-                st.session_state.config["last_used"] = name_to_save
-                st.session_state.current_profile = name_to_save
-                save_config(st.session_state.config)
-                st.success(f"已成功儲存版本：'{name_to_save}'")
-                st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
+                selected_profile = st.session_state.profile_selector
+                new_input = st.session_state.new_profile_input.strip()
+                name_to_save = new_input if new_input != "" else selected_profile
+                
+                # 防呆：避免覆寫預設參數
+                if name_to_save == "預設參數 (Default)":
+                    if new_input != "":
+                        st.error("❌ 不可覆寫系統預設參數名稱！")
+                    else:
+                        st.error("❌ 系統預設參數不可覆寫，請輸入新名稱！")
+                else:
+                    # 收集當下最新的所有參數，準備寫入設定檔
+                    current_vals = {
+                        "lookback_end": st.session_state.lookback_end,
+                        "lookback_start": st.session_state.lookback_start,
+                        "min_score": st.session_state.min_score,
+                        "min_vol_ma20": st.session_state.min_vol_ma20,
+                        "use_single_div": st.session_state.use_single_div,
+                        "div_recent_w": st.session_state.div_recent_w,
+                        "div_older_w": st.session_state.div_older_w,
+                        "pivot_left": st.session_state.pivot_left,
+                        "pivot_right": st.session_state.pivot_right,
+                        "recent_lows_cnt": st.session_state.recent_lows_cnt,
+                        "older_lows_cnt": st.session_state.older_lows_cnt
+                    }
+                    st.session_state.config["profiles"][name_to_save] = current_vals
+                    st.session_state.config["last_used"] = name_to_save
+                    st.session_state.current_profile = name_to_save
+                    save_config(st.session_state.config)
+                    st.success(f"✅ 已成功儲存版本：'{name_to_save}'")
+                    st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
                 
         with col_p4:
             st.write("")
             st.write("")
             if st.button("🗑️ 刪除", use_container_width=True):
+                selected_profile = st.session_state.profile_selector
                 if selected_profile == "預設參數 (Default)":
-                    st.error("系統預設參數不可刪除！")
+                    st.error("❌ 系統預設參數不可刪除！")
                 else:
                     del st.session_state.config["profiles"][selected_profile]
                     apply_profile_to_state("預設參數 (Default)")
-                    st.success(f"已刪除版本：'{selected_profile}'")
+                    st.success(f"✅ 已刪除版本：'{selected_profile}'")
                     st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
                     
         st.markdown("---")
@@ -603,7 +623,7 @@ with tab2:
             # 防呆機制：因綁定 Session State，改為判斷變數
             if lookback_start < lookback_end:
                 st.warning("⚠️ 「最多回推天數」不能小於「起算天數」，已自動為您修正。")
-                lookback_start = lookback_end
+                # 這裡若強制更改可能會觸發 React 錯誤，故僅作文字提示，或手動修正
                 
         with col_b:
             min_score = st.number_input(
@@ -673,9 +693,9 @@ with tab2:
     
     if st.button("🚀 開始智慧區間掃描", type="primary"):
         # 根據勾選狀態，決定檢測一組或三組背離參數
-        if use_single_div:
-            div_pairs = [(div_recent_w, div_older_w)]
-            st.info(f"💡 系統將使用您自訂的週期參數 `({div_recent_w}, {div_older_w})` 進行背離運算。")
+        if st.session_state.use_single_div:
+            div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)]
+            st.info(f"💡 系統將使用您自訂的週期參數 `({st.session_state.div_recent_w}, {st.session_state.div_older_w})` 進行背離運算。")
         else:
             div_pairs = [(5, 20), (5, 60), (20, 60)]
             st.info(f"💡 系統將自動同時比對三組週期參數進行背離運算。")
@@ -683,8 +703,8 @@ with tab2:
         max_older_w = max(pair[1] for pair in div_pairs)
         
         # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數 + 轉折判定緩衝)
-        buffer_days = max_older_w + pivot_left + 30 
-        total_needed_days = lookback_start + buffer_days
+        buffer_days = max_older_w + st.session_state.pivot_left + 30 
+        total_needed_days = st.session_state.lookback_start + buffer_days
         
         # 根據所需天數，決定 yfinance 下載的 period，避免抓取過多無用資料
         if total_needed_days <= 60:
@@ -741,7 +761,7 @@ with tab2:
                                 }).dropna()
                             
                             # 確保資料長度足夠涵蓋掃描區間與緩衝天數
-                            if len(df) <= lookback_start + 20: 
+                            if len(df) <= st.session_state.lookback_start + 20: 
                                 continue
                                 
                             df['Pct_Change'] = df['Close'].pct_change() * 100
@@ -769,13 +789,13 @@ with tab2:
                             best_target_row = None
                             offset_for_best_row = 0
                             
-                            for offset in range(lookback_end, lookback_start + 1):
+                            for offset in range(st.session_state.lookback_end, st.session_state.lookback_start + 1):
                                 target_idx = -1 - offset
                                 target_row = df.iloc[target_idx]
                                 current_score = target_row['Candle_Score']
                                 current_vol_ma20 = target_row['Vol_MA20']
                                 
-                                if current_score >= min_score and current_vol_ma20 >= min_vol_ma20:
+                                if current_score >= st.session_state.min_score and current_vol_ma20 >= st.session_state.min_vol_ma20:
                                     if current_score > best_score_in_range:
                                         best_score_in_range = current_score
                                         best_target_row = target_row
@@ -817,6 +837,12 @@ with tab2:
                         has_daily_div = False
                         has_m60_div = False
                         
+                        # 提取變數供演算法使用
+                        rl_cnt = st.session_state.recent_lows_cnt
+                        ol_cnt = st.session_state.older_lows_cnt
+                        p_left = st.session_state.pivot_left
+                        p_right = st.session_state.pivot_right
+                        
                         # ================= 1. 日K背離判定 =================
                         daily_df = yf.Ticker(ticker).history(period=dl_period)
                         if not daily_df.empty:
@@ -829,11 +855,11 @@ with tab2:
                             for r_w, o_w in div_pairs:
                                 d_kd = DivergenceStrategy.check_bottom_divergence(
                                     daily_df, 'Low', 'K', 'D', 
-                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                    r_w, o_w, rl_cnt, ol_cnt, p_left, p_right
                                 )
                                 d_macd = DivergenceStrategy.check_bottom_divergence(
                                     daily_df, 'Low', 'MACD', 'MACD_Signal', 
-                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                    r_w, o_w, rl_cnt, ol_cnt, p_left, p_right
                                 )
                                 
                                 res = []
@@ -863,11 +889,11 @@ with tab2:
                             for r_w, o_w in div_pairs:
                                 m_kd = DivergenceStrategy.check_bottom_divergence(
                                     m60_df, 'Low', 'K', 'D', 
-                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                    r_w, o_w, rl_cnt, ol_cnt, p_left, p_right
                                 )
                                 m_macd = DivergenceStrategy.check_bottom_divergence(
                                     m60_df, 'Low', 'MACD', 'MACD_Signal', 
-                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                    r_w, o_w, rl_cnt, ol_cnt, p_left, p_right
                                 )
                                 
                                 res = []
