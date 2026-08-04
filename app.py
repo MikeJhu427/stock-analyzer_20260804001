@@ -47,14 +47,16 @@ class TechnicalIndicators:
 # ==========================================
 class DivergenceStrategy:
     @staticmethod
-    def check_bottom_divergence(df, price_col='Low', ind_col='K', ind_signal_col='D', recent_w=20, older_w=60):
+    def check_bottom_divergence(df, price_col='Low', ind_col='K', ind_signal_col='D', recent_w=20, older_w=60, x_lows=5):
         """
-        判定底背離邏輯：
+        判定底背離邏輯 (優化版：支援比對前波 X 個低點)：
         1. 尋找近波低點 (第一低點)
-        2. 尋找前波低點 (第二低點)
-        3. 條件A: 價格破底 (p2 > p1)
-        4. 條件B: 指標不破底 (i2 < i1)
-        5. 條件C: 兩波低點之間，指標必須曾經發生過死叉 (確認中間有形成反彈山峰)
+        2. 尋找前波前 X 個低點 (第 1 ~ 第 X 低點)
+        3. 針對這 X 個低點逐一比對：
+           條件A: 價格破底 (前波低點 > 第一低點)
+           條件B: 指標不破底 (前波指標 < 第一指標)
+           條件C: 兩波低點之間，指標必須曾經發生過死叉 (確認中間有形成反彈山峰)
+        4. 只要有任一個前波低點符合上述條件，即判定背離成立。
         """
         if len(df) < older_w:
             return False
@@ -65,28 +67,35 @@ class DivergenceStrategy:
         p1 = df.loc[idx1, price_col]
         i1 = df.loc[idx1, ind_col]
         
-        # 2. 尋找前波第二低點 (時間區段必定早於 recent_slice)
+        # 2. 尋找前波 (必定早於 recent_slice)
         older_slice = df.iloc[-older_w:-recent_w]
         if older_slice.empty:
             return False
             
-        idx2 = older_slice[price_col].idxmin()
-        p2 = df.loc[idx2, price_col]
-        i2 = df.loc[idx2, ind_col]
+        # 取得前波價格最低的前 X 個點
+        # 使用 nsmallest 取出最小的 x_lows 筆資料
+        bottom_x_rows = older_slice.nsmallest(x_lows, price_col)
         
-        # 條件 A & B判定：價格破底，但指標未破底
-        if p2 > p1 and i2 < i1:
-            # 條件 C判定：擷取 idx2 到 idx1 之間的資料，尋找是否發生過死叉
-            # 死叉定義：前一根快線 >= 慢線，且當前快線 < 慢線
-            middle_df = df.loc[idx2:idx1]
-            if len(middle_df) > 2:
-                cross_down = (middle_df[ind_col] < middle_df[ind_signal_col]) & \
-                             (middle_df[ind_col].shift(1) >= middle_df[ind_signal_col].shift(1))
-                
-                # 如果這段期間內有發生過死叉，則確認這是一個真實背離
-                if cross_down.any():
-                    return True
-                    
+        # 3. 針對這 X 個點，只要有任何一個構成背離即成立
+        for idx2, row2 in bottom_x_rows.iterrows():
+            p2 = row2[price_col]
+            i2 = row2[ind_col]
+            
+            # 條件 A & B判定：價格破底，但指標未破底
+            if p2 > p1 and i2 < i1:
+                # 確保前波時間點早於近波時間點
+                if idx2 < idx1:
+                    # 條件 C判定：擷取 idx2 到 idx1 之間的資料，尋找是否發生過死叉
+                    # 死叉定義：前一根快線 >= 慢線，且當前快線 < 慢線
+                    middle_df = df.loc[idx2:idx1]
+                    if len(middle_df) > 2:
+                        cross_down = (middle_df[ind_col] < middle_df[ind_signal_col]) & \
+                                     (middle_df[ind_col].shift(1) >= middle_df[ind_signal_col].shift(1))
+                        
+                        # 如果這段期間內有發生過死叉，則確認這是一個真實背離
+                        if cross_down.any():
+                            return True
+                            
         return False
 
 # ==========================================
@@ -166,7 +175,7 @@ st.markdown(
 tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場掃描 (低檔反轉+背離)"])
 
 # ----------------------------------------------------
-# 頁籤 1：單檔深度解析 (原有功能)
+# 頁籤 1：單檔深度解析
 # ----------------------------------------------------
 with tab1:
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
@@ -379,10 +388,10 @@ with tab1:
         """)
 
 # ----------------------------------------------------
-# 頁籤 2：全市場掃描 (新增功能 - 雙階段過濾)
+# 頁籤 2：全市場掃描 (包含 X低點 比對)
 # ----------------------------------------------------
 with tab2:
-    st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測多組技術底背離。")
+    st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測技術底背離。")
     
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         st.markdown("**1. 基礎掃描參數**")
@@ -415,14 +424,40 @@ with tab2:
                 help="【已最佳化】預設 1000 張，避開流動性不佳的殭屍股。"
             )
         
-        st.markdown("**2. 背離檢測參數 (已升級為多組週期自動檢測)**")
-        st.info("💡 系統將自動同時比對三組週期參數：`(5, 20)`、`(5, 60)` 與 `(20, 60)`，完整捕捉各級別底背離訊號，並匯總呈現於表格中。")
+        st.markdown("**2. 背離檢測參數設定**")
+        use_single_div = st.checkbox("啟用單一組自訂背離週期 (未勾選則預設比對三組：(5,20)、(5,60)、(20,60))", value=False)
+        
+        col_d, col_e, col_f = st.columns(3)
+        with col_d:
+            div_recent_w = st.number_input(
+                "自訂：第一低點(近波)範圍", 
+                min_value=5, max_value=60, value=5, step=1,
+                disabled=not use_single_div
+            )
+        with col_e:
+            div_older_w = st.number_input(
+                "自訂：第二低點(前波)範圍", 
+                min_value=10, max_value=240, value=20, step=1,
+                disabled=not use_single_div
+            )
+        with col_f:
+            x_lows = st.number_input(
+                "前波比對低點數量 (X)", 
+                min_value=1, max_value=20, value=5, step=1,
+                help="預設找出前波最深的前 5 個低點來跟第一低點比對，只要其中一個符合底背離即判定成立。"
+            )
 
     st.markdown("---")
     
     if st.button("🚀 開始智慧區間掃描", type="primary"):
-        # 設定固定檢測的三組背離參數 (近波, 前波)
-        div_pairs = [(5, 20), (5, 60), (20, 60)]
+        # 根據勾選狀態，決定檢測一組或三組背離參數
+        if use_single_div:
+            div_pairs = [(div_recent_w, div_older_w)]
+            st.info(f"💡 系統將使用您自訂的週期參數 `({div_recent_w}, {div_older_w})`，且前波將比對前 {x_lows} 個低點進行運算。")
+        else:
+            div_pairs = [(5, 20), (5, 60), (20, 60)]
+            st.info(f"💡 系統將自動同時比對三組週期參數，且前波將比對前 {x_lows} 個低點進行運算。")
+            
         max_older_w = max(pair[1] for pair in div_pairs)
         
         # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數)
@@ -458,7 +493,6 @@ with tab2:
             tickers = list(stock_dict.keys())
             reversal_candidates = {} 
             
-            st.info(f"💡 系統偵測您的回推設定，自動將資料下載區間最佳化為：**{dl_period}**，以提升掃描效率。")
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -546,7 +580,7 @@ with tab2:
             reversal_list = list(reversal_candidates.values())
             
             # ----------------------------------------------------
-            # 第二階段：針對入選標的進行 日K/60分K 多組背離深度檢測
+            # 第二階段：針對入選標的進行 日K/60分K 背離深度檢測
             # ----------------------------------------------------
             if reversal_list:
                 progress_bar.progress(0)
@@ -571,8 +605,9 @@ with tab2:
                             daily_df = TechnicalIndicators.add_macd(daily_df)
                             
                             for r_w, o_w in div_pairs:
-                                d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w)
-                                d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w)
+                                # 套用新的傳遞參數：加入 x_lows 供模組動態使用
+                                d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, x_lows)
+                                d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, x_lows)
                                 
                                 res = []
                                 if d_kd: res.append("KD")
@@ -599,8 +634,9 @@ with tab2:
                             m60_df = TechnicalIndicators.add_macd(m60_df)
                             
                             for r_w, o_w in div_pairs:
-                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w)
-                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w)
+                                # 套用新的傳遞參數：加入 x_lows 供模組動態使用
+                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, x_lows)
+                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, x_lows)
                                 
                                 res = []
                                 if m_kd: res.append("KD")
