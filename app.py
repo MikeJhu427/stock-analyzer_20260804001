@@ -218,7 +218,8 @@ def get_yf_session():
     })
     return session
 
-@st.cache_data(ttl=86400)
+# 【優化】加入 show_spinner=False 關閉右下角預設的 Running 提示
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_all_tw_stocks():
     """抓取台股上市/上櫃全部普通股代號與名稱"""
     stocks = {}
@@ -240,7 +241,8 @@ def get_all_tw_stocks():
             pass
     return stocks
 
-@st.cache_data(ttl=3600)
+# 【優化】加入 show_spinner=False 關閉右下角預設的 Running 提示
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_tw_stock_name(ticker):
     """緩存股票名稱，避免重複查詢網頁"""
     code = ticker.split('.')[0]
@@ -362,7 +364,6 @@ with tab1:
                 df['Prev_VWMA20'] = df['VWMA20'].shift(1)
                 df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
                 
-                # 【效能優化】: 將原本 Pandas iterrows 計算 Max_Vol_Defense 改為 numpy 高速運算
                 vols_arr = df['Volume'].values
                 opens_arr = df['Open'].values
                 closes_arr = df['Close'].values
@@ -698,6 +699,12 @@ with tab2:
     st.markdown("---")
     
     if st.button("🚀 開始智慧區間掃描", type="primary"):
+        # 【優化】提前建立 UI 元件並提供初始化進度，避免畫面卡頓假死
+        status_text = st.empty()
+        progress_bar = st.progress(0)
+        
+        status_text.text("⏳ [初始化] 正在同步台股最新代號與名稱清單，請稍候...")
+        
         if st.session_state.use_single_div:
             div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)]
             st.info(f"💡 系統將使用您自訂的週期參數 `({st.session_state.div_recent_w}, {st.session_state.div_older_w})` 進行運算。")
@@ -720,15 +727,16 @@ with tab2:
         elif total_needed_days <= 120: dl_period_60m = "6mo"
         else: dl_period_60m = "730d"
 
+        # 這裡由於已提前建立狀態文字，使用者會看見同步中的提示
         stock_dict = get_all_tw_stocks()
+        
         if not stock_dict:
+            status_text.empty()
+            progress_bar.empty()
             st.error("❌ 無法取得台股清單，請檢查網路連線。")
         else:
             tickers = list(stock_dict.keys())
             reversal_candidates = {} 
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
             
             # ----------------------------------------------------
             # 第一階段：區間粗篩
@@ -738,7 +746,6 @@ with tab2:
                 chunk = tickers[i:i+chunk_size]
                 status_text.text(f"[階段一] 正在全市場區間掃描：進度 {i} / {len(tickers)} 檔...")
                 try:
-                    # 【防阻擋優化】: 關閉 threads 並套用穩健的 Session
                     data = yf.download(
                         chunk, 
                         period=dl_period, 
@@ -749,7 +756,6 @@ with tab2:
                     
                     for ticker in chunk:
                         try:
-                            # 【效能與穩定度優化】: 安全解析 yfinance MultiIndex DataFrame
                             if isinstance(data.columns, pd.MultiIndex):
                                 df = data.xs(ticker, axis=1, level=1).dropna(how='all')
                             else:
@@ -800,7 +806,7 @@ with tab2:
                                 reversal_candidates[ticker] = {
                                     "_Full_Ticker": ticker,
                                     "_Offset": offset_for_best_row, 
-                                    "_Daily_DF": df.copy(), # 【效能優化】: 將計算好的日線資料緩存，供階段二直接使用
+                                    "_Daily_DF": df.copy(),
                                     "股票代號": clean_ticker,
                                     "股票名稱": stock_dict[ticker],
                                     "觸發日期": best_target_row.name.strftime('%Y-%m-%d'),
@@ -828,7 +834,6 @@ with tab2:
                     try:
                         ticker = item.pop("_Full_Ticker")
                         specific_offset = item.pop("_Offset") 
-                        # 【效能優化】: 直接取回階段一已下載完成的資料，省去 API 重複請求與延遲
                         daily_df = item.pop("_Daily_DF") 
                         
                         has_daily_div = False
@@ -871,7 +876,6 @@ with tab2:
                                 item[f"日K背離({r_w},{o_w})"] = "無資料"
                         
                         # ================= 2. 60分K背離判定 =================
-                        # 【防阻擋優化】: 使用套用防阻擋機制的 Session
                         m60_df = yf.Ticker(ticker, session=get_yf_session()).history(period=dl_period_60m, interval="60m")
                         
                         if specific_offset > 0 and not daily_df.empty:
