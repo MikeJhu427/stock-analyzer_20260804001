@@ -42,14 +42,17 @@ def load_config():
         try:
             with open(PARAMS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"讀取設定檔失敗，將套用預設值: {e}")
     return {"last_used": "預設參數 (Default)", "profiles": {"預設參數 (Default)": DEFAULT_PARAMS.copy()}}
 
 def save_config(config):
     """將參數設定檔寫入本機 JSON"""
-    with open(PARAMS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
+    try:
+        with open(PARAMS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logging.error(f"儲存設定檔失敗: {e}")
 
 # ==========================================
 # 獨立模組 1：技術指標計算
@@ -89,15 +92,7 @@ class DivergenceStrategy:
         recent_lows_cnt=0, older_lows_cnt=0,
         pivot_left=0, pivot_right=0
     ):
-        """
-        判定底背離邏輯 (多低點嚴格驗證版)：
-        1. 定義近波與前波範圍，並找出近波的「絕對最低點」(p1, i1)。
-        2. 若 recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right 均為 0，則退回基礎絕對低點比對。
-        3. 轉折低點定義：該 K 棒價格必須是 [往前左抓 left 根, 往後右抓 right 根] 區間內的最小值。(右側若不足則抓到最新一根為止)
-        4. 本波比對：在近波內找出所有轉折低點，排除絕對最低點後，取最低的 `recent_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
-        5. 前波比對：在前波內找出所有轉折低點，取最低的 `older_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
-        6. 背離定義：過去轉折點價格 > p1 (價格破底) 且 過去指標 < i1 (指標不破底)，且兩點之間指標曾發生過死叉。
-        """
+        """判定底背離邏輯 (多低點嚴格驗證版)"""
         if len(df) < older_w:
             return False
             
@@ -175,18 +170,11 @@ class DivergenceStrategy:
         # ==========================
         if recent_lows_cnt > 0:
             recent_pivots_iloc = get_valid_pivots_iloc(recent_start, recent_end)
-            # 排除本波絕對最低點
             if idx1_iloc in recent_pivots_iloc:
                 recent_pivots_iloc.remove(idx1_iloc)
-                
-            # 若本波內沒有其他低點，視為無法滿足多點比對條件
             if not recent_pivots_iloc:
                 return False
-                
-            # 取本波價格最低的前 N 個轉折低點
             recent_pivots_iloc = sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]
-            
-            # 本波找出的低點 "全數" 都必須滿足背離條件
             for p_iloc in recent_pivots_iloc:
                 if not check_divergence_condition(p_iloc):
                     return False
@@ -198,16 +186,11 @@ class DivergenceStrategy:
             older_pivots_iloc = get_valid_pivots_iloc(older_start, older_end)
             if not older_pivots_iloc:
                 return False
-                
-            # 取前波價格最低的前 M 個轉折低點
             older_pivots_iloc = sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]
-            
-            # 前波找出的低點 "全數" 都必須滿足背離條件
             for p_iloc in older_pivots_iloc:
                 if not check_divergence_condition(p_iloc):
                     return False
                     
-        # 全部條件皆通過，判定底背離強烈成立
         return True
 
 # ==========================================
@@ -231,10 +214,11 @@ def get_all_tw_stocks():
                         code, name = text.split('\u3000')
                         if code.isdigit() and len(code) == 4:
                             stocks[code + suffix] = name
-        except:
+        except Exception:
             pass
     return stocks
 
+@st.cache_data(ttl=3600)  # 新增 Cache：避免同檔股票重複爬取名稱
 def get_tw_stock_name(ticker):
     code = ticker.split('.')[0]
     try:
@@ -246,11 +230,11 @@ def get_tw_stock_name(ticker):
             h1 = soup.find('h1')
             if h1:
                 return h1.text.strip()
-    except:
+    except Exception:
         pass
     try:
         return yf.Ticker(ticker).info.get('shortName', code)
-    except:
+    except Exception:
         return code
 
 def get_stock_data(symbol):
@@ -272,7 +256,6 @@ def get_stock_data(symbol):
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
-# 1. 載入設定檔到 Session State
 if "config" not in st.session_state:
     st.session_state.config = load_config()
 
@@ -280,22 +263,20 @@ if "current_profile" not in st.session_state:
     st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
 def apply_profile_to_state(profile_name):
-    """【核心修復】將指定的參數檔內容套用到所有 Widget 綁定的 Session State"""
+    """將指定的參數檔內容套用到所有 Widget 綁定的 Session State"""
     prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
     for k, v in prof.items():
         st.session_state[k] = v
-    # 更新當前設定與記錄
     st.session_state.current_profile = profile_name
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
 
-# 2. 系統首次執行時，初始化 Widget 需要用到的 Session State 變數
 if "lookback_end" not in st.session_state:
     apply_profile_to_state(st.session_state.current_profile)
 
 st.title("📈 台股 K線型態與位階深度解析系統")
 
-# 隱藏右上角工具列（包含 GitHub 連結）
+# 隱藏右上角工具列
 st.markdown(
     """
     <style>
@@ -347,17 +328,18 @@ with tab1:
                 df['Prev_VWMA20'] = df['VWMA20'].shift(1)
                 df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
                 
-                max_vol_defense = []
-                for i in range(len(df)):
-                    if i < 60:
-                        max_vol_defense.append(np.nan)
-                    else:
-                        window = df.iloc[i-60:i+1]
-                        max_idx = window['Volume'].idxmax()
-                        max_bar = window.loc[max_idx]
-                        defense_price = min(max_bar['Open'], max_bar['Close'])
-                        max_vol_defense.append(defense_price)
-                df['Max_Vol_Defense'] = max_vol_defense
+                # 【效能優化】: 將原本 Pandas iterrows 計算 Max_Vol_Defense 改為 numpy 高速運算
+                vols_arr = df['Volume'].values
+                opens_arr = df['Open'].values
+                closes_arr = df['Close'].values
+                defense_arr = np.full(len(df), np.nan)
+                
+                for i in range(60, len(df)):
+                    window_vols = vols_arr[i-60:i+1]
+                    max_idx = (i - 60) + np.argmax(window_vols)
+                    defense_arr[i] = min(opens_arr[max_idx], closes_arr[max_idx])
+                    
+                df['Max_Vol_Defense'] = defense_arr
                 df['Prev_Defense'] = df['Max_Vol_Defense'].shift(1)
                 
                 df['Body'] = abs(df['Close'] - df['Open'])
@@ -530,14 +512,12 @@ with tab2:
         st.markdown("**📂 參數設定檔管理**")
         profile_names = list(st.session_state.config["profiles"].keys())
         
-        # 確保下拉選單的預設選項正確
         if st.session_state.current_profile in profile_names:
             idx = profile_names.index(st.session_state.current_profile)
         else:
             idx = 0
             
         def on_profile_change():
-            """【核心修復】當下拉選單一變更，立刻覆寫所有的 Session 狀態，保證下方欄位同步刷新"""
             sel = st.session_state.profile_selector
             apply_profile_to_state(sel)
 
@@ -562,14 +542,12 @@ with tab2:
                 new_input = st.session_state.new_profile_input.strip()
                 name_to_save = new_input if new_input != "" else selected_profile
                 
-                # 防呆：避免覆寫預設參數
                 if name_to_save == "預設參數 (Default)":
                     if new_input != "":
                         st.error("❌ 不可覆寫系統預設參數名稱！")
                     else:
                         st.error("❌ 系統預設參數不可覆寫，請輸入新名稱！")
                 else:
-                    # 收集當下最新的所有參數，準備寫入設定檔
                     current_vals = {
                         "lookback_end": st.session_state.lookback_end,
                         "lookback_start": st.session_state.lookback_start,
@@ -588,7 +566,7 @@ with tab2:
                     st.session_state.current_profile = name_to_save
                     save_config(st.session_state.config)
                     st.success(f"✅ 已成功儲存版本：'{name_to_save}'")
-                    st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
+                    st.rerun()
                 
         with col_p4:
             st.write("")
@@ -601,7 +579,7 @@ with tab2:
                     del st.session_state.config["profiles"][selected_profile]
                     apply_profile_to_state("預設參數 (Default)")
                     st.success(f"✅ 已刪除版本：'{selected_profile}'")
-                    st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
+                    st.rerun()
                     
         st.markdown("---")
 
@@ -618,26 +596,24 @@ with tab2:
                 "掃描區間：最多回推至幾天前？", 
                 min_value=0, max_value=1000, step=1,
                 key="lookback_start",
-                help="若此數值大於起算天數，系統會掃描該段期間(多日)內任何曾觸發反轉訊號的股票。"
+                help="若此數值大於起算天數，系統會掃描該段期間內曾觸發反轉訊號的股票。"
             )
-            # 防呆機制：因綁定 Session State，改為判斷變數
             if lookback_start < lookback_end:
-                st.warning("⚠️ 「最多回推天數」不能小於「起算天數」，已自動為您修正。")
-                # 這裡若強制更改可能會觸發 React 錯誤，故僅作文字提示，或手動修正
+                st.warning("⚠️ 「最多回推天數」不能小於「起算天數」，請手動修正以確保掃描正常。")
                 
         with col_b:
             min_score = st.number_input(
                 "最低反轉權重分數", 
                 min_value=1.0, max_value=30.0, step=1.0,
                 key="min_score",
-                help="【已最佳化】預設 8.0，過濾弱勢小紅K，確保底部成型力道。"
+                help="預設 8.0，過濾弱勢小紅K，確保底部成型力道。"
             )
         with col_c:
             min_vol_ma20 = st.number_input(
                 "月均量最低門檻 (張)", 
                 min_value=0, max_value=100000, step=100,
                 key="min_vol_ma20",
-                help="【已最佳化】預設 1000 張，避開流動性不佳的殭屍股。"
+                help="預設 1000 張，避開流動性不佳的殭屍股。"
             )
         
         st.markdown("**2. 背離檢測週期設定**")
@@ -658,75 +634,57 @@ with tab2:
                 disabled=not use_single_div
             )
 
-        st.markdown("**3. 嚴格轉折點與比對數量設定 (四者皆設為 0 時將自動關閉嚴格邏輯，退回基礎比對)**")
+        st.markdown("**3. 嚴格轉折點與比對數量設定 (四者皆設為 0 時退回基礎比對)**")
         col_f, col_g, col_h, col_i = st.columns(4)
         with col_f:
             pivot_left = st.number_input(
                 "轉折判定：往前抓K棒數", 
                 min_value=0, max_value=20, step=1,
-                key="pivot_left",
-                help="低點定義：價格必須是(往前+往後)這段區間內的最低價。皆設為 0 時關閉多點嚴格邏輯。"
+                key="pivot_left"
             )
         with col_g:
             pivot_right = st.number_input(
                 "轉折判定：往後取K棒數", 
                 min_value=0, max_value=20, step=1,
-                key="pivot_right",
-                help="遇到最新資料往後數量不足時，會自動抓到最新一筆為止。皆設為 0 時關閉多點嚴格邏輯。"
+                key="pivot_right"
             )
         with col_h:
             recent_lows_cnt = st.number_input(
                 "本波(近波)比對低點數", 
                 min_value=0, max_value=20, step=1,
-                key="recent_lows_cnt",
-                help="排除絕對最低點後，找出近波前幾低的轉折點，全都必須滿足底背離。皆設為 0 時關閉此邏輯。"
+                key="recent_lows_cnt"
             )
         with col_i:
             older_lows_cnt = st.number_input(
-                "前波比對低點數 (X)", 
+                "前波比對低點數", 
                 min_value=0, max_value=20, step=1,
-                key="older_lows_cnt",
-                help="找出前波前幾低的轉折點，也都必須全部滿足底背離才成立。皆設為 0 時關閉此邏輯。"
+                key="older_lows_cnt"
             )
 
     st.markdown("---")
     
     if st.button("🚀 開始智慧區間掃描", type="primary"):
-        # 根據勾選狀態，決定檢測一組或三組背離參數
         if st.session_state.use_single_div:
             div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)]
-            st.info(f"💡 系統將使用您自訂的週期參數 `({st.session_state.div_recent_w}, {st.session_state.div_older_w})` 進行背離運算。")
+            st.info(f"💡 系統將使用您自訂的週期參數 `({st.session_state.div_recent_w}, {st.session_state.div_older_w})` 進行運算。")
         else:
             div_pairs = [(5, 20), (5, 60), (20, 60)]
-            st.info(f"💡 系統將自動同時比對三組週期參數進行背離運算。")
+            st.info("💡 系統將自動同時比對三組週期參數進行背離運算。")
             
         max_older_w = max(pair[1] for pair in div_pairs)
-        
-        # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數 + 轉折判定緩衝)
         buffer_days = max_older_w + st.session_state.pivot_left + 30 
         total_needed_days = st.session_state.lookback_start + buffer_days
         
-        # 根據所需天數，決定 yfinance 下載的 period，避免抓取過多無用資料
-        if total_needed_days <= 60:
-            dl_period = "3mo"
-        elif total_needed_days <= 120:
-            dl_period = "6mo"
-        elif total_needed_days <= 250:
-            dl_period = "1y"
-        elif total_needed_days <= 500:
-            dl_period = "2y"
-        elif total_needed_days <= 1250:
-            dl_period = "5y"
-        else:
-            dl_period = "10y"
+        if total_needed_days <= 60: dl_period = "3mo"
+        elif total_needed_days <= 120: dl_period = "6mo"
+        elif total_needed_days <= 250: dl_period = "1y"
+        elif total_needed_days <= 500: dl_period = "2y"
+        elif total_needed_days <= 1250: dl_period = "5y"
+        else: dl_period = "10y"
             
-        # 針對 60分K 動態優化 (最高限制為 730d)
-        if total_needed_days <= 60:
-            dl_period_60m = "3mo"
-        elif total_needed_days <= 120:
-            dl_period_60m = "6mo"
-        else:
-            dl_period_60m = "730d"
+        if total_needed_days <= 60: dl_period_60m = "3mo"
+        elif total_needed_days <= 120: dl_period_60m = "6mo"
+        else: dl_period_60m = "730d"
 
         stock_dict = get_all_tw_stocks()
         if not stock_dict:
@@ -749,19 +707,13 @@ with tab2:
                     data = yf.download(chunk, period=dl_period, threads=True, progress=False)
                     for ticker in chunk:
                         try:
-                            if len(chunk) == 1:
-                                df = data.copy()
+                            # 【效能與穩定度優化】: 安全解析 yfinance MultiIndex DataFrame
+                            if isinstance(data.columns, pd.MultiIndex):
+                                df = data.xs(ticker, axis=1, level=1).dropna(how='all')
                             else:
-                                df = pd.DataFrame({
-                                    'Open': data['Open'][ticker],
-                                    'High': data['High'][ticker],
-                                    'Low': data['Low'][ticker],
-                                    'Close': data['Close'][ticker],
-                                    'Volume': data['Volume'][ticker]
-                                }).dropna()
-                            
-                            # 確保資料長度足夠涵蓋掃描區間與緩衝天數
-                            if len(df) <= st.session_state.lookback_start + 20: 
+                                df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
+                                
+                            if df.empty or len(df) <= st.session_state.lookback_start + 20:
                                 continue
                                 
                             df['Pct_Change'] = df['Close'].pct_change() * 100
@@ -806,6 +758,7 @@ with tab2:
                                 reversal_candidates[ticker] = {
                                     "_Full_Ticker": ticker,
                                     "_Offset": offset_for_best_row, 
+                                    "_Daily_DF": df.copy(), # 【效能優化】: 將計算好的日線資料緩存，供階段二直接使用
                                     "股票代號": clean_ticker,
                                     "股票名稱": stock_dict[ticker],
                                     "觸發日期": best_target_row.name.strftime('%Y-%m-%d'),
@@ -813,9 +766,9 @@ with tab2:
                                     "月均量(張)": int(best_target_row['Vol_MA20']),
                                     "反轉權重分數": round(float(best_score_in_range), 2)
                                 }
-                        except Exception:
+                        except Exception as e:
                             continue
-                except Exception:
+                except Exception as e:
                     pass
                 progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
             
@@ -833,18 +786,18 @@ with tab2:
                     try:
                         ticker = item.pop("_Full_Ticker")
                         specific_offset = item.pop("_Offset") 
+                        # 【效能優化】: 直接取回階段一已下載完成的資料，省去 API 重複請求與延遲
+                        daily_df = item.pop("_Daily_DF") 
                         
                         has_daily_div = False
                         has_m60_div = False
                         
-                        # 提取變數供演算法使用
                         rl_cnt = st.session_state.recent_lows_cnt
                         ol_cnt = st.session_state.older_lows_cnt
                         p_left = st.session_state.pivot_left
                         p_right = st.session_state.pivot_right
                         
                         # ================= 1. 日K背離判定 =================
-                        daily_df = yf.Ticker(ticker).history(period=dl_period)
                         if not daily_df.empty:
                             if specific_offset > 0 and len(daily_df) > specific_offset:
                                 daily_df = daily_df.iloc[:-specific_offset]
