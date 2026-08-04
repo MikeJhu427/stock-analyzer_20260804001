@@ -266,7 +266,6 @@ def get_stock_data(symbol):
             return df, ticker
     return pd.DataFrame(), code
 
-
 # ==========================================
 # 介面主程式與 Session State 初始化
 # ==========================================
@@ -284,14 +283,14 @@ def apply_profile_to_state(profile_name):
     prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
     for k, v in prof.items():
         st.session_state[k] = v
-    # 儲存最後使用的紀錄
+    # 更新當前設定與記錄
+    st.session_state.current_profile = profile_name
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
 
 # 系統首次執行時，將當前設定檔寫入 Widget 對應的 Session State
 if "lookback_end" not in st.session_state:
     apply_profile_to_state(st.session_state.current_profile)
-
 
 st.title("📈 台股 K線型態與位階深度解析系統")
 
@@ -531,20 +530,19 @@ with tab2:
         profile_names = list(st.session_state.config["profiles"].keys())
         idx = profile_names.index(st.session_state.current_profile) if st.session_state.current_profile in profile_names else 0
         
-        def on_profile_change():
-            sel = st.session_state.profile_selector
-            st.session_state.current_profile = sel
-            apply_profile_to_state(sel)
-            
         col_p1, col_p2, col_p3, col_p4 = st.columns([3, 3, 2, 2])
         with col_p1:
             selected_profile = st.selectbox(
                 "選擇歷史設定檔", 
                 profile_names, 
-                index=idx, 
-                key="profile_selector", 
-                on_change=on_profile_change
+                index=idx
             )
+            
+            # 【核心修復】：利用同步狀態檢查，一旦發現下拉選單變更，立刻覆蓋 Session 並強制重繪
+            if selected_profile != st.session_state.current_profile:
+                apply_profile_to_state(selected_profile)
+                st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
+                
         with col_p2:
             new_profile_name = st.text_input("儲存新名稱", placeholder="輸入自訂設定檔名稱...")
         with col_p3:
@@ -552,7 +550,7 @@ with tab2:
             st.write("")
             if st.button("💾 儲存設定", use_container_width=True):
                 name_to_save = new_profile_name.strip() or selected_profile
-                # 收集當下最新輸入的參數
+                # 收集當下最新的所有參數，準備寫入設定檔
                 current_vals = {
                     "lookback_end": st.session_state.lookback_end,
                     "lookback_start": st.session_state.lookback_start,
@@ -581,9 +579,6 @@ with tab2:
                     st.error("系統預設參數不可刪除！")
                 else:
                     del st.session_state.config["profiles"][selected_profile]
-                    st.session_state.config["last_used"] = "預設參數 (Default)"
-                    st.session_state.current_profile = "預設參數 (Default)"
-                    save_config(st.session_state.config)
                     apply_profile_to_state("預設參數 (Default)")
                     st.success(f"已刪除版本：'{selected_profile}'")
                     st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
@@ -605,7 +600,7 @@ with tab2:
                 key="lookback_start",
                 help="若此數值大於起算天數，系統會掃描該段期間(多日)內任何曾觸發反轉訊號的股票。"
             )
-            # 防呆機制 (因綁定 Session State，此處改用變數比對)
+            # 防呆機制：因綁定 Session State，改為判斷變數
             if lookback_start < lookback_end:
                 st.warning("⚠️ 「最多回推天數」不能小於「起算天數」，已自動為您修正。")
                 lookback_start = lookback_end
