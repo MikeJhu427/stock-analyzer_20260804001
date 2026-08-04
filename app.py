@@ -3,6 +3,8 @@ import json
 import warnings
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import numpy as np
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -194,8 +196,28 @@ class DivergenceStrategy:
         return True
 
 # ==========================================
-# 資料抓取與共用函式
+# 資料抓取與共用函式 (含防阻擋機制)
 # ==========================================
+def get_yf_session():
+    """建立帶有自動重試機制與偽裝 User-Agent 的 Session，降低被 Yahoo 阻擋的機率"""
+    session = requests.Session()
+    # 設定重試機制：遇到 429 (Rate Limit) 或伺服器錯誤時，自動退避並重試 3 次
+    retry = Retry(
+        total=3,
+        read=3,
+        connect=3,
+        backoff_factor=1.5,  # 延遲時間將成倍數增長 (1.5s, 3s, 4.5s)
+        status_forcelist=(429, 500, 502, 503, 504),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    # 偽裝成一般的 Chrome 瀏覽器
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    return session
+
 @st.cache_data(ttl=86400)
 def get_all_tw_stocks():
     """抓取台股上市/上櫃全部普通股代號與名稱"""
@@ -218,8 +240,9 @@ def get_all_tw_stocks():
             pass
     return stocks
 
-@st.cache_data(ttl=3600)  # 新增 Cache：避免同檔股票重複爬取名稱
+@st.cache_data(ttl=3600)
 def get_tw_stock_name(ticker):
+    """緩存股票名稱，避免重複查詢網頁"""
     code = ticker.split('.')[0]
     try:
         url = f"https://tw.stock.yahoo.com/quote/{code}"
@@ -233,22 +256,33 @@ def get_tw_stock_name(ticker):
     except Exception:
         pass
     try:
-        return yf.Ticker(ticker).info.get('shortName', code)
+        return yf.Ticker(ticker, session=get_yf_session()).info.get('shortName', code)
     except Exception:
         return code
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_data(symbol):
+    """抓取單檔股票資料 (含快取機制與防阻擋 Session)"""
     code = str(symbol).strip().upper()
     if code.endswith(".TW") or code.endswith(".TWO"):
         targets = [code]
     else:
         targets = [f"{code}.TW", f"{code}.TWO"]
         
+    session = get_yf_session()
+    
     for ticker in targets:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="2y")
-        if not df.empty:
-            return df, ticker
+        try:
+            # 將穩健的 session 傳遞給 yfinance
+            stock = yf.Ticker(ticker, session=session)
+            df = stock.history(period="2y")
+            if not df.empty:
+                return df, ticker
+        except Exception as e:
+            # 若發生例外錯誤，則跳過繼續嘗試下一個後綴
+            logging.warning(f"Fetch failed for {ticker}: {e}")
+            continue
+            
     return pd.DataFrame(), code
 
 # ==========================================
@@ -307,7 +341,7 @@ with tab1:
             df, real_ticker = get_stock_data(user_input)
             
             if df.empty:
-                st.error(f"❌ 查無 [{user_input}] 的歷史數據，請確認代號是否正確。")
+                st.error(f"❌ 查無 [{user_input}] 的歷史數據，請確認代號是否正確。或請稍後再試 (可能遭遇連線限制)。")
             else:
                 stock_name = get_tw_stock_name(real_ticker)
                 st.subheader(f"📊 【{stock_name} ({real_ticker})】 K線型態解析")
@@ -704,7 +738,15 @@ with tab2:
                 chunk = tickers[i:i+chunk_size]
                 status_text.text(f"[階段一] 正在全市場區間掃描：進度 {i} / {len(tickers)} 檔...")
                 try:
-                    data = yf.download(chunk, period=dl_period, threads=True, progress=False)
+                    # 【防阻擋優化】: 關閉 threads 並套用穩健的 Session
+                    data = yf.download(
+                        chunk, 
+                        period=dl_period, 
+                        threads=False, 
+                        progress=False,
+                        session=get_yf_session()
+                    )
+                    
                     for ticker in chunk:
                         try:
                             # 【效能與穩定度優化】: 安全解析 yfinance MultiIndex DataFrame
@@ -829,7 +871,9 @@ with tab2:
                                 item[f"日K背離({r_w},{o_w})"] = "無資料"
                         
                         # ================= 2. 60分K背離判定 =================
-                        m60_df = yf.Ticker(ticker).history(period=dl_period_60m, interval="60m")
+                        # 【防阻擋優化】: 使用套用防阻擋機制的 Session
+                        m60_df = yf.Ticker(ticker, session=get_yf_session()).history(period=dl_period_60m, interval="60m")
+                        
                         if specific_offset > 0 and not daily_df.empty:
                             target_date = daily_df.index[-1].date()
                             mask = [d.date() <= target_date for d in m60_df.index]
