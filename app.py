@@ -1,4 +1,5 @@
 import os
+import json
 import warnings
 import logging
 import requests
@@ -16,7 +17,41 @@ warnings.filterwarnings("ignore")
 logging.getLogger('matplotlib.font_manager').disabled = True
 
 # ==========================================
-# 獨立模組 1：技術指標計算 (鬆散耦合設計)
+# 參數設定檔管理模組 (JSON 本機儲存)
+# ==========================================
+PARAMS_FILE = "params_config.json"
+
+DEFAULT_PARAMS = {
+    "lookback_end": 0,
+    "lookback_start": 0,
+    "min_score": 8.0,
+    "min_vol_ma20": 1000,
+    "use_single_div": False,
+    "div_recent_w": 5,
+    "div_older_w": 20,
+    "pivot_left": 0,
+    "pivot_right": 0,
+    "recent_lows_cnt": 0,
+    "older_lows_cnt": 0
+}
+
+def load_config():
+    """讀取本機參數設定檔，若無則建立預設結構"""
+    if os.path.exists(PARAMS_FILE):
+        try:
+            with open(PARAMS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_used": "預設參數 (Default)", "profiles": {"預設參數 (Default)": DEFAULT_PARAMS}}
+
+def save_config(config):
+    """將參數設定檔寫入本機 JSON"""
+    with open(PARAMS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=4)
+
+# ==========================================
+# 獨立模組 1：技術指標計算
 # ==========================================
 class TechnicalIndicators:
     @staticmethod
@@ -43,23 +78,24 @@ class TechnicalIndicators:
         return df
 
 # ==========================================
-# 獨立模組 2：背離策略判斷 (鬆散耦合設計)
+# 獨立模組 2：背離策略判斷 
 # ==========================================
 class DivergenceStrategy:
     @staticmethod
     def check_bottom_divergence(
         df, price_col='Low', ind_col='K', ind_signal_col='D', 
         recent_w=20, older_w=60, 
-        recent_lows_cnt=3, older_lows_cnt=5,
-        pivot_left=3, pivot_right=3
+        recent_lows_cnt=0, older_lows_cnt=0,
+        pivot_left=0, pivot_right=0
     ):
         """
         判定底背離邏輯 (多低點嚴格驗證版)：
         1. 定義近波與前波範圍，並找出近波的「絕對最低點」(p1, i1)。
-        2. 轉折低點定義：該 K 棒價格必須是 [往前左抓 left 根, 往後右抓 right 根] 區間內的最小值。(右側若不足則抓到最新一根為止)
-        3. 本波比對：在近波內找出所有轉折低點，排除絕對最低點後，取最低的 `recent_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
-        4. 前波比對：在前波內找出所有轉折低點，取最低的 `older_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
-        5. 背離定義：過去轉折點價格 > p1 (價格破底) 且 過去指標 < i1 (指標不破底)，且兩點之間指標曾發生過死叉。
+        2. 若 recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right 均為 0，則退回基礎絕對低點比對。
+        3. 轉折低點定義：該 K 棒價格必須是 [往前左抓 left 根, 往後右抓 right 根] 區間內的最小值。(右側若不足則抓到最新一根為止)
+        4. 本波比對：在近波內找出所有轉折低點，排除絕對最低點後，取最低的 `recent_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
+        5. 前波比對：在前波內找出所有轉折低點，取最低的 `older_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
+        6. 背離定義：過去轉折點價格 > p1 (價格破底) 且 過去指標 < i1 (指標不破底)，且兩點之間指標曾發生過死叉。
         """
         if len(df) < older_w:
             return False
@@ -79,22 +115,12 @@ class DivergenceStrategy:
         
         # 1. 尋找近波絕對第一低點
         recent_prices = prices[recent_start:recent_end]
+        if len(recent_prices) == 0:
+            return False
         idx1_iloc = recent_start + np.argmin(recent_prices)
         p1 = prices[idx1_iloc]
         i1 = k_vals[idx1_iloc]
         
-        def get_valid_pivots_iloc(start_loc, end_loc):
-            """取得區間內的所有轉折低點索引"""
-            pivots = []
-            for i_loc in range(start_loc, end_loc):
-                s = max(0, i_loc - pivot_left)
-                # 往右取若遇到邊界，min() 自動支援切片至最後一筆
-                e = min(len(prices), i_loc + pivot_right + 1)
-                window = prices[s:e]
-                if prices[i_loc] == np.min(window):
-                    pivots.append(i_loc)
-            return pivots
-            
         def check_divergence_condition(p_iloc):
             """單點背離與死叉條件驗證"""
             p2 = prices[p_iloc]
@@ -121,40 +147,65 @@ class DivergenceStrategy:
             return True
 
         # ==========================
+        # 判斷是否全為 0，若是，則關閉嚴格多點判定，退回基礎的絕對單低點比對
+        # ==========================
+        if recent_lows_cnt == 0 and older_lows_cnt == 0 and pivot_left == 0 and pivot_right == 0:
+            older_prices = prices[older_start:older_end]
+            if len(older_prices) == 0:
+                return False
+            idx2_iloc = older_start + np.argmin(older_prices)
+            return check_divergence_condition(idx2_iloc)
+
+        # 嚴格轉折判定函式
+        def get_valid_pivots_iloc(start_loc, end_loc):
+            """取得區間內的所有轉折低點索引"""
+            pivots = []
+            for i_loc in range(start_loc, end_loc):
+                s = max(0, i_loc - pivot_left)
+                # 往右取若遇到邊界，min() 自動支援切片至最後一筆
+                e = min(len(prices), i_loc + pivot_right + 1)
+                window = prices[s:e]
+                if prices[i_loc] == np.min(window):
+                    pivots.append(i_loc)
+            return pivots
+
+        # ==========================
         # 2. 本波(近波) 其他低點比對
         # ==========================
-        recent_pivots_iloc = get_valid_pivots_iloc(recent_start, recent_end)
-        # 排除本波絕對最低點
-        if idx1_iloc in recent_pivots_iloc:
-            recent_pivots_iloc.remove(idx1_iloc)
-            
-        # 若本波內沒有其他低點，視為無法滿足多點比對條件
-        if not recent_pivots_iloc:
-            return False
-            
-        # 取本波價格最低的前 N 個轉折低點
-        recent_pivots_iloc = sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]
-        
-        # 本波找出的低點 "全數" 都必須滿足背離條件
-        for p_iloc in recent_pivots_iloc:
-            if not check_divergence_condition(p_iloc):
+        if recent_lows_cnt > 0:
+            recent_pivots_iloc = get_valid_pivots_iloc(recent_start, recent_end)
+            # 排除本波絕對最低點
+            if idx1_iloc in recent_pivots_iloc:
+                recent_pivots_iloc.remove(idx1_iloc)
+                
+            # 若本波內沒有其他低點，視為無法滿足多點比對條件
+            if not recent_pivots_iloc:
                 return False
                 
+            # 取本波價格最低的前 N 個轉折低點
+            recent_pivots_iloc = sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]
+            
+            # 本波找出的低點 "全數" 都必須滿足背離條件
+            for p_iloc in recent_pivots_iloc:
+                if not check_divergence_condition(p_iloc):
+                    return False
+                    
         # ==========================
         # 3. 前波低點比對
         # ==========================
-        older_pivots_iloc = get_valid_pivots_iloc(older_start, older_end)
-        if not older_pivots_iloc:
-            return False
-            
-        # 取前波價格最低的前 M 個轉折低點
-        older_pivots_iloc = sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]
-        
-        # 前波找出的低點 "全數" 都必須滿足背離條件
-        for p_iloc in older_pivots_iloc:
-            if not check_divergence_condition(p_iloc):
+        if older_lows_cnt > 0:
+            older_pivots_iloc = get_valid_pivots_iloc(older_start, older_end)
+            if not older_pivots_iloc:
                 return False
                 
+            # 取前波價格最低的前 M 個轉折低點
+            older_pivots_iloc = sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]
+            
+            # 前波找出的低點 "全數" 都必須滿足背離條件
+            for p_iloc in older_pivots_iloc:
+                if not check_divergence_condition(p_iloc):
+                    return False
+                    
         # 全部條件皆通過，判定底背離強烈成立
         return True
 
@@ -217,9 +268,31 @@ def get_stock_data(symbol):
 
 
 # ==========================================
-# 介面主程式
+# 介面主程式與 Session State 初始化
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
+
+# 載入設定檔到 Session State
+if "config" not in st.session_state:
+    st.session_state.config = load_config()
+
+if "current_profile" not in st.session_state:
+    st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
+
+def apply_profile_to_state(profile_name):
+    """將指定的參數檔內容套用到 st.session_state，並記錄為最後使用版本"""
+    prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
+    for k, v in prof.items():
+        st.session_state[k] = v
+    # 儲存最後使用的紀錄
+    st.session_state.config["last_used"] = profile_name
+    save_config(st.session_state.config)
+
+# 系統首次執行時，將當前設定檔寫入 Widget 對應的 Session State
+if "lookback_end" not in st.session_state:
+    apply_profile_to_state(st.session_state.current_profile)
+
+
 st.title("📈 台股 K線型態與位階深度解析系統")
 
 # 隱藏右上角工具列（包含 GitHub 連結）
@@ -448,25 +521,91 @@ with tab1:
         """)
 
 # ----------------------------------------------------
-# 頁籤 2：全市場掃描 (包含嚴格轉折低點比對)
+# 頁籤 2：全市場掃描 (包含嚴格轉折低點比對與參數管理)
 # ----------------------------------------------------
 with tab2:
     st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測多組技術底背離。")
     
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
+        st.markdown("**📂 參數設定檔管理**")
+        profile_names = list(st.session_state.config["profiles"].keys())
+        idx = profile_names.index(st.session_state.current_profile) if st.session_state.current_profile in profile_names else 0
+        
+        def on_profile_change():
+            sel = st.session_state.profile_selector
+            st.session_state.current_profile = sel
+            apply_profile_to_state(sel)
+            
+        col_p1, col_p2, col_p3, col_p4 = st.columns([3, 3, 2, 2])
+        with col_p1:
+            selected_profile = st.selectbox(
+                "選擇歷史設定檔", 
+                profile_names, 
+                index=idx, 
+                key="profile_selector", 
+                on_change=on_profile_change
+            )
+        with col_p2:
+            new_profile_name = st.text_input("儲存新名稱", placeholder="輸入自訂設定檔名稱...")
+        with col_p3:
+            st.write("")
+            st.write("")
+            if st.button("💾 儲存設定", use_container_width=True):
+                name_to_save = new_profile_name.strip() or selected_profile
+                # 收集當下最新輸入的參數
+                current_vals = {
+                    "lookback_end": st.session_state.lookback_end,
+                    "lookback_start": st.session_state.lookback_start,
+                    "min_score": st.session_state.min_score,
+                    "min_vol_ma20": st.session_state.min_vol_ma20,
+                    "use_single_div": st.session_state.use_single_div,
+                    "div_recent_w": st.session_state.div_recent_w,
+                    "div_older_w": st.session_state.div_older_w,
+                    "pivot_left": st.session_state.pivot_left,
+                    "pivot_right": st.session_state.pivot_right,
+                    "recent_lows_cnt": st.session_state.recent_lows_cnt,
+                    "older_lows_cnt": st.session_state.older_lows_cnt
+                }
+                st.session_state.config["profiles"][name_to_save] = current_vals
+                st.session_state.config["last_used"] = name_to_save
+                st.session_state.current_profile = name_to_save
+                save_config(st.session_state.config)
+                st.success(f"已成功儲存版本：'{name_to_save}'")
+                st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
+                
+        with col_p4:
+            st.write("")
+            st.write("")
+            if st.button("🗑️ 刪除", use_container_width=True):
+                if selected_profile == "預設參數 (Default)":
+                    st.error("系統預設參數不可刪除！")
+                else:
+                    del st.session_state.config["profiles"][selected_profile]
+                    st.session_state.config["last_used"] = "預設參數 (Default)"
+                    st.session_state.current_profile = "預設參數 (Default)"
+                    save_config(st.session_state.config)
+                    apply_profile_to_state("預設參數 (Default)")
+                    st.success(f"已刪除版本：'{selected_profile}'")
+                    st.rerun() if hasattr(st, "rerun") else st.experimental_rerun()
+                    
+        st.markdown("---")
+
         st.markdown("**1. 基礎掃描參數**")
         col_a, col_b, col_c = st.columns(3)
         with col_a:
             lookback_end = st.number_input(
                 "掃描區間：從幾天前起算？ (最新為 0)", 
-                min_value=0, max_value=1000, value=0, step=1,
+                min_value=0, max_value=1000, step=1,
+                key="lookback_end",
                 help="例如設定 0 表示從最新交易日開始往回掃描。"
             )
             lookback_start = st.number_input(
                 "掃描區間：最多回推至幾天前？", 
-                min_value=0, max_value=1000, value=0, step=1,
+                min_value=0, max_value=1000, step=1,
+                key="lookback_start",
                 help="若此數值大於起算天數，系統會掃描該段期間(多日)內任何曾觸發反轉訊號的股票。"
             )
+            # 防呆機制 (因綁定 Session State，此處改用變數比對)
             if lookback_start < lookback_end:
                 st.warning("⚠️ 「最多回推天數」不能小於「起算天數」，已自動為您修正。")
                 lookback_start = lookback_end
@@ -474,57 +613,65 @@ with tab2:
         with col_b:
             min_score = st.number_input(
                 "最低反轉權重分數", 
-                min_value=1.0, max_value=30.0, value=8.0, step=1.0,
+                min_value=1.0, max_value=30.0, step=1.0,
+                key="min_score",
                 help="【已最佳化】預設 8.0，過濾弱勢小紅K，確保底部成型力道。"
             )
         with col_c:
             min_vol_ma20 = st.number_input(
                 "月均量最低門檻 (張)", 
-                min_value=0, max_value=100000, value=1000, step=100,
+                min_value=0, max_value=100000, step=100,
+                key="min_vol_ma20",
                 help="【已最佳化】預設 1000 張，避開流動性不佳的殭屍股。"
             )
         
         st.markdown("**2. 背離檢測週期設定**")
-        use_single_div = st.checkbox("啟用單一組自訂背離週期 (未勾選則預設比對三組：(5,20)、(5,60)、(20,60))", value=False)
+        use_single_div = st.checkbox("啟用單一組自訂背離週期 (未勾選則預設比對三組：(5,20)、(5,60)、(20,60))", key="use_single_div")
         col_d, col_e = st.columns(2)
         with col_d:
             div_recent_w = st.number_input(
                 "自訂：第一低點(近波)範圍", 
-                min_value=5, max_value=60, value=5, step=1,
+                min_value=5, max_value=60, step=1,
+                key="div_recent_w",
                 disabled=not use_single_div
             )
         with col_e:
             div_older_w = st.number_input(
                 "自訂：第二低點(前波)範圍", 
-                min_value=10, max_value=240, value=20, step=1,
+                min_value=10, max_value=240, step=1,
+                key="div_older_w",
                 disabled=not use_single_div
             )
 
-        st.markdown("**3. 嚴格轉折點與比對數量設定**")
+        st.markdown("**3. 嚴格轉折點與比對數量設定 (四者皆設為 0 時將自動關閉嚴格邏輯，退回基礎比對)**")
         col_f, col_g, col_h, col_i = st.columns(4)
         with col_f:
             pivot_left = st.number_input(
                 "轉折判定：往前抓K棒數", 
-                min_value=1, max_value=20, value=3, step=1,
-                help="低點定義：價格必須是(往前+往後)這段區間內的最低價。"
+                min_value=0, max_value=20, step=1,
+                key="pivot_left",
+                help="低點定義：價格必須是(往前+往後)這段區間內的最低價。皆設為 0 時關閉多點嚴格邏輯。"
             )
         with col_g:
             pivot_right = st.number_input(
                 "轉折判定：往後取K棒數", 
-                min_value=1, max_value=20, value=3, step=1,
-                help="遇到最新資料往後數量不足時，會自動抓到最新一筆為止。"
+                min_value=0, max_value=20, step=1,
+                key="pivot_right",
+                help="遇到最新資料往後數量不足時，會自動抓到最新一筆為止。皆設為 0 時關閉多點嚴格邏輯。"
             )
         with col_h:
             recent_lows_cnt = st.number_input(
                 "本波(近波)比對低點數", 
-                min_value=1, max_value=20, value=3, step=1,
-                help="排除絕對最低點後，找出近波前幾低的轉折點，全都必須滿足底背離。"
+                min_value=0, max_value=20, step=1,
+                key="recent_lows_cnt",
+                help="排除絕對最低點後，找出近波前幾低的轉折點，全都必須滿足底背離。皆設為 0 時關閉此邏輯。"
             )
         with col_i:
             older_lows_cnt = st.number_input(
                 "前波比對低點數 (X)", 
-                min_value=1, max_value=20, value=5, step=1,
-                help="找出前波前幾低的轉折點，也都必須全部滿足底背離才成立。"
+                min_value=0, max_value=20, step=1,
+                key="older_lows_cnt",
+                help="找出前波前幾低的轉折點，也都必須全部滿足底背離才成立。皆設為 0 時關閉此邏輯。"
             )
 
     st.markdown("---")
@@ -533,10 +680,10 @@ with tab2:
         # 根據勾選狀態，決定檢測一組或三組背離參數
         if use_single_div:
             div_pairs = [(div_recent_w, div_older_w)]
-            st.info(f"💡 系統將使用您自訂的週期參數 `({div_recent_w}, {div_older_w})`，並依據您設定的轉折條件嚴格篩選多個低點。")
+            st.info(f"💡 系統將使用您自訂的週期參數 `({div_recent_w}, {div_older_w})` 進行背離運算。")
         else:
             div_pairs = [(5, 20), (5, 60), (20, 60)]
-            st.info(f"💡 系統將自動同時比對三組週期參數，並依據您設定的轉折條件嚴格篩選多個低點。")
+            st.info(f"💡 系統將自動同時比對三組週期參數進行背離運算。")
             
         max_older_w = max(pair[1] for pair in div_pairs)
         
