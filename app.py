@@ -47,56 +47,116 @@ class TechnicalIndicators:
 # ==========================================
 class DivergenceStrategy:
     @staticmethod
-    def check_bottom_divergence(df, price_col='Low', ind_col='K', ind_signal_col='D', recent_w=20, older_w=60, x_lows=5):
+    def check_bottom_divergence(
+        df, price_col='Low', ind_col='K', ind_signal_col='D', 
+        recent_w=20, older_w=60, 
+        recent_lows_cnt=3, older_lows_cnt=5,
+        pivot_left=3, pivot_right=3
+    ):
         """
-        判定底背離邏輯 (優化版：支援比對前波 X 個低點)：
-        1. 尋找近波低點 (第一低點)
-        2. 尋找前波前 X 個低點 (第 1 ~ 第 X 低點)
-        3. 針對這 X 個低點逐一比對：
-           條件A: 價格破底 (前波低點 > 第一低點)
-           條件B: 指標不破底 (前波指標 < 第一指標)
-           條件C: 兩波低點之間，指標必須曾經發生過死叉 (確認中間有形成反彈山峰)
-        4. 只要有任一個前波低點符合上述條件，即判定背離成立。
+        判定底背離邏輯 (多低點嚴格驗證版)：
+        1. 定義近波與前波範圍，並找出近波的「絕對最低點」(p1, i1)。
+        2. 轉折低點定義：該 K 棒價格必須是 [往前左抓 left 根, 往後右抓 right 根] 區間內的最小值。(右側若不足則抓到最新一根為止)
+        3. 本波比對：在近波內找出所有轉折低點，排除絕對最低點後，取最低的 `recent_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
+        4. 前波比對：在前波內找出所有轉折低點，取最低的 `older_lows_cnt` 個。這幾個低點全數必須與 p1 構成背離。
+        5. 背離定義：過去轉折點價格 > p1 (價格破底) 且 過去指標 < i1 (指標不破底)，且兩點之間指標曾發生過死叉。
         """
         if len(df) < older_w:
             return False
             
-        # 1. 尋找近波第一低點
-        recent_slice = df.iloc[-recent_w:]
-        idx1 = recent_slice[price_col].idxmin()
-        p1 = df.loc[idx1, price_col]
-        i1 = df.loc[idx1, ind_col]
+        recent_start = len(df) - recent_w
+        recent_end = len(df)
+        older_start = len(df) - older_w
+        older_end = recent_start
         
-        # 2. 尋找前波 (必定早於 recent_slice)
-        older_slice = df.iloc[-older_w:-recent_w]
-        if older_slice.empty:
+        if recent_start < 0 or older_start < 0:
             return False
             
-        # 取得前波價格最低的前 X 個點
-        # 使用 nsmallest 取出最小的 x_lows 筆資料
-        bottom_x_rows = older_slice.nsmallest(x_lows, price_col)
+        # 提取資料轉為 numpy 加速運算
+        prices = df[price_col].values
+        k_vals = df[ind_col].values
+        d_vals = df[ind_signal_col].values
         
-        # 3. 針對這 X 個點，只要有任何一個構成背離即成立
-        for idx2, row2 in bottom_x_rows.iterrows():
-            p2 = row2[price_col]
-            i2 = row2[ind_col]
+        # 1. 尋找近波絕對第一低點
+        recent_prices = prices[recent_start:recent_end]
+        idx1_iloc = recent_start + np.argmin(recent_prices)
+        p1 = prices[idx1_iloc]
+        i1 = k_vals[idx1_iloc]
+        
+        def get_valid_pivots_iloc(start_loc, end_loc):
+            """取得區間內的所有轉折低點索引"""
+            pivots = []
+            for i_loc in range(start_loc, end_loc):
+                s = max(0, i_loc - pivot_left)
+                # 往右取若遇到邊界，min() 自動支援切片至最後一筆
+                e = min(len(prices), i_loc + pivot_right + 1)
+                window = prices[s:e]
+                if prices[i_loc] == np.min(window):
+                    pivots.append(i_loc)
+            return pivots
             
-            # 條件 A & B判定：價格破底，但指標未破底
-            if p2 > p1 and i2 < i1:
-                # 確保前波時間點早於近波時間點
-                if idx2 < idx1:
-                    # 條件 C判定：擷取 idx2 到 idx1 之間的資料，尋找是否發生過死叉
-                    # 死叉定義：前一根快線 >= 慢線，且當前快線 < 慢線
-                    middle_df = df.loc[idx2:idx1]
-                    if len(middle_df) > 2:
-                        cross_down = (middle_df[ind_col] < middle_df[ind_signal_col]) & \
-                                     (middle_df[ind_col].shift(1) >= middle_df[ind_signal_col].shift(1))
-                        
-                        # 如果這段期間內有發生過死叉，則確認這是一個真實背離
-                        if cross_down.any():
-                            return True
-                            
-        return False
+        def check_divergence_condition(p_iloc):
+            """單點背離與死叉條件驗證"""
+            p2 = prices[p_iloc]
+            i2 = k_vals[p_iloc]
+            # 條件 A & B: 價格破底，指標不破底
+            if not (p2 > p1 and i2 < i1):
+                return False
+                
+            s_idx = min(idx1_iloc, p_iloc)
+            e_idx = max(idx1_iloc, p_iloc)
+            
+            # 條件 C: 兩點之間必須經歷過死叉
+            if e_idx - s_idx + 1 > 2:
+                cross_found = False
+                for j in range(s_idx + 1, e_idx + 1):
+                    # 死叉：快線小於慢線，且前一根快線大於等於慢線
+                    if k_vals[j] < d_vals[j] and k_vals[j-1] >= d_vals[j-1]:
+                        cross_found = True
+                        break
+                if not cross_found:
+                    return False
+            else:
+                return False
+            return True
+
+        # ==========================
+        # 2. 本波(近波) 其他低點比對
+        # ==========================
+        recent_pivots_iloc = get_valid_pivots_iloc(recent_start, recent_end)
+        # 排除本波絕對最低點
+        if idx1_iloc in recent_pivots_iloc:
+            recent_pivots_iloc.remove(idx1_iloc)
+            
+        # 若本波內沒有其他低點，視為無法滿足多點比對條件
+        if not recent_pivots_iloc:
+            return False
+            
+        # 取本波價格最低的前 N 個轉折低點
+        recent_pivots_iloc = sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]
+        
+        # 本波找出的低點 "全數" 都必須滿足背離條件
+        for p_iloc in recent_pivots_iloc:
+            if not check_divergence_condition(p_iloc):
+                return False
+                
+        # ==========================
+        # 3. 前波低點比對
+        # ==========================
+        older_pivots_iloc = get_valid_pivots_iloc(older_start, older_end)
+        if not older_pivots_iloc:
+            return False
+            
+        # 取前波價格最低的前 M 個轉折低點
+        older_pivots_iloc = sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]
+        
+        # 前波找出的低點 "全數" 都必須滿足背離條件
+        for p_iloc in older_pivots_iloc:
+            if not check_divergence_condition(p_iloc):
+                return False
+                
+        # 全部條件皆通過，判定底背離強烈成立
+        return True
 
 # ==========================================
 # 資料抓取與共用函式
@@ -388,10 +448,10 @@ with tab1:
         """)
 
 # ----------------------------------------------------
-# 頁籤 2：全市場掃描 (包含 X低點 比對)
+# 頁籤 2：全市場掃描 (包含嚴格轉折低點比對)
 # ----------------------------------------------------
 with tab2:
-    st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測技術底背離。")
+    st.write("系統將自動抓取全部普通股資料，尋找指定區間內符合「低檔強力反轉」的標的，並進一步檢測多組技術底背離。")
     
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         st.markdown("**1. 基礎掃描參數**")
@@ -424,10 +484,9 @@ with tab2:
                 help="【已最佳化】預設 1000 張，避開流動性不佳的殭屍股。"
             )
         
-        st.markdown("**2. 背離檢測參數設定**")
+        st.markdown("**2. 背離檢測週期設定**")
         use_single_div = st.checkbox("啟用單一組自訂背離週期 (未勾選則預設比對三組：(5,20)、(5,60)、(20,60))", value=False)
-        
-        col_d, col_e, col_f = st.columns(3)
+        col_d, col_e = st.columns(2)
         with col_d:
             div_recent_w = st.number_input(
                 "自訂：第一低點(近波)範圍", 
@@ -440,11 +499,32 @@ with tab2:
                 min_value=10, max_value=240, value=20, step=1,
                 disabled=not use_single_div
             )
+
+        st.markdown("**3. 嚴格轉折點與比對數量設定**")
+        col_f, col_g, col_h, col_i = st.columns(4)
         with col_f:
-            x_lows = st.number_input(
-                "前波比對低點數量 (X)", 
+            pivot_left = st.number_input(
+                "轉折判定：往前抓K棒數", 
+                min_value=1, max_value=20, value=3, step=1,
+                help="低點定義：價格必須是(往前+往後)這段區間內的最低價。"
+            )
+        with col_g:
+            pivot_right = st.number_input(
+                "轉折判定：往後取K棒數", 
+                min_value=1, max_value=20, value=3, step=1,
+                help="遇到最新資料往後數量不足時，會自動抓到最新一筆為止。"
+            )
+        with col_h:
+            recent_lows_cnt = st.number_input(
+                "本波(近波)比對低點數", 
+                min_value=1, max_value=20, value=3, step=1,
+                help="排除絕對最低點後，找出近波前幾低的轉折點，全都必須滿足底背離。"
+            )
+        with col_i:
+            older_lows_cnt = st.number_input(
+                "前波比對低點數 (X)", 
                 min_value=1, max_value=20, value=5, step=1,
-                help="預設找出前波最深的前 5 個低點來跟第一低點比對，只要其中一個符合底背離即判定成立。"
+                help="找出前波前幾低的轉折點，也都必須全部滿足底背離才成立。"
             )
 
     st.markdown("---")
@@ -453,15 +533,15 @@ with tab2:
         # 根據勾選狀態，決定檢測一組或三組背離參數
         if use_single_div:
             div_pairs = [(div_recent_w, div_older_w)]
-            st.info(f"💡 系統將使用您自訂的週期參數 `({div_recent_w}, {div_older_w})`，且前波將比對前 {x_lows} 個低點進行運算。")
+            st.info(f"💡 系統將使用您自訂的週期參數 `({div_recent_w}, {div_older_w})`，並依據您設定的轉折條件嚴格篩選多個低點。")
         else:
             div_pairs = [(5, 20), (5, 60), (20, 60)]
-            st.info(f"💡 系統將自動同時比對三組週期參數，且前波將比對前 {x_lows} 個低點進行運算。")
+            st.info(f"💡 系統將自動同時比對三組週期參數，並依據您設定的轉折條件嚴格篩選多個低點。")
             
         max_older_w = max(pair[1] for pair in div_pairs)
         
-        # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數)
-        buffer_days = max_older_w + 30 
+        # 動態計算需要的歷史資料天數 (最多回推天數 + 指標與背離所需的緩衝天數 + 轉折判定緩衝)
+        buffer_days = max_older_w + pivot_left + 30 
         total_needed_days = lookback_start + buffer_days
         
         # 根據所需天數，決定 yfinance 下載的 period，避免抓取過多無用資料
@@ -605,9 +685,14 @@ with tab2:
                             daily_df = TechnicalIndicators.add_macd(daily_df)
                             
                             for r_w, o_w in div_pairs:
-                                # 套用新的傳遞參數：加入 x_lows 供模組動態使用
-                                d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, x_lows)
-                                d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, x_lows)
+                                d_kd = DivergenceStrategy.check_bottom_divergence(
+                                    daily_df, 'Low', 'K', 'D', 
+                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                )
+                                d_macd = DivergenceStrategy.check_bottom_divergence(
+                                    daily_df, 'Low', 'MACD', 'MACD_Signal', 
+                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                )
                                 
                                 res = []
                                 if d_kd: res.append("KD")
@@ -634,9 +719,14 @@ with tab2:
                             m60_df = TechnicalIndicators.add_macd(m60_df)
                             
                             for r_w, o_w in div_pairs:
-                                # 套用新的傳遞參數：加入 x_lows 供模組動態使用
-                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, x_lows)
-                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, x_lows)
+                                m_kd = DivergenceStrategy.check_bottom_divergence(
+                                    m60_df, 'Low', 'K', 'D', 
+                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                )
+                                m_macd = DivergenceStrategy.check_bottom_divergence(
+                                    m60_df, 'Low', 'MACD', 'MACD_Signal', 
+                                    r_w, o_w, recent_lows_cnt, older_lows_cnt, pivot_left, pivot_right
+                                )
                                 
                                 res = []
                                 if m_kd: res.append("KD")
