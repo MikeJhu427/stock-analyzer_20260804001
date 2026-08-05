@@ -94,22 +94,26 @@ class MarketRegimeFilter:
             ma20 = df['Close'].rolling(20).mean().iloc[-1]
             ma60 = df['Close'].rolling(60).mean().iloc[-1]
             
-            # 將自動運算基準價值切換為約當大台基礎
+            # 自動運算基準價值改為約當大台基礎
             basis_value = close 
             
             if close > ma20 and ma20 > ma60:
-                regime = "🟢 多頭排列 (做多環境佳)"
+                regime = "🟢 多頭排列 (做多環境佳，可適度放大部位)"
+                regime_type = "bull"
             elif close < ma20 and ma20 < ma60:
-                regime = "🔴 空頭弱勢 (建議縮小部位)"
+                regime = "🔴 空頭弱勢 (系統性風險高，強烈建議縮小部位)"
+                regime_type = "bear"
             else:
-                regime = "🟡 震盪整理 (選股不選市)"
+                regime = "🟡 震盪整理 (選股不選市，注意波段風險)"
+                regime_type = "neutral"
                 
             return {
                 "加權指數收盤": f"{close:.2f}",
                 "月線 (MA20)": f"{ma20:.2f}",
                 "季線 (MA60)": f"{ma60:.2f}",
                 "自動運算基準價值 (約當大台基礎)": f"{basis_value:.2f}",
-                "大盤環境判定": regime
+                "大盤環境判定": regime,
+                "regime_type": regime_type
             }
         except Exception as e:
             return None
@@ -535,6 +539,18 @@ with tab2:
         st.write("")
 
         st.markdown("**2. 基礎掃描參數**")
+        # 💡 新增：獨立說明的參數定義表格 (預設關閉)
+        with st.expander("📖 點我看【基礎掃描參數定義說明】", expanded=False):
+            st.markdown("""
+            | 參數名稱 | 單位 | 功能與定義說明 | 系統預設值 |
+            | :--- | :--- | :--- | :--- |
+            | **掃描區間(迄)：從幾天前起算？** | 天 | 設定掃描區間的終點。設定為 `0` 代表掃描到最新一個交易日。 | `0` |
+            | **掃描區間(起)：回推至幾天前？** | 天 | 設定掃描區間的起點。若設定為 `5`，系統會檢查過去 5 天內是否有任何一天觸發訊號。 | `0` |
+            | **底部翻轉最低分數** | 分 | 演算法評估 K 線型態與量能的反轉強度。分數越高代表底部型態越扎實、爆發量越大。 | `8.0` |
+            | **VCP收斂最低分數** | 分 | 演算法評估波動收斂與量縮的程度。滿分為 20 分，分數越高代表籌碼越安定、爆發潛力越強。 | `10.0` |
+            | **月均量最低門檻** | 張 | 過濾流動性不佳的股票。設定 `1000` 代表過去 20 日平均成交量需大於 1000 張才會列入掃描。 | `1000` |
+            """)
+            
         col_a, col_b, col_c, col_c2 = st.columns(4)
         with col_a:
             st.number_input("掃描區間(迄)：從幾天前起算？", min_value=0, max_value=1000, step=1, key="lookback_end")
@@ -563,7 +579,6 @@ with tab2:
         status_text = st.empty(); progress_bar = st.progress(0)
         status_text.text("⏳ [初始化] 正在同步台股最新代號與名稱清單，請稍候...")
         
-        # 在執行掃描前，先抓取大盤位階資訊
         yf_session = get_yf_session()
         market_info = MarketRegimeFilter.evaluate(yf_session)
         
@@ -587,7 +602,6 @@ with tab2:
             tickers = list(stock_dict.keys())
             reversal_candidates = {} 
             
-            # 第一階段：區間粗篩 (依據使用者選擇動態切換)
             chunk_size = 100
             for i in range(0, len(tickers), chunk_size):
                 chunk = tickers[i:i+chunk_size]
@@ -610,7 +624,6 @@ with tab2:
                             df['BB_Upper'] = df['MA20'] + 2 * std20
                             df['BB_Lower'] = df['MA20'] - 2 * std20
                             
-                            # 動態開關演算法
                             if algo_mode in ['全部', '底部翻轉']:
                                 df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
                             else:
@@ -654,7 +667,6 @@ with tab2:
             
             reversal_list = list(reversal_candidates.values())
             
-            # 第二階段：針對入選標的進行 日K/60分K 背離深度檢測
             if reversal_list:
                 progress_bar.progress(0)
                 status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵...")
@@ -712,12 +724,24 @@ with tab2:
                 status_text.empty(); progress_bar.empty()
                 st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合【{algo_mode}】條件的標的。")
                 
-                # 動態大盤環境資訊輸出
+                # 💡 優化：大盤環境資訊防截斷排版
                 if market_info:
                     st.markdown("### 🌐 大盤位階與期貨基準動態濾網評估結果")
-                    m_cols = st.columns(len(market_info))
-                    for m_idx, (k, v) in enumerate(market_info.items()):
-                        m_cols[m_idx].metric(label=k, value=v)
+                    # 使用欄位分隔純數值資料，避免擁擠
+                    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+                    m_col1.metric(label="加權指數收盤", value=market_info["加權指數收盤"])
+                    m_col2.metric(label="月線 (MA20)", value=market_info["月線 (MA20)"])
+                    m_col3.metric(label="季線 (MA60)", value=market_info["季線 (MA60)"])
+                    m_col4.metric(label="約當大台基礎", value=market_info["自動運算基準價值 (約當大台基礎)"])
+                    
+                    # 將環境判定獨立出來，使用醒目的提示框，解決手機版文字被截斷的問題
+                    regime_msg = f"**大盤環境判定：** {market_info['大盤環境判定']}"
+                    if market_info["regime_type"] == "bull":
+                        st.success(regime_msg)
+                    elif market_info["regime_type"] == "bear":
+                        st.error(regime_msg)
+                    else:
+                        st.warning(regime_msg)
                     st.markdown("---")
                 
                 res_df = pd.DataFrame(final_results)
