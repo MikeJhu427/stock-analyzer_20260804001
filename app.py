@@ -36,10 +36,10 @@ DEFAULT_PARAMS = {
     "pivot_right": 0,
     "recent_lows_cnt": 0,
     "older_lows_cnt": 0,
-    "kou_di_5": True,   # 新增：預設開啟 5MA 扣低判斷
-    "kou_di_10": False, # 新增：預設關閉 10MA 扣低判斷
-    "kou_di_20": True,  # 新增：預設開啟 20MA 扣低判斷
-    "kou_di_60": True   # 新增：預設開啟 60MA 扣低判斷
+    "kou_di_5": True,   # 預設開啟 5MA 扣抵判斷
+    "kou_di_10": False, # 預設關閉 10MA 扣抵判斷
+    "kou_di_20": True,  # 預設開啟 20MA 扣抵判斷
+    "kou_di_60": True   # 預設開啟 60MA 扣抵判斷
 }
 
 def load_config():
@@ -593,7 +593,7 @@ with tab2:
         
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
-        total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70  # 確保扣抵60MA有足夠緩衝
+        total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70
         
         if total_needed_days <= 60: dl_period = "3mo"
         elif total_needed_days <= 120: dl_period = "6mo"
@@ -677,7 +677,6 @@ with tab2:
             
             reversal_list = list(reversal_candidates.values())
             
-            # 決定使用者要篩選的扣抵天數
             kou_di_periods = []
             if st.session_state.kou_di_5: kou_di_periods.append(5)
             if st.session_state.kou_di_10: kou_di_periods.append(10)
@@ -700,7 +699,6 @@ with tab2:
                         if not daily_df.empty:
                             if specific_offset > 0: daily_df = daily_df.iloc[:-specific_offset]
                             
-                            # === 計算均線扣抵 ===
                             for n in kou_di_periods:
                                 if len(daily_df) >= n:
                                     curr_p = daily_df['Close'].iloc[-1]
@@ -766,7 +764,6 @@ with tab2:
                 
                 res_df = pd.DataFrame(final_results)
                 
-                # 自動排序 DataFrame 欄位 (將背離與扣抵放在最後方)
                 base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '當日收盤', '月均量(張)']
                 div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
                 kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
