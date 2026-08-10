@@ -35,7 +35,11 @@ DEFAULT_PARAMS = {
     "pivot_left": 0,
     "pivot_right": 0,
     "recent_lows_cnt": 0,
-    "older_lows_cnt": 0
+    "older_lows_cnt": 0,
+    "kou_di_5": True,   # 新增：預設開啟 5MA 扣低判斷
+    "kou_di_10": False, # 新增：預設關閉 10MA 扣低判斷
+    "kou_di_20": True,  # 新增：預設開啟 20MA 扣低判斷
+    "kou_di_60": True   # 新增：預設開啟 60MA 扣低判斷
 }
 
 def load_config():
@@ -315,7 +319,7 @@ if "lookback_end" not in st.session_state:
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (翻轉/VCP/背離)"])
+tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (翻轉/VCP/背離/扣抵)"])
 
 # ----------------------------------------------------
 # 頁籤 1：單檔深度解析
@@ -479,10 +483,9 @@ with tab1:
 # 頁籤 2：全市場智慧掃描
 # ----------------------------------------------------
 with tab2:
-    st.write("系統將自動抓取全部普通股，尋找符合「低檔強力反轉」或「VCP波動收斂」的標的，並針對入選標的進行多級別背離判定。")
+    st.write("系統將自動抓取全部普通股，尋找符合「低檔強力反轉」或「VCP波動收斂」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
     
-    # 📖 【優化新增】預設關閉的參數定義表格
-    with st.expander("📖 掃描參數與背離判定定義說明", expanded=False):
+    with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
         st.markdown("""
         | 參數名稱 | 模組分類 | 定義與邏輯說明 |
         | :--- | :--- | :--- |
@@ -491,8 +494,8 @@ with tab2:
         | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
         | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
         | **近波/前波範圍** | 背離判定 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。 |
-        | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。皆設 0 則退回基礎判定。 |
-        | **近波/前波低點數** | 背離判定 | 在指定的波段範圍內，取前 N 低的轉折點。這些點「全數」都必須與第一低點構成背離才算成立。皆設 0 則退回單一低點判定。 |
+        | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
+        | **均線扣抵判斷(5/10/20/60)** | 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
         """)
 
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
@@ -525,7 +528,11 @@ with tab2:
                         "pivot_left": st.session_state.pivot_left,
                         "pivot_right": st.session_state.pivot_right,
                         "recent_lows_cnt": st.session_state.recent_lows_cnt,
-                        "older_lows_cnt": st.session_state.older_lows_cnt
+                        "older_lows_cnt": st.session_state.older_lows_cnt,
+                        "kou_di_5": st.session_state.kou_di_5,
+                        "kou_di_10": st.session_state.kou_di_10,
+                        "kou_di_20": st.session_state.kou_di_20,
+                        "kou_di_60": st.session_state.kou_di_60
                     }
                     st.session_state.config["last_used"] = name_to_save
                     save_config(st.session_state.config)
@@ -567,6 +574,13 @@ with tab2:
         with col_g: st.number_input("右Y根不破", min_value=0, max_value=20, step=1, key="pivot_right")
         with col_h: st.number_input("近波低點數", min_value=0, max_value=20, step=1, key="recent_lows_cnt")
         with col_i: st.number_input("前波低點數", min_value=0, max_value=20, step=1, key="older_lows_cnt")
+        
+        st.markdown("**4. 均線扣抵判斷設定 (扣低有利均線向上)**")
+        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+        with col_k1: st.checkbox("啟用 5MA 扣抵判斷", key="kou_di_5")
+        with col_k2: st.checkbox("啟用 10MA 扣抵判斷", key="kou_di_10")
+        with col_k3: st.checkbox("啟用 20MA 扣抵判斷", key="kou_di_20")
+        with col_k4: st.checkbox("啟用 60MA 扣抵判斷", key="kou_di_60")
 
     st.markdown("---")
     
@@ -579,7 +593,7 @@ with tab2:
         
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
-        total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 30 
+        total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70  # 確保扣抵60MA有足夠緩衝
         
         if total_needed_days <= 60: dl_period = "3mo"
         elif total_needed_days <= 120: dl_period = "6mo"
@@ -663,10 +677,17 @@ with tab2:
             
             reversal_list = list(reversal_candidates.values())
             
-            # 第二階段：背離深度檢測
+            # 決定使用者要篩選的扣抵天數
+            kou_di_periods = []
+            if st.session_state.kou_di_5: kou_di_periods.append(5)
+            if st.session_state.kou_di_10: kou_di_periods.append(10)
+            if st.session_state.kou_di_20: kou_di_periods.append(20)
+            if st.session_state.kou_di_60: kou_di_periods.append(60)
+            
+            # 第二階段：背離與扣抵深度檢測
             if reversal_list:
                 progress_bar.progress(0)
-                status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵...")
+                status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
                 
                 final_results = []
                 for idx, item in enumerate(reversal_list):
@@ -678,6 +699,16 @@ with tab2:
                         
                         if not daily_df.empty:
                             if specific_offset > 0: daily_df = daily_df.iloc[:-specific_offset]
+                            
+                            # === 計算均線扣抵 ===
+                            for n in kou_di_periods:
+                                if len(daily_df) >= n:
+                                    curr_p = daily_df['Close'].iloc[-1]
+                                    drop_p = daily_df['Close'].iloc[-n]
+                                    item[f"扣抵狀態({n}MA)"] = "✅ 扣低" if curr_p > drop_p else "❌ 扣高"
+                                else:
+                                    item[f"扣抵狀態({n}MA)"] = "無資料"
+                            
                             daily_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(daily_df))
                             for r_w, o_w in div_pairs:
                                 d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
@@ -687,6 +718,7 @@ with tab2:
                                 if res: has_daily_div = True
                         else:
                             for r_w, o_w in div_pairs: item[f"日K背離({r_w},{o_w})"] = "無資料"
+                            for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
                         
                         m60_df = yf.Ticker(ticker, session=yf_session).history(period=dl_period_60m, interval="60m")
                         if specific_offset > 0 and not daily_df.empty:
@@ -716,27 +748,30 @@ with tab2:
                     progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
                 # ==================================
-                # 掃描完成：呈現環境狀態與結果表格 (UI 優化)
+                # 掃描完成：呈現環境狀態與結果表格
                 # ==================================
                 status_text.empty(); progress_bar.empty()
                 st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合【{algo_mode}】條件的標的。")
                 
-                # 🌐 【優化新增】大盤動態濾網排版，解決長文字截斷問題
                 if market_info:
                     st.markdown("### 🌐 大盤位階與期貨基準動態濾網評估結果")
-                    # 將數字分為四欄整齊排列
                     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
                     m_col1.metric("加權指數收盤", market_info["加權指數收盤"])
                     m_col2.metric("月線 (MA20)", market_info["月線 (MA20)"])
                     m_col3.metric("季線 (MA60)", market_info["季線 (MA60)"])
                     m_col4.metric("約當大台基礎", market_info["自動運算基準價值 (約當大台基礎)"])
                     
-                    # 狀態判定使用全寬度的 info 橫幅，徹底避免截斷
                     st.info(f"**大盤環境判定：** {market_info['大盤環境判定']}")
                     st.markdown("---")
                 
                 res_df = pd.DataFrame(final_results)
-                cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '當日收盤', '月均量(張)'] + [c for c in res_df.columns if '背離' in c and c != '演算法建議結果']
+                
+                # 自動排序 DataFrame 欄位 (將背離與扣抵放在最後方)
+                base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '當日收盤', '月均量(張)']
+                div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
+                kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
+                cols = base_cols + div_cols + kou_cols
+                
                 res_df = res_df[cols].sort_values(by=["反轉分數", "VCP分數"], ascending=[False, False]).reset_index(drop=True)
                 res_df.index = res_df.index + 1
                 
