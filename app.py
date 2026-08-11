@@ -3,6 +3,7 @@ import json
 import warnings
 import logging
 import requests
+import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
@@ -44,9 +45,12 @@ DEFAULT_PARAMS = {
     "reso_kd_older_low": 20.0,
     "reso_kd_older_high": 50.0,
     "reso_kd_recent_low": 20.0,
+    "use_macd_abs": False,        # 新增：是否啟用MACD絕對數值濾網 (預設不指定)
     "reso_macd_older_low": 0.0,
     "reso_macd_recent_low": 0.0,
-    "reso_cross_days": 3
+    "reso_cross_days": 3,
+    "use_backtest_date": False,   # 新增：是否啟用指定日期回測
+    "backtest_date": str(datetime.date.today()) # 新增：回測基準日
 }
 
 def load_config():
@@ -95,9 +99,15 @@ class TechnicalIndicators:
 class MarketRegimeFilter:
     """大盤位階與期貨基準動態濾網"""
     @staticmethod
-    def evaluate(session):
+    def evaluate(session, backtest_date_obj=None):
         try:
-            df = yf.Ticker("^TWII", session=session).history(period="3mo")
+            if backtest_date_obj:
+                end_dt = backtest_date_obj + datetime.timedelta(days=1)
+                start_dt = end_dt - datetime.timedelta(days=150)
+                df = yf.Ticker("^TWII", session=session).history(start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'))
+            else:
+                df = yf.Ticker("^TWII", session=session).history(period="3mo")
+                
             if df.empty: return None
             
             close = df['Close'].iloc[-1]
@@ -160,7 +170,8 @@ class VCPStrategy:
 class IndicatorResonanceStrategy:
     """雙指標共振起漲：精細化KD與MACD波段條件限制"""
     @staticmethod
-    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, macd_older_low_th=0, macd_recent_low_th=0, cross_days=3):
+    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, 
+                 use_macd_abs=False, macd_older_low_th=0, macd_recent_low_th=0, cross_days=3):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
 
@@ -181,7 +192,13 @@ class IndicatorResonanceStrategy:
         macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
 
         cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
-        cond_macd = (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th) & macd_recent_cross
+        
+        # MACD 核心判斷：底底高 (DIF近波最低 > 前波最低) + 近期金叉
+        cond_macd = (recent_macd_low > older_macd_low) & macd_recent_cross
+        # 若使用者有啟用絕對數值濾網，才加上指定門檻限制
+        if use_macd_abs:
+            cond_macd = cond_macd & (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th)
+            
         cond_price = recent_price_low > older_price_low
 
         resonance_score = pd.Series(0.0, index=df.index)
@@ -327,19 +344,20 @@ def apply_profile_to_state(profile_name):
     full_prof = DEFAULT_PARAMS.copy()
     full_prof.update(prof)
     for k, v in full_prof.items(): st.session_state[k] = v
+    # 同步日期物件
+    st.session_state.backtest_date_obj = pd.to_datetime(full_prof["backtest_date"]).date()
     st.session_state.current_profile = profile_name
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
 
-# 【核心修復】自動檢查所有預設參數是否已存在 Session State，避免舊存檔缺失參數導致 AttributeError
 missing_keys = [k for k in DEFAULT_PARAMS.keys() if k not in st.session_state]
-if missing_keys:
+if missing_keys or "backtest_date_obj" not in st.session_state:
     apply_profile_to_state(st.session_state.current_profile)
 
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (翻轉/VCP/共振/背離)"])
+tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)"])
 
 # ----------------------------------------------------
 # 頁籤 1：單檔深度解析
@@ -403,6 +421,7 @@ with tab1:
                     kd_older_low_th=st.session_state.reso_kd_older_low,
                     kd_older_high_th=st.session_state.reso_kd_older_high,
                     kd_recent_low_th=st.session_state.reso_kd_recent_low,
+                    use_macd_abs=st.session_state.use_macd_abs,
                     macd_older_low_th=st.session_state.reso_macd_older_low,
                     macd_recent_low_th=st.session_state.reso_macd_recent_low,
                     cross_days=st.session_state.reso_cross_days
@@ -526,13 +545,14 @@ with tab2:
         st.markdown("""
         | 參數名稱 | 模組分類 | 定義與邏輯說明 |
         | :--- | :--- | :--- |
+        | **回測基準日** | 基礎過濾 | 啟用後，系統下載的歷史資料將自動截斷至該日期。讓您能精準回到過去任意一天執行策略回測。 |
         | **底部翻轉最低分數** | 基礎過濾 | 判定低檔長紅或下影線強度的核心數值。預設 8.0 分，分數越高代表買盤力道越強、型態越完美。 |
         | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
         | **指標共振最低分數** | 基礎過濾 | 判定 KD 與 MACD 的共振強度。滿分 15 分，滿足基礎條件即給 10 分，動能越強加分越多。 |
         | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
         | **近波/前波範圍** | 背離/共振 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。共振模組亦連動此參數。 |
         | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
-        | **KD/MACD共振門檻** | 指標共振 | 設定 KD 前波高低點、近波低點限制，以及 MACD 前波與近波的數值濾網。並要求在指定天數內發生金叉。 |
+        | **KD/MACD共振門檻** | 指標共振 | 內建 MACD 底底高核心邏輯。支援設定 KD 前波高低點、近波低點限制，以及 MACD 絕對數值濾網。並要求在指定天數內發生金叉。 |
         | **均線扣抵判斷(5/10/20/60)**| 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
         """)
 
@@ -552,7 +572,7 @@ with tab2:
                 name_to_save = new_input if new_input != "" else st.session_state.profile_selector
                 if name_to_save == "預設參數 (Default)": st.error("❌ 不可覆寫系統預設參數名稱！")
                 else:
-                    # 動態存取所有 DEFAULT_PARAMS 擁有的 Key
+                    st.session_state.backtest_date = str(st.session_state.backtest_date_obj)
                     current_vals = {k: st.session_state[k] for k in DEFAULT_PARAMS.keys()}
                     st.session_state.config["profiles"][name_to_save] = current_vals
                     st.session_state.config["last_used"] = name_to_save
@@ -574,7 +594,11 @@ with tab2:
         if algo_mode == '全部':
             st.warning("💡 提示：您目前選擇【全部】演算法，標的只要符合「任一」條件即會列出。請務必查看表格中的『演算法建議結果』確認觸發類型！")
 
-        st.markdown("**2. 基礎掃描參數**")
+        st.markdown("**2. 基礎掃描參數與時光機回測設定**")
+        col_b1, col_b2, col_b3 = st.columns([1, 1, 2])
+        with col_b1: st.checkbox("啟用指定日期回測", key="use_backtest_date")
+        with col_b2: st.date_input("選擇回測基準日", key="backtest_date_obj", disabled=not st.session_state.use_backtest_date)
+            
         col_a, col_b, col_c, col_d, col_e = st.columns(5)
         with col_a:
             st.number_input("掃描區間(迄)：起算天數", min_value=0, max_value=1000, step=1, key="lookback_end")
@@ -611,8 +635,9 @@ with tab2:
             st.number_input("KD近波低點 >", value=st.session_state.reso_kd_recent_low, step=1.0, key="reso_kd_recent_low")
             st.number_input("近期金叉天數 <=", value=st.session_state.reso_cross_days, step=1, key="reso_cross_days")
         with col_r3:
-            st.number_input("MACD前波低 <", value=st.session_state.reso_macd_older_low, step=0.1, key="reso_macd_older_low")
-            st.number_input("MACD近波低 >", value=st.session_state.reso_macd_recent_low, step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0")
+            st.checkbox("啟用 MACD絕對數值濾網", key="use_macd_abs")
+            st.number_input("MACD前波低 <", value=st.session_state.reso_macd_older_low, step=0.1, key="reso_macd_older_low", disabled=not st.session_state.use_macd_abs)
+            st.number_input("MACD近波低 >", value=st.session_state.reso_macd_recent_low, step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0", disabled=not st.session_state.use_macd_abs)
 
     st.markdown("---")
     
@@ -621,20 +646,39 @@ with tab2:
         status_text.text("⏳ [初始化] 正在同步台股最新代號與名稱清單，請稍候...")
         
         yf_session = get_yf_session()
-        market_info = MarketRegimeFilter.evaluate(yf_session)
         
+        # 決定資料下載區間 (支援回測)
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
         total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70
         
-        if total_needed_days <= 60: dl_period = "3mo"
-        elif total_needed_days <= 120: dl_period = "6mo"
-        elif total_needed_days <= 250: dl_period = "1y"
-        elif total_needed_days <= 500: dl_period = "2y"
-        elif total_needed_days <= 1250: dl_period = "5y"
-        else: dl_period = "10y"
+        dl_kwargs = {}
+        dl_60m_kwargs = {}
+        
+        if st.session_state.use_backtest_date:
+            end_dt = st.session_state.backtest_date_obj + datetime.timedelta(days=1)
+            start_dt = end_dt - datetime.timedelta(days=730)
+            dl_kwargs = {"start": start_dt.strftime('%Y-%m-%d'), "end": end_dt.strftime('%Y-%m-%d')}
             
-        dl_period_60m = "3mo" if total_needed_days <= 60 else "6mo" if total_needed_days <= 120 else "730d"
+            start_60m = datetime.date.today() - datetime.timedelta(days=729)
+            if end_dt <= start_60m:
+                st.warning("⚠️ 回測基準日過早 (超過 730 天)，Yahoo Finance 不支援該時期的 60 分 K 線，短線背離檢測將顯示無資料。")
+                dl_60m_kwargs = None
+            else:
+                dl_60m_kwargs = {"start": start_60m.strftime('%Y-%m-%d'), "end": end_dt.strftime('%Y-%m-%d')}
+        else:
+            if total_needed_days <= 60: dl_period = "3mo"
+            elif total_needed_days <= 120: dl_period = "6mo"
+            elif total_needed_days <= 250: dl_period = "1y"
+            elif total_needed_days <= 500: dl_period = "2y"
+            elif total_needed_days <= 1250: dl_period = "5y"
+            else: dl_period = "10y"
+            dl_period_60m = "3mo" if total_needed_days <= 60 else "6mo" if total_needed_days <= 120 else "730d"
+            dl_kwargs = {"period": dl_period}
+            dl_60m_kwargs = {"period": dl_period_60m}
+            
+        market_info = MarketRegimeFilter.evaluate(yf_session, st.session_state.backtest_date_obj if st.session_state.use_backtest_date else None)
+        
         stock_dict = get_all_tw_stocks()
         
         if not stock_dict:
@@ -648,10 +692,16 @@ with tab2:
                 chunk = tickers[i:i+chunk_size]
                 status_text.text(f"[階段一] 正在全市場區間掃描 [{algo_mode}]：進度 {i} / {len(tickers)} 檔...")
                 try:
-                    data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=yf_session)
+                    data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
                     for ticker in chunk:
                         try:
                             df = data.xs(ticker, axis=1, level=1).dropna(how='all') if isinstance(data.columns, pd.MultiIndex) else (data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame())
+                            
+                            # 針對回測日期精確截斷資料
+                            if st.session_state.use_backtest_date:
+                                target_dt = pd.to_datetime(st.session_state.backtest_date_obj)
+                                df = df[df.index.tz_localize(None).normalize() <= target_dt]
+                                
                             if df.empty or len(df) <= st.session_state.lookback_start + 20: continue
                             
                             df = TechnicalIndicators.add_kd(df)
@@ -679,6 +729,7 @@ with tab2:
                                     kd_older_low_th=st.session_state.reso_kd_older_low,
                                     kd_older_high_th=st.session_state.reso_kd_older_high,
                                     kd_recent_low_th=st.session_state.reso_kd_recent_low,
+                                    use_macd_abs=st.session_state.use_macd_abs,
                                     macd_older_low_th=st.session_state.reso_macd_older_low,
                                     macd_recent_low_th=st.session_state.reso_macd_recent_low,
                                     cross_days=st.session_state.reso_cross_days
@@ -761,19 +812,22 @@ with tab2:
                             for r_w, o_w in div_pairs: item[f"日K背離({r_w},{o_w})"] = "無資料"
                             for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
                         
-                        m60_df = yf.Ticker(ticker, session=yf_session).history(period=dl_period_60m, interval="60m")
-                        if specific_offset > 0 and not daily_df.empty:
-                            target_date = daily_df.index[-1].date()
-                            m60_df = m60_df[[d.date() <= target_date for d in m60_df.index]]
-                            
-                        if not m60_df.empty:
-                            m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
-                            for r_w, o_w in div_pairs:
-                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
-                                item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
-                                if res: has_m60_div = True
+                        if dl_60m_kwargs is not None:
+                            m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", **dl_60m_kwargs)
+                            if specific_offset > 0 and not daily_df.empty:
+                                target_date = daily_df.index[-1].date()
+                                m60_df = m60_df[[d.date() <= target_date for d in m60_df.index]]
+                                
+                            if not m60_df.empty:
+                                m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
+                                for r_w, o_w in div_pairs:
+                                    m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                    m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                    res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
+                                    item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
+                                    if res: has_m60_div = True
+                            else:
+                                for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
                         else:
                             for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
 
@@ -790,7 +844,8 @@ with tab2:
                     progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
                 status_text.empty(); progress_bar.empty()
-                st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合條件的標的。")
+                date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
+                st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合條件的標的 {date_str}。")
                 
                 if market_info:
                     st.markdown("### 🌐 大盤位階與期貨基準動態濾網評估結果")
