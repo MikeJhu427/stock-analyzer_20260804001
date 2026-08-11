@@ -41,10 +41,12 @@ DEFAULT_PARAMS = {
     "kou_di_10": False,
     "kou_di_20": True,
     "kou_di_60": True,
-    "reso_kd_low": 20,        # 新增：KD前波低點與近波低點基準
-    "reso_kd_high": 50,       # 新增：KD前波高點基準
-    "reso_macd_val": 0.0,     # 新增：MACD判定基準
-    "reso_cross_days": 3      # 新增：近期金叉天數
+    "reso_kd_older_low": 20.0,    # KD前波低點上限
+    "reso_kd_older_high": 50.0,   # KD前波高點上限
+    "reso_kd_recent_low": 20.0,   # KD近波低點下限
+    "reso_macd_older_low": 0.0,   # MACD前波低點上限
+    "reso_macd_recent_low": 0.0,  # MACD近波低點下限 (注意：若要抓水下金叉，建議設為負數)
+    "reso_cross_days": 3          # 近期金叉天數
 }
 
 def load_config():
@@ -101,7 +103,6 @@ class MarketRegimeFilter:
             close = df['Close'].iloc[-1]
             ma20 = df['Close'].rolling(20).mean().iloc[-1]
             ma60 = df['Close'].rolling(60).mean().iloc[-1]
-            
             basis_value = close 
             
             if close > ma20 and ma20 > ma60:
@@ -137,7 +138,6 @@ class BottomReversalStrategy:
         candle_score = pd.Series(0.0, index=df.index)
         candle_score[cond_low_pin] = 7 * (lower_shadow[cond_low_pin] / total_range[cond_low_pin]) * vol_mult[cond_low_pin]
         candle_score[cond_low_red] = 5 * vol_mult[cond_low_red]
-        
         return candle_score
 
 class VCPStrategy:
@@ -155,18 +155,16 @@ class VCPStrategy:
         vcp_score = pd.Series(0.0, index=df.index)
         valid_mask = cond_uptrend & cond_vol_dry & cond_tight_price
         vcp_score[valid_mask] = vol_score[valid_mask] + tight_score[valid_mask]
-
         return vcp_score
 
 class IndicatorResonanceStrategy:
-    """雙指標共振起漲：精細化KD與MACD波段條件"""
+    """雙指標共振起漲：精細化KD與MACD波段條件限制"""
     @staticmethod
-    def evaluate(df, recent_w=5, older_w=20, kd_low_th=20, kd_high_th=50, macd_th=0.0, cross_days=3):
-        # 防呆：確保歷史資料足夠
+    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, macd_older_low_th=0, macd_recent_low_th=0, cross_days=3):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
 
-        # 1. 抓取 KD、MACD(DIF) 與 K線價格 的波段高低點
+        # 1. 抓取各波段極值 (利用 Rolling 確保捕捉範圍內的極值)
         recent_k_low = df['K'].rolling(window=recent_w, min_periods=1).min()
         older_k_low = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         older_k_high = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).max()
@@ -177,31 +175,29 @@ class IndicatorResonanceStrategy:
         recent_price_low = df['Low'].rolling(window=recent_w, min_periods=1).min()
         older_price_low = df['Low'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
 
-        # 2. 定義金叉與近期發生條件
+        # 2. 判斷是否於指定天數內發生金叉
         kd_cross = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
         macd_cross = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
 
-        # 近期 N 日內曾發生過金叉
         kd_recent_cross = kd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
         macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
 
-        # 3. 核心邏輯判定
-        # 條件 A：KD 前波低點 < 預設20，前波高點 < 預設50，近波低點 > 預設20，且近期金叉
-        cond_kd = (older_k_low < kd_low_th) & (older_k_high < kd_high_th) & (recent_k_low > kd_low_th) & kd_recent_cross
+        # 3. 嚴格對齊波段邏輯
+        # 邏輯 A：KD 條件 (前低<20, 前高<50, 近低>20, 且近期金叉)
+        cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
         
-        # 條件 B：MACD 前波低點 < 預設0，近波低點 > 預設0，且近期金叉
-        cond_macd = (older_macd_low < macd_th) & (recent_macd_low > macd_th) & macd_recent_cross
+        # 邏輯 B：MACD 條件 (前低<0, 近低>0, 且近期金叉)
+        cond_macd = (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th) & macd_recent_cross
         
-        # 條件 C：K線價格底底高
+        # 邏輯 C：K線價格底底高
         cond_price = recent_price_low > older_price_low
 
-        # 4. 合併條件並計分
+        # 4. 合併並給分
         resonance_score = pd.Series(0.0, index=df.index)
         valid_mask = cond_kd & cond_macd & cond_price
         
-        # 滿足所有嚴格條件即給予基礎 10 分，再外加 MACD 柱狀圖的動能放大分數(最高5分)
         hist_momentum = (df['MACD_Hist'] - df['MACD_Hist'].shift(1)) * 100
-        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5)
+        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5) # 基礎分10 + 動能加權
         
         return resonance_score
 
@@ -214,31 +210,21 @@ class DivergenceStrategy:
         pivot_left=0, pivot_right=0
     ):
         if len(df) < older_w: return False
-            
-        recent_start = len(df) - recent_w
-        recent_end = len(df)
-        older_start = len(df) - older_w
-        older_end = recent_start
-        
+        recent_start, recent_end = len(df) - recent_w, len(df)
+        older_start, older_end = len(df) - older_w, recent_start
         if recent_start < 0 or older_start < 0: return False
             
-        prices = df[price_col].values
-        k_vals = df[ind_col].values
-        d_vals = df[ind_signal_col].values
-        
+        prices, k_vals, d_vals = df[price_col].values, df[ind_col].values, df[ind_signal_col].values
         recent_prices = prices[recent_start:recent_end]
         if len(recent_prices) == 0: return False
+        
         idx1_iloc = recent_start + np.argmin(recent_prices)
-        p1 = prices[idx1_iloc]
-        i1 = k_vals[idx1_iloc]
+        p1, i1 = prices[idx1_iloc], k_vals[idx1_iloc]
         
         def check_divergence_condition(p_iloc):
-            p2 = prices[p_iloc]
-            i2 = k_vals[p_iloc]
+            p2, i2 = prices[p_iloc], k_vals[p_iloc]
             if not (p2 > p1 and i2 < i1): return False 
-            
-            s_idx = min(idx1_iloc, p_iloc)
-            e_idx = max(idx1_iloc, p_iloc)
+            s_idx, e_idx = min(idx1_iloc, p_iloc), max(idx1_iloc, p_iloc)
             if e_idx - s_idx + 1 > 2:
                 cross_found = False
                 for j in range(s_idx + 1, e_idx + 1):
@@ -246,8 +232,7 @@ class DivergenceStrategy:
                         cross_found = True
                         break
                 if not cross_found: return False
-            else:
-                return False
+            else: return False
             return True
 
         if recent_lows_cnt == 0 and older_lows_cnt == 0 and pivot_left == 0 and pivot_right == 0:
@@ -259,25 +244,21 @@ class DivergenceStrategy:
         def get_valid_pivots_iloc(start_loc, end_loc):
             pivots = []
             for i_loc in range(start_loc, end_loc):
-                s = max(0, i_loc - pivot_left)
-                e = min(len(prices), i_loc + pivot_right + 1)
-                window = prices[s:e]
-                if prices[i_loc] == np.min(window): pivots.append(i_loc)
+                s, e = max(0, i_loc - pivot_left), min(len(prices), i_loc + pivot_right + 1)
+                if prices[i_loc] == np.min(prices[s:e]): pivots.append(i_loc)
             return pivots
 
         if recent_lows_cnt > 0:
             recent_pivots_iloc = get_valid_pivots_iloc(recent_start, recent_end)
             if idx1_iloc in recent_pivots_iloc: recent_pivots_iloc.remove(idx1_iloc)
             if not recent_pivots_iloc: return False
-            recent_pivots_iloc = sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]
-            for p_iloc in recent_pivots_iloc:
+            for p_iloc in sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]:
                 if not check_divergence_condition(p_iloc): return False
                     
         if older_lows_cnt > 0:
             older_pivots_iloc = get_valid_pivots_iloc(older_start, older_end)
             if not older_pivots_iloc: return False
-            older_pivots_iloc = sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]
-            for p_iloc in older_pivots_iloc:
+            for p_iloc in sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]:
                 if not check_divergence_condition(p_iloc): return False
                     
         return True
@@ -311,8 +292,7 @@ def get_all_tw_stocks():
                         code, name = text.split('\u3000')
                         if code.isdigit() and len(code) == 4:
                             stocks[code + suffix] = name
-        except Exception:
-            pass
+        except Exception: pass
     return stocks
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -325,26 +305,22 @@ def get_tw_stock_name(ticker):
             soup = BeautifulSoup(res.text, 'html.parser')
             h1 = soup.find('h1')
             if h1: return h1.text.strip()
-    except Exception:
-        pass
+    except Exception: pass
     try:
         return yf.Ticker(ticker, session=get_yf_session()).info.get('shortName', code)
-    except Exception:
-        return code
+    except Exception: return code
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_data(symbol):
     code = str(symbol).strip().upper()
     targets = [code] if code.endswith(".TW") or code.endswith(".TWO") else [f"{code}.TW", f"{code}.TWO"]
     session = get_yf_session()
-    
     for ticker in targets:
         try:
             stock = yf.Ticker(ticker, session=session)
             df = stock.history(period="2y")
             if not df.empty: return df, ticker
-        except Exception as e:
-            continue
+        except Exception: continue
     return pd.DataFrame(), code
 
 # ==========================================
@@ -352,24 +328,19 @@ def get_stock_data(symbol):
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
-if "config" not in st.session_state:
-    st.session_state.config = load_config()
-
-if "current_profile" not in st.session_state:
-    st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
+if "config" not in st.session_state: st.session_state.config = load_config()
+if "current_profile" not in st.session_state: st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
 def apply_profile_to_state(profile_name):
     prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
     full_prof = DEFAULT_PARAMS.copy()
     full_prof.update(prof)
-    for k, v in full_prof.items(): 
-        st.session_state[k] = v
+    for k, v in full_prof.items(): st.session_state[k] = v
     st.session_state.current_profile = profile_name
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
 
-if "lookback_end" not in st.session_state:
-    apply_profile_to_state(st.session_state.current_profile)
+if "lookback_end" not in st.session_state: apply_profile_to_state(st.session_state.current_profile)
 
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
@@ -383,11 +354,8 @@ with tab1:
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
 
     col1, col2 = st.columns([4, 1])
-    with col1:
-        user_input = st.text_input("輸入股票代號", value="2495", placeholder="例如：2330").strip()
-    with col2:
-        st.write(""); st.write("")
-        submit_btn = st.button("開始分析", type="primary")
+    with col1: user_input = st.text_input("輸入股票代號", value="2495", placeholder="例如：2330").strip()
+    with col2: st.write(""); st.write(""); submit_btn = st.button("開始分析", type="primary")
 
     if submit_btn and user_input:
         with st.spinner(f"⏳ 正在抓取 [{user_input}] 資料並進行解析中..."):
@@ -438,9 +406,11 @@ with tab1:
                     df,
                     recent_w=st.session_state.div_recent_w,
                     older_w=st.session_state.div_older_w,
-                    kd_low_th=st.session_state.reso_kd_low,
-                    kd_high_th=st.session_state.reso_kd_high,
-                    macd_th=st.session_state.reso_macd_val,
+                    kd_older_low_th=st.session_state.reso_kd_older_low,
+                    kd_older_high_th=st.session_state.reso_kd_older_high,
+                    kd_recent_low_th=st.session_state.reso_kd_recent_low,
+                    macd_older_low_th=st.session_state.reso_macd_older_low,
+                    macd_recent_low_th=st.session_state.reso_macd_recent_low,
                     cross_days=st.session_state.reso_cross_days
                 )
                 
@@ -492,8 +462,7 @@ with tab1:
                         vwma20, prev_vwma20 = row['VWMA20'], row['Prev_VWMA20']
                         defense, prev_defense = row['Max_Vol_Defense'], row['Prev_Defense']
                         vol, vol_ma = row['Volume_Lots'], row['Vol_MA20']
-                        cps = row['Candle_Score']
-                        res_sc = row['Reso_Score']
+                        cps, res_sc = row['Candle_Score'], row['Reso_Score']
                         
                         date_str = date.strftime('%Y-%m-%d')
                         is_bull_surge = (m > row['Upper_Bound']) or (row['Pct_Change'] >= 4.0 and vol >= vol_ma * 1.5)
@@ -563,14 +532,9 @@ with tab2:
         st.markdown("""
         | 參數名稱 | 模組分類 | 定義與邏輯說明 |
         | :--- | :--- | :--- |
-        | **掃描區間(起/迄)** | 基礎過濾 | 設定系統往回推算的歷史天數。例如「起=5, 迄=0」代表掃描最近 5 天內是否有符合條件的標的。 |
         | **底部翻轉最低分數** | 基礎過濾 | 判定低檔長紅或下影線強度的核心數值。預設 8.0 分，分數越高代表買盤力道越強、型態越完美。 |
         | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
         | **指標共振最低分數** | 基礎過濾 | 判定 KD 與 MACD 的共振強度。滿分 15 分，滿足基礎條件即給 10 分，動能越強加分越多。 |
-        | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
-        | **近波/前波範圍** | 背離/共振 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。共振模組亦連動此參數。 |
-        | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
-        | **KD/MACD共振門檻** | 指標共振 | 設定 KD 前波高低點、近波低點限制，以及 MACD 前波與近波的數值濾網。並要求在指定天數內發生金叉。 |
         | **均線扣抵判斷(5/10/20/60)**| 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
         """)
 
@@ -581,10 +545,8 @@ with tab2:
         def on_profile_change(): apply_profile_to_state(st.session_state.profile_selector)
 
         col_p1, col_p2, col_p3, col_p4 = st.columns([3, 3, 2, 2])
-        with col_p1:
-            st.selectbox("選擇歷史設定檔", profile_names, index=idx, key="profile_selector", on_change=on_profile_change)
-        with col_p2:
-            st.text_input("儲存新名稱", placeholder="輸入自訂設定檔名稱...", key="new_profile_input")
+        with col_p1: st.selectbox("選擇歷史設定檔", profile_names, index=idx, key="profile_selector", on_change=on_profile_change)
+        with col_p2: st.text_input("儲存新名稱", placeholder="輸入自訂設定檔名稱...", key="new_profile_input")
         with col_p3:
             st.write(""); st.write("")
             if st.button("💾 儲存設定", use_container_width=True):
@@ -593,26 +555,17 @@ with tab2:
                 if name_to_save == "預設參數 (Default)": st.error("❌ 不可覆寫系統預設參數名稱！")
                 else:
                     st.session_state.config["profiles"][name_to_save] = {
-                        "lookback_end": st.session_state.lookback_end,
-                        "lookback_start": st.session_state.lookback_start,
-                        "min_score": st.session_state.min_score,
-                        "min_vcp_score": st.session_state.min_vcp_score,
-                        "min_reso_score": st.session_state.min_reso_score,
-                        "min_vol_ma20": st.session_state.min_vol_ma20,
-                        "use_single_div": st.session_state.use_single_div,
-                        "div_recent_w": st.session_state.div_recent_w,
-                        "div_older_w": st.session_state.div_older_w,
-                        "pivot_left": st.session_state.pivot_left,
-                        "pivot_right": st.session_state.pivot_right,
-                        "recent_lows_cnt": st.session_state.recent_lows_cnt,
-                        "older_lows_cnt": st.session_state.older_lows_cnt,
-                        "kou_di_5": st.session_state.kou_di_5,
-                        "kou_di_10": st.session_state.kou_di_10,
-                        "kou_di_20": st.session_state.kou_di_20,
-                        "kou_di_60": st.session_state.kou_di_60,
-                        "reso_kd_low": st.session_state.reso_kd_low,
-                        "reso_kd_high": st.session_state.reso_kd_high,
-                        "reso_macd_val": st.session_state.reso_macd_val,
+                        "lookback_end": st.session_state.lookback_end, "lookback_start": st.session_state.lookback_start,
+                        "min_score": st.session_state.min_score, "min_vcp_score": st.session_state.min_vcp_score,
+                        "min_reso_score": st.session_state.min_reso_score, "min_vol_ma20": st.session_state.min_vol_ma20,
+                        "use_single_div": st.session_state.use_single_div, "div_recent_w": st.session_state.div_recent_w,
+                        "div_older_w": st.session_state.div_older_w, "pivot_left": st.session_state.pivot_left,
+                        "pivot_right": st.session_state.pivot_right, "recent_lows_cnt": st.session_state.recent_lows_cnt,
+                        "older_lows_cnt": st.session_state.older_lows_cnt, "kou_di_5": st.session_state.kou_di_5,
+                        "kou_di_10": st.session_state.kou_di_10, "kou_di_20": st.session_state.kou_di_20,
+                        "kou_di_60": st.session_state.kou_di_60, "reso_kd_older_low": st.session_state.reso_kd_older_low,
+                        "reso_kd_older_high": st.session_state.reso_kd_older_high, "reso_kd_recent_low": st.session_state.reso_kd_recent_low,
+                        "reso_macd_older_low": st.session_state.reso_macd_older_low, "reso_macd_recent_low": st.session_state.reso_macd_recent_low,
                         "reso_cross_days": st.session_state.reso_cross_days
                     }
                     st.session_state.config["last_used"] = name_to_save
@@ -631,7 +584,8 @@ with tab2:
         
         st.markdown("**1. 演算法選擇**")
         algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振'], index=0, horizontal=True)
-        st.write("")
+        if algo_mode == '全部':
+            st.warning("💡 提示：您目前選擇【全部】演算法，標的只要符合「任一」條件即會列出。請務必查看表格中的『演算法建議結果』確認觸發類型！")
 
         st.markdown("**2. 基礎掃描參數**")
         col_a, col_b, col_c, col_d, col_e = st.columns(5)
@@ -639,14 +593,10 @@ with tab2:
             st.number_input("掃描區間(迄)：起算天數", min_value=0, max_value=1000, step=1, key="lookback_end")
             st.number_input("掃描區間(起)：回推天數", min_value=0, max_value=1000, step=1, key="lookback_start")
             if st.session_state.lookback_start < st.session_state.lookback_end: st.warning("⚠️ 「起」需大於「迄」。")
-        with col_b:
-            st.number_input("底部翻轉最低分", min_value=1.0, max_value=30.0, step=1.0, key="min_score")
-        with col_c:
-            st.number_input("VCP收斂最低分", min_value=1.0, max_value=20.0, step=1.0, key="min_vcp_score")
-        with col_d:
-            st.number_input("指標共振最低分", min_value=1.0, max_value=15.0, step=1.0, key="min_reso_score")
-        with col_e:
-            st.number_input("月均量最低門檻", min_value=0, max_value=100000, step=100, key="min_vol_ma20")
+        with col_b: st.number_input("底部翻轉最低分", min_value=1.0, max_value=30.0, step=1.0, key="min_score")
+        with col_c: st.number_input("VCP收斂最低分", min_value=1.0, max_value=20.0, step=1.0, key="min_vcp_score")
+        with col_d: st.number_input("指標共振最低分", min_value=1.0, max_value=15.0, step=1.0, key="min_reso_score")
+        with col_e: st.number_input("月均量最低門檻", min_value=0, max_value=100000, step=100, key="min_vol_ma20")
         
         st.markdown("**3. 波段檢測週期與背離條件設定 (共振演算法同步使用波段天數)**")
         st.checkbox("啟用單一組自訂背離週期 (未勾則預設比對三組：(5,20)、(5,60)、(20,60))", key="use_single_div")
@@ -665,12 +615,17 @@ with tab2:
         with col_k3: st.checkbox("啟用 20MA 扣抵判斷", key="kou_di_20")
         with col_k4: st.checkbox("啟用 60MA 扣抵判斷", key="kou_di_60")
             
-        st.markdown("**5. 指標共振演算法參數設定**")
+        st.markdown("**5. 指標共振演算法進階濾網 (依據上方波段範圍天數)**")
         col_r1, col_r2, col_r3, col_r4 = st.columns(4)
-        with col_r1: st.number_input("KD低點門檻", min_value=0, max_value=100, step=1, key="reso_kd_low")
-        with col_r2: st.number_input("KD高點門檻", min_value=0, max_value=100, step=1, key="reso_kd_high")
-        with col_r3: st.number_input("MACD前波門檻", step=0.1, key="reso_macd_val")
-        with col_r4: st.number_input("近期金叉天數", min_value=1, max_value=20, step=1, key="reso_cross_days")
+        with col_r1:
+            st.number_input("KD前波低點 <", value=st.session_state.reso_kd_older_low, step=1.0, key="reso_kd_older_low")
+            st.number_input("KD前波高點 <", value=st.session_state.reso_kd_older_high, step=1.0, key="reso_kd_older_high")
+        with col_r2:
+            st.number_input("KD近波低點 >", value=st.session_state.reso_kd_recent_low, step=1.0, key="reso_kd_recent_low")
+            st.number_input("近期金叉天數 <=", value=st.session_state.reso_cross_days, step=1, key="reso_cross_days")
+        with col_r3:
+            st.number_input("MACD前波低 <", value=st.session_state.reso_macd_older_low, step=0.1, key="reso_macd_older_low")
+            st.number_input("MACD近波低 >", value=st.session_state.reso_macd_recent_low, step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0")
 
     st.markdown("---")
     
@@ -701,7 +656,6 @@ with tab2:
             tickers = list(stock_dict.keys())
             reversal_candidates = {} 
             
-            # 第一階段：區間粗篩
             chunk_size = 100
             for i in range(0, len(tickers), chunk_size):
                 chunk = tickers[i:i+chunk_size]
@@ -735,9 +689,11 @@ with tab2:
                                     df,
                                     recent_w=st.session_state.div_recent_w,
                                     older_w=st.session_state.div_older_w,
-                                    kd_low_th=st.session_state.reso_kd_low,
-                                    kd_high_th=st.session_state.reso_kd_high,
-                                    macd_th=st.session_state.reso_macd_val,
+                                    kd_older_low_th=st.session_state.reso_kd_older_low,
+                                    kd_older_high_th=st.session_state.reso_kd_older_high,
+                                    kd_recent_low_th=st.session_state.reso_kd_recent_low,
+                                    macd_older_low_th=st.session_state.reso_macd_older_low,
+                                    macd_recent_low_th=st.session_state.reso_macd_recent_low,
                                     cross_days=st.session_state.reso_cross_days
                                 )
                             else:
@@ -785,7 +741,6 @@ with tab2:
             if st.session_state.kou_di_20: kou_di_periods.append(20)
             if st.session_state.kou_di_60: kou_di_periods.append(60)
             
-            # 第二階段：背離與扣抵深度檢測
             if reversal_list:
                 progress_bar.progress(0)
                 status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
@@ -837,7 +792,7 @@ with tab2:
 
                         base_tags = []
                         if item["反轉分數"] >= st.session_state.min_score: base_tags.append("底部翻轉")
-                        if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP多頭收斂")
+                        if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP收斂")
                         if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
                         
                         div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
@@ -847,11 +802,8 @@ with tab2:
                     except Exception: pass
                     progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
-                # ==================================
-                # 掃描完成：呈現環境狀態與結果表格
-                # ==================================
                 status_text.empty(); progress_bar.empty()
-                st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合【{algo_mode}】條件的標的。")
+                st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合條件的標的。")
                 
                 if market_info:
                     st.markdown("### 🌐 大盤位階與期貨基準動態濾網評估結果")
@@ -860,7 +812,6 @@ with tab2:
                     m_col2.metric("月線 (MA20)", market_info["月線 (MA20)"])
                     m_col3.metric("季線 (MA60)", market_info["季線 (MA60)"])
                     m_col4.metric("約當大台基礎", market_info["自動運算基準價值 (約當大台基礎)"])
-                    
                     st.info(f"**大盤環境判定：** {market_info['大盤環境判定']}")
                     st.markdown("---")
                 
