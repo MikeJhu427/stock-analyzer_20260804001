@@ -43,7 +43,7 @@ DEFAULT_PARAMS = {
     "kou_di_20": True,
     "kou_di_60": True,
     "reso_kd_older_low": 20.0,
-    "reso_kd_older_high": 50.0,
+    "reso_kd_older_high": 80.0,
     "reso_kd_recent_low": 20.0,
     "use_macd_abs": False,        # 新增：是否啟用MACD絕對數值濾網 (預設不指定)
     "reso_macd_older_low": 0.0,
