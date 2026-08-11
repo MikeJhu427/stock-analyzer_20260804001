@@ -28,7 +28,7 @@ DEFAULT_PARAMS = {
     "lookback_start": 0,
     "min_score": 8.0,
     "min_vcp_score": 10.0,
-    "min_reso_score": 10.0,  # 新增：雙指標共振最低門檻
+    "min_reso_score": 10.0,
     "min_vol_ma20": 1000,
     "use_single_div": False,
     "div_recent_w": 5,
@@ -40,7 +40,11 @@ DEFAULT_PARAMS = {
     "kou_di_5": True,
     "kou_di_10": False,
     "kou_di_20": True,
-    "kou_di_60": True
+    "kou_di_60": True,
+    "reso_kd_low": 20,        # 新增：KD前波低點與近波低點基準
+    "reso_kd_high": 50,       # 新增：KD前波高點基準
+    "reso_macd_val": 0.0,     # 新增：MACD判定基準
+    "reso_cross_days": 3      # 新增：近期金叉天數
 }
 
 def load_config():
@@ -155,26 +159,49 @@ class VCPStrategy:
         return vcp_score
 
 class IndicatorResonanceStrategy:
-    """雙指標共振起漲：MACD水下綠轉紅 + KD向上發散"""
+    """雙指標共振起漲：精細化KD與MACD波段條件"""
     @staticmethod
-    def evaluate(df):
-        # 1. MACD 特徵：水下金叉且綠柱剛翻紅放大
-        cond_macd_underwater = (df['MACD'] < 0) & (df['MACD_Signal'] < 0)
-        cond_macd_red_expanding = (df['MACD_Hist'] > 0) & (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
-        cond_macd_recently_green = df['MACD_Hist'].rolling(window=3).min() <= 0
-        macd_pass = cond_macd_underwater & cond_macd_red_expanding & cond_macd_recently_green
+    def evaluate(df, recent_w=5, older_w=20, kd_low_th=20, kd_high_th=50, macd_th=0.0, cross_days=3):
+        # 防呆：確保歷史資料足夠
+        if len(df) < recent_w + older_w:
+            return pd.Series(0.0, index=df.index)
+
+        # 1. 抓取 KD、MACD(DIF) 與 K線價格 的波段高低點
+        recent_k_low = df['K'].rolling(window=recent_w, min_periods=1).min()
+        older_k_low = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
+        older_k_high = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).max()
         
-        # 2. KD 特徵：金叉維持向上，且脫離嚴重超賣區
-        cond_kd_up = (df['K'] > df['D']) & (df['K'] > df['K'].shift(1))
-        cond_kd_range = (df['K'] > 20) & (df['K'] < 80)
-        kd_pass = cond_kd_up & cond_kd_range
+        recent_macd_low = df['MACD'].rolling(window=recent_w, min_periods=1).min()
+        older_macd_low = df['MACD'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         
-        # 3. 計分邏輯 (滿足共振基礎給 10 分，動能越強加分越多)
+        recent_price_low = df['Low'].rolling(window=recent_w, min_periods=1).min()
+        older_price_low = df['Low'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
+
+        # 2. 定義金叉與近期發生條件
+        kd_cross = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
+        macd_cross = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
+
+        # 近期 N 日內曾發生過金叉
+        kd_recent_cross = kd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
+        macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
+
+        # 3. 核心邏輯判定
+        # 條件 A：KD 前波低點 < 預設20，前波高點 < 預設50，近波低點 > 預設20，且近期金叉
+        cond_kd = (older_k_low < kd_low_th) & (older_k_high < kd_high_th) & (recent_k_low > kd_low_th) & kd_recent_cross
+        
+        # 條件 B：MACD 前波低點 < 預設0，近波低點 > 預設0，且近期金叉
+        cond_macd = (older_macd_low < macd_th) & (recent_macd_low > macd_th) & macd_recent_cross
+        
+        # 條件 C：K線價格底底高
+        cond_price = recent_price_low > older_price_low
+
+        # 4. 合併條件並計分
         resonance_score = pd.Series(0.0, index=df.index)
-        valid_mask = macd_pass & kd_pass
+        valid_mask = cond_kd & cond_macd & cond_price
         
+        # 滿足所有嚴格條件即給予基礎 10 分，再外加 MACD 柱狀圖的動能放大分數(最高5分)
         hist_momentum = (df['MACD_Hist'] - df['MACD_Hist'].shift(1)) * 100
-        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5) # 最高加 5 分
+        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5)
         
         return resonance_score
 
@@ -332,7 +359,6 @@ if "current_profile" not in st.session_state:
     st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
 def apply_profile_to_state(profile_name):
-    # 安全載入：確保新增參數不會因為舊設定檔遺失而報錯
     prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
     full_prof = DEFAULT_PARAMS.copy()
     full_prof.update(prof)
@@ -372,7 +398,6 @@ with tab1:
             else:
                 stock_name = get_tw_stock_name(real_ticker)
                 
-                # 計算所有基礎指標與技術訊號
                 df = TechnicalIndicators.add_kd(df)
                 df = TechnicalIndicators.add_macd(df)
                 
@@ -407,10 +432,17 @@ with tab1:
                 df['Upper_Bound'] = df['M_Mean'] + 1.5 * df['M_Std']
                 df['Lower_Bound'] = df['M_Mean'] - 1.5 * df['M_Std']
                 
-                # 執行三大演算法評估
                 df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
                 df['VCP_Score'] = VCPStrategy.evaluate(df)
-                df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(df)
+                df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
+                    df,
+                    recent_w=st.session_state.div_recent_w,
+                    older_w=st.session_state.div_older_w,
+                    kd_low_th=st.session_state.reso_kd_low,
+                    kd_high_th=st.session_state.reso_kd_high,
+                    macd_th=st.session_state.reso_macd_val,
+                    cross_days=st.session_state.reso_cross_days
+                )
                 
                 df = df.dropna(subset=['Momentum_Force', 'Max_Vol_Defense', 'VWMA20', 'Prev_MA5', 'Vol_MA20', 'MA60']).copy()
                 plot_df, recent_df = df.tail(240).copy(), df.tail(60)
@@ -534,11 +566,12 @@ with tab2:
         | **掃描區間(起/迄)** | 基礎過濾 | 設定系統往回推算的歷史天數。例如「起=5, 迄=0」代表掃描最近 5 天內是否有符合條件的標的。 |
         | **底部翻轉最低分數** | 基礎過濾 | 判定低檔長紅或下影線強度的核心數值。預設 8.0 分，分數越高代表買盤力道越強、型態越完美。 |
         | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
-        | **指標共振最低分數** | 基礎過濾 | 判定 KD 脫離超賣向上與 MACD 水下翻紅的共振強度。預設 10.0 分，滿分 15 分。分數越高代表動能發動越強烈。 |
+        | **指標共振最低分數** | 基礎過濾 | 判定 KD 與 MACD 的共振強度。滿分 15 分，滿足基礎條件即給 10 分，動能越強加分越多。 |
         | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
-        | **近波/前波範圍** | 背離判定 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。 |
+        | **近波/前波範圍** | 背離/共振 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。共振模組亦連動此參數。 |
         | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
-        | **均線扣抵判斷(5/10/20/60)** | 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
+        | **KD/MACD共振門檻** | 指標共振 | 設定 KD 前波高低點、近波低點限制，以及 MACD 前波與近波的數值濾網。並要求在指定天數內發生金叉。 |
+        | **均線扣抵判斷(5/10/20/60)**| 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
         """)
 
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
@@ -576,7 +609,11 @@ with tab2:
                         "kou_di_5": st.session_state.kou_di_5,
                         "kou_di_10": st.session_state.kou_di_10,
                         "kou_di_20": st.session_state.kou_di_20,
-                        "kou_di_60": st.session_state.kou_di_60
+                        "kou_di_60": st.session_state.kou_di_60,
+                        "reso_kd_low": st.session_state.reso_kd_low,
+                        "reso_kd_high": st.session_state.reso_kd_high,
+                        "reso_macd_val": st.session_state.reso_macd_val,
+                        "reso_cross_days": st.session_state.reso_cross_days
                     }
                     st.session_state.config["last_used"] = name_to_save
                     save_config(st.session_state.config)
@@ -611,7 +648,7 @@ with tab2:
         with col_e:
             st.number_input("月均量最低門檻", min_value=0, max_value=100000, step=100, key="min_vol_ma20")
         
-        st.markdown("**3. 背離檢測週期與嚴格條件設定**")
+        st.markdown("**3. 波段檢測週期與背離條件設定 (共振演算法同步使用波段天數)**")
         st.checkbox("啟用單一組自訂背離週期 (未勾則預設比對三組：(5,20)、(5,60)、(20,60))", key="use_single_div")
         col_f, col_g, col_h, col_i, col_j, col_k = st.columns(6)
         with col_f: st.number_input("近波範圍", min_value=5, max_value=60, step=1, key="div_recent_w", disabled=not st.session_state.use_single_div)
@@ -627,6 +664,13 @@ with tab2:
         with col_k2: st.checkbox("啟用 10MA 扣抵判斷", key="kou_di_10")
         with col_k3: st.checkbox("啟用 20MA 扣抵判斷", key="kou_di_20")
         with col_k4: st.checkbox("啟用 60MA 扣抵判斷", key="kou_di_60")
+            
+        st.markdown("**5. 指標共振演算法參數設定**")
+        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+        with col_r1: st.number_input("KD低點門檻", min_value=0, max_value=100, step=1, key="reso_kd_low")
+        with col_r2: st.number_input("KD高點門檻", min_value=0, max_value=100, step=1, key="reso_kd_high")
+        with col_r3: st.number_input("MACD前波門檻", step=0.1, key="reso_macd_val")
+        with col_r4: st.number_input("近期金叉天數", min_value=1, max_value=20, step=1, key="reso_cross_days")
 
     st.markdown("---")
     
@@ -669,7 +713,6 @@ with tab2:
                             df = data.xs(ticker, axis=1, level=1).dropna(how='all') if isinstance(data.columns, pd.MultiIndex) else (data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame())
                             if df.empty or len(df) <= st.session_state.lookback_start + 20: continue
                             
-                            # 為了共振模組與後續背離判斷，在此先統一加上 KD 與 MACD
                             df = TechnicalIndicators.add_kd(df)
                             df = TechnicalIndicators.add_macd(df)
                             
@@ -684,10 +727,21 @@ with tab2:
                             df['BB_Upper'] = df['MA20'] + 2 * std20
                             df['BB_Lower'] = df['MA20'] - 2 * std20
                             
-                            # 依據選擇啟動計算分數
                             df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
                             df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
-                            df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(df) if algo_mode in ['全部', '指標共振'] else pd.Series(0.0, index=df.index)
+                            
+                            if algo_mode in ['全部', '指標共振']:
+                                df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
+                                    df,
+                                    recent_w=st.session_state.div_recent_w,
+                                    older_w=st.session_state.div_older_w,
+                                    kd_low_th=st.session_state.reso_kd_low,
+                                    kd_high_th=st.session_state.reso_kd_high,
+                                    macd_th=st.session_state.reso_macd_val,
+                                    cross_days=st.session_state.reso_cross_days
+                                )
+                            else:
+                                df['Reso_Score'] = pd.Series(0.0, index=df.index)
                             
                             best_combined_score = -1
                             best_row, best_offset = None, 0
@@ -755,7 +809,6 @@ with tab2:
                                 else:
                                     item[f"扣抵狀態({n}MA)"] = "無資料"
                             
-                            # 指標已在第一階段計算完成，直接進行背離運算
                             for r_w, o_w in div_pairs:
                                 d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
                                 d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
