@@ -41,12 +41,12 @@ DEFAULT_PARAMS = {
     "kou_di_10": False,
     "kou_di_20": True,
     "kou_di_60": True,
-    "reso_kd_older_low": 20.0,    # KD前波低點上限
-    "reso_kd_older_high": 50.0,   # KD前波高點上限
-    "reso_kd_recent_low": 20.0,   # KD近波低點下限
-    "reso_macd_older_low": 0.0,   # MACD前波低點上限
-    "reso_macd_recent_low": 0.0,  # MACD近波低點下限 (注意：若要抓水下金叉，建議設為負數)
-    "reso_cross_days": 3          # 近期金叉天數
+    "reso_kd_older_low": 20.0,
+    "reso_kd_older_high": 50.0,
+    "reso_kd_recent_low": 20.0,
+    "reso_macd_older_low": 0.0,
+    "reso_macd_recent_low": 0.0,
+    "reso_cross_days": 3
 }
 
 def load_config():
@@ -164,7 +164,6 @@ class IndicatorResonanceStrategy:
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
 
-        # 1. 抓取各波段極值 (利用 Rolling 確保捕捉範圍內的極值)
         recent_k_low = df['K'].rolling(window=recent_w, min_periods=1).min()
         older_k_low = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         older_k_high = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).max()
@@ -175,29 +174,21 @@ class IndicatorResonanceStrategy:
         recent_price_low = df['Low'].rolling(window=recent_w, min_periods=1).min()
         older_price_low = df['Low'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
 
-        # 2. 判斷是否於指定天數內發生金叉
         kd_cross = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
         macd_cross = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
 
         kd_recent_cross = kd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
         macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
 
-        # 3. 嚴格對齊波段邏輯
-        # 邏輯 A：KD 條件 (前低<20, 前高<50, 近低>20, 且近期金叉)
         cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
-        
-        # 邏輯 B：MACD 條件 (前低<0, 近低>0, 且近期金叉)
         cond_macd = (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th) & macd_recent_cross
-        
-        # 邏輯 C：K線價格底底高
         cond_price = recent_price_low > older_price_low
 
-        # 4. 合併並給分
         resonance_score = pd.Series(0.0, index=df.index)
         valid_mask = cond_kd & cond_macd & cond_price
         
         hist_momentum = (df['MACD_Hist'] - df['MACD_Hist'].shift(1)) * 100
-        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5) # 基礎分10 + 動能加權
+        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5) 
         
         return resonance_score
 
@@ -324,7 +315,7 @@ def get_stock_data(symbol):
     return pd.DataFrame(), code
 
 # ==========================================
-# 介面主程式與 Session State 初始化
+# 介面主程式與 Session State 初始化防呆
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
@@ -340,7 +331,10 @@ def apply_profile_to_state(profile_name):
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
 
-if "lookback_end" not in st.session_state: apply_profile_to_state(st.session_state.current_profile)
+# 【核心修復】自動檢查所有預設參數是否已存在 Session State，避免舊存檔缺失參數導致 AttributeError
+missing_keys = [k for k in DEFAULT_PARAMS.keys() if k not in st.session_state]
+if missing_keys:
+    apply_profile_to_state(st.session_state.current_profile)
 
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
@@ -535,6 +529,10 @@ with tab2:
         | **底部翻轉最低分數** | 基礎過濾 | 判定低檔長紅或下影線強度的核心數值。預設 8.0 分，分數越高代表買盤力道越強、型態越完美。 |
         | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
         | **指標共振最低分數** | 基礎過濾 | 判定 KD 與 MACD 的共振強度。滿分 15 分，滿足基礎條件即給 10 分，動能越強加分越多。 |
+        | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
+        | **近波/前波範圍** | 背離/共振 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。共振模組亦連動此參數。 |
+        | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
+        | **KD/MACD共振門檻** | 指標共振 | 設定 KD 前波高低點、近波低點限制，以及 MACD 前波與近波的數值濾網。並要求在指定天數內發生金叉。 |
         | **均線扣抵判斷(5/10/20/60)**| 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
         """)
 
@@ -554,20 +552,9 @@ with tab2:
                 name_to_save = new_input if new_input != "" else st.session_state.profile_selector
                 if name_to_save == "預設參數 (Default)": st.error("❌ 不可覆寫系統預設參數名稱！")
                 else:
-                    st.session_state.config["profiles"][name_to_save] = {
-                        "lookback_end": st.session_state.lookback_end, "lookback_start": st.session_state.lookback_start,
-                        "min_score": st.session_state.min_score, "min_vcp_score": st.session_state.min_vcp_score,
-                        "min_reso_score": st.session_state.min_reso_score, "min_vol_ma20": st.session_state.min_vol_ma20,
-                        "use_single_div": st.session_state.use_single_div, "div_recent_w": st.session_state.div_recent_w,
-                        "div_older_w": st.session_state.div_older_w, "pivot_left": st.session_state.pivot_left,
-                        "pivot_right": st.session_state.pivot_right, "recent_lows_cnt": st.session_state.recent_lows_cnt,
-                        "older_lows_cnt": st.session_state.older_lows_cnt, "kou_di_5": st.session_state.kou_di_5,
-                        "kou_di_10": st.session_state.kou_di_10, "kou_di_20": st.session_state.kou_di_20,
-                        "kou_di_60": st.session_state.kou_di_60, "reso_kd_older_low": st.session_state.reso_kd_older_low,
-                        "reso_kd_older_high": st.session_state.reso_kd_older_high, "reso_kd_recent_low": st.session_state.reso_kd_recent_low,
-                        "reso_macd_older_low": st.session_state.reso_macd_older_low, "reso_macd_recent_low": st.session_state.reso_macd_recent_low,
-                        "reso_cross_days": st.session_state.reso_cross_days
-                    }
+                    # 動態存取所有 DEFAULT_PARAMS 擁有的 Key
+                    current_vals = {k: st.session_state[k] for k in DEFAULT_PARAMS.keys()}
+                    st.session_state.config["profiles"][name_to_save] = current_vals
                     st.session_state.config["last_used"] = name_to_save
                     save_config(st.session_state.config)
                     st.success(f"✅ 已成功儲存版本：'{name_to_save}'"); st.rerun()
