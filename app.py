@@ -28,6 +28,7 @@ DEFAULT_PARAMS = {
     "lookback_start": 0,
     "min_score": 8.0,
     "min_vcp_score": 10.0,
+    "min_reso_score": 10.0,  # 新增：雙指標共振最低門檻
     "min_vol_ma20": 1000,
     "use_single_div": False,
     "div_recent_w": 5,
@@ -36,10 +37,10 @@ DEFAULT_PARAMS = {
     "pivot_right": 0,
     "recent_lows_cnt": 0,
     "older_lows_cnt": 0,
-    "kou_di_5": True,   # 預設開啟 5MA 扣抵判斷
-    "kou_di_10": False, # 預設關閉 10MA 扣抵判斷
-    "kou_di_20": True,  # 預設開啟 20MA 扣抵判斷
-    "kou_di_60": True   # 預設開啟 60MA 扣抵判斷
+    "kou_di_5": True,
+    "kou_di_10": False,
+    "kou_di_20": True,
+    "kou_di_60": True
 }
 
 def load_config():
@@ -152,6 +153,30 @@ class VCPStrategy:
         vcp_score[valid_mask] = vol_score[valid_mask] + tight_score[valid_mask]
 
         return vcp_score
+
+class IndicatorResonanceStrategy:
+    """雙指標共振起漲：MACD水下綠轉紅 + KD向上發散"""
+    @staticmethod
+    def evaluate(df):
+        # 1. MACD 特徵：水下金叉且綠柱剛翻紅放大
+        cond_macd_underwater = (df['MACD'] < 0) & (df['MACD_Signal'] < 0)
+        cond_macd_red_expanding = (df['MACD_Hist'] > 0) & (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
+        cond_macd_recently_green = df['MACD_Hist'].rolling(window=3).min() <= 0
+        macd_pass = cond_macd_underwater & cond_macd_red_expanding & cond_macd_recently_green
+        
+        # 2. KD 特徵：金叉維持向上，且脫離嚴重超賣區
+        cond_kd_up = (df['K'] > df['D']) & (df['K'] > df['K'].shift(1))
+        cond_kd_range = (df['K'] > 20) & (df['K'] < 80)
+        kd_pass = cond_kd_up & cond_kd_range
+        
+        # 3. 計分邏輯 (滿足共振基礎給 10 分，動能越強加分越多)
+        resonance_score = pd.Series(0.0, index=df.index)
+        valid_mask = macd_pass & kd_pass
+        
+        hist_momentum = (df['MACD_Hist'] - df['MACD_Hist'].shift(1)) * 100
+        resonance_score[valid_mask] = 10.0 + hist_momentum[valid_mask].clip(0, 5) # 最高加 5 分
+        
+        return resonance_score
 
 class DivergenceStrategy:
     """底背離判定模組"""
@@ -307,8 +332,12 @@ if "current_profile" not in st.session_state:
     st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
 def apply_profile_to_state(profile_name):
+    # 安全載入：確保新增參數不會因為舊設定檔遺失而報錯
     prof = st.session_state.config["profiles"].get(profile_name, DEFAULT_PARAMS)
-    for k, v in prof.items(): st.session_state[k] = v
+    full_prof = DEFAULT_PARAMS.copy()
+    full_prof.update(prof)
+    for k, v in full_prof.items(): 
+        st.session_state[k] = v
     st.session_state.current_profile = profile_name
     st.session_state.config["last_used"] = profile_name
     save_config(st.session_state.config)
@@ -319,7 +348,7 @@ if "lookback_end" not in st.session_state:
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (翻轉/VCP/背離/扣抵)"])
+tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (翻轉/VCP/共振/背離)"])
 
 # ----------------------------------------------------
 # 頁籤 1：單檔深度解析
@@ -342,6 +371,10 @@ with tab1:
                 st.error(f"❌ 查無 [{user_input}] 的歷史數據，請確認代號是否正確。或請稍後再試。")
             else:
                 stock_name = get_tw_stock_name(real_ticker)
+                
+                # 計算所有基礎指標與技術訊號
+                df = TechnicalIndicators.add_kd(df)
+                df = TechnicalIndicators.add_macd(df)
                 
                 df['Pct_Change'] = df['Close'].pct_change() * 100
                 df['Volume_Lots'] = df['Volume'] / 1000
@@ -374,8 +407,10 @@ with tab1:
                 df['Upper_Bound'] = df['M_Mean'] + 1.5 * df['M_Std']
                 df['Lower_Bound'] = df['M_Mean'] - 1.5 * df['M_Std']
                 
+                # 執行三大演算法評估
                 df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
                 df['VCP_Score'] = VCPStrategy.evaluate(df)
+                df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(df)
                 
                 df = df.dropna(subset=['Momentum_Force', 'Max_Vol_Defense', 'VWMA20', 'Prev_MA5', 'Vol_MA20', 'MA60']).copy()
                 plot_df, recent_df = df.tail(240).copy(), df.tail(60)
@@ -386,7 +421,7 @@ with tab1:
                 st.subheader(f"📊 【{stock_name} ({real_ticker})】 深度解析與策略判定")
                 
                 st.markdown("### 🎯 演算法最新判定狀態 (全市場掃描標準)")
-                col_a, col_b = st.columns(2)
+                col_a, col_b, col_c = st.columns(3)
                 with col_a:
                     rev_score = round(last_row['Candle_Score'], 2)
                     rev_status = "✅ 達標入選" if rev_score >= st.session_state.min_score else "❌ 未達標"
@@ -395,6 +430,10 @@ with tab1:
                     vcp_score = round(last_row['VCP_Score'], 2)
                     vcp_status = "✅ 達標入選" if vcp_score >= st.session_state.min_vcp_score else "❌ 未達標"
                     st.success(f"**VCP 收斂分數：{vcp_score}** ({vcp_status})\n\n*(門檻：{st.session_state.min_vcp_score} 分)*")
+                with col_c:
+                    reso_score = round(last_row['Reso_Score'], 2)
+                    reso_status = "✅ 達標入選" if reso_score >= st.session_state.min_reso_score else "❌ 未達標"
+                    st.warning(f"**指標共振分數：{reso_score}** ({reso_status})\n\n*(門檻：{st.session_state.min_reso_score} 分)*")
                 st.markdown("---")
                 
                 st.markdown(f"**更新日期：{last_date} | 最新收盤價：{last_row['Close']:.2f}**")
@@ -422,6 +461,7 @@ with tab1:
                         defense, prev_defense = row['Max_Vol_Defense'], row['Prev_Defense']
                         vol, vol_ma = row['Volume_Lots'], row['Vol_MA20']
                         cps = row['Candle_Score']
+                        res_sc = row['Reso_Score']
                         
                         date_str = date.strftime('%Y-%m-%d')
                         is_bull_surge = (m > row['Upper_Bound']) or (row['Pct_Change'] >= 4.0 and vol >= vol_ma * 1.5)
@@ -429,8 +469,10 @@ with tab1:
                         
                         if c < defense and prev_c >= prev_defense:
                             signal_logs.append(f"- ☠️ **{date_str}** | 🚨 跌破最大量防守價 **{defense:.2f}** (最後防線潰堤) | 收盤: {c:.2f}")
+                        elif res_sc >= st.session_state.min_reso_score:
+                            signal_logs.append(f"- 🎯 **{date_str}** | 🔥 MACD與KD底部共振發動 (買點浮現) | 共振分: {res_sc:.1f}")
                         elif cps >= st.session_state.min_score:
-                            signal_logs.append(f"- ☀️ **{date_str}** | 🚀 低檔強力反轉 (觸發掃描進場) | 正權重: {cps:.1f}")
+                            signal_logs.append(f"- ☀️ **{date_str}** | 🚀 低檔強力反轉 (爆量買盤) | 正權重: {cps:.1f}")
                         elif not is_bull_surge and not is_bear_surge:
                             if c < vwma20 and prev_c >= prev_vwma20:
                                 signal_logs.append(f"- 📉 **{date_str}** | ⚠️ 跌破 VWMA 加權均線 (建議大部位減碼) | 收盤: {c:.2f}")
@@ -483,7 +525,7 @@ with tab1:
 # 頁籤 2：全市場智慧掃描
 # ----------------------------------------------------
 with tab2:
-    st.write("系統將自動抓取全部普通股，尋找符合「低檔強力反轉」或「VCP波動收斂」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
+    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」或「雙指標共振」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
     
     with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
         st.markdown("""
@@ -492,6 +534,7 @@ with tab2:
         | **掃描區間(起/迄)** | 基礎過濾 | 設定系統往回推算的歷史天數。例如「起=5, 迄=0」代表掃描最近 5 天內是否有符合條件的標的。 |
         | **底部翻轉最低分數** | 基礎過濾 | 判定低檔長紅或下影線強度的核心數值。預設 8.0 分，分數越高代表買盤力道越強、型態越完美。 |
         | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
+        | **指標共振最低分數** | 基礎過濾 | 判定 KD 脫離超賣向上與 MACD 水下翻紅的共振強度。預設 10.0 分，滿分 15 分。分數越高代表動能發動越強烈。 |
         | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
         | **近波/前波範圍** | 背離判定 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。 |
         | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
@@ -521,6 +564,7 @@ with tab2:
                         "lookback_start": st.session_state.lookback_start,
                         "min_score": st.session_state.min_score,
                         "min_vcp_score": st.session_state.min_vcp_score,
+                        "min_reso_score": st.session_state.min_reso_score,
                         "min_vol_ma20": st.session_state.min_vol_ma20,
                         "use_single_div": st.session_state.use_single_div,
                         "div_recent_w": st.session_state.div_recent_w,
@@ -549,31 +593,33 @@ with tab2:
         st.markdown("---")
         
         st.markdown("**1. 演算法選擇**")
-        algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP'], index=0, horizontal=True)
+        algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振'], index=0, horizontal=True)
         st.write("")
 
         st.markdown("**2. 基礎掃描參數**")
-        col_a, col_b, col_c, col_c2 = st.columns(4)
+        col_a, col_b, col_c, col_d, col_e = st.columns(5)
         with col_a:
-            st.number_input("掃描區間(迄)：從幾天前起算？", min_value=0, max_value=1000, step=1, key="lookback_end")
-            st.number_input("掃描區間(起)：回推至幾天前？", min_value=0, max_value=1000, step=1, key="lookback_start")
+            st.number_input("掃描區間(迄)：起算天數", min_value=0, max_value=1000, step=1, key="lookback_end")
+            st.number_input("掃描區間(起)：回推天數", min_value=0, max_value=1000, step=1, key="lookback_start")
             if st.session_state.lookback_start < st.session_state.lookback_end: st.warning("⚠️ 「起」需大於「迄」。")
         with col_b:
-            st.number_input("底部翻轉最低分數", min_value=1.0, max_value=30.0, step=1.0, key="min_score")
+            st.number_input("底部翻轉最低分", min_value=1.0, max_value=30.0, step=1.0, key="min_score")
         with col_c:
-            st.number_input("VCP收斂最低分數", min_value=1.0, max_value=20.0, step=1.0, key="min_vcp_score")
-        with col_c2:
-            st.number_input("月均量最低門檻 (張)", min_value=0, max_value=100000, step=100, key="min_vol_ma20")
+            st.number_input("VCP收斂最低分", min_value=1.0, max_value=20.0, step=1.0, key="min_vcp_score")
+        with col_d:
+            st.number_input("指標共振最低分", min_value=1.0, max_value=15.0, step=1.0, key="min_reso_score")
+        with col_e:
+            st.number_input("月均量最低門檻", min_value=0, max_value=100000, step=100, key="min_vol_ma20")
         
         st.markdown("**3. 背離檢測週期與嚴格條件設定**")
         st.checkbox("啟用單一組自訂背離週期 (未勾則預設比對三組：(5,20)、(5,60)、(20,60))", key="use_single_div")
-        col_d, col_e, col_f, col_g, col_h, col_i = st.columns(6)
-        with col_d: st.number_input("近波範圍", min_value=5, max_value=60, step=1, key="div_recent_w", disabled=not st.session_state.use_single_div)
-        with col_e: st.number_input("前波範圍", min_value=10, max_value=240, step=1, key="div_older_w", disabled=not st.session_state.use_single_div)
-        with col_f: st.number_input("左X根不破", min_value=0, max_value=20, step=1, key="pivot_left")
-        with col_g: st.number_input("右Y根不破", min_value=0, max_value=20, step=1, key="pivot_right")
-        with col_h: st.number_input("近波低點數", min_value=0, max_value=20, step=1, key="recent_lows_cnt")
-        with col_i: st.number_input("前波低點數", min_value=0, max_value=20, step=1, key="older_lows_cnt")
+        col_f, col_g, col_h, col_i, col_j, col_k = st.columns(6)
+        with col_f: st.number_input("近波範圍", min_value=5, max_value=60, step=1, key="div_recent_w", disabled=not st.session_state.use_single_div)
+        with col_g: st.number_input("前波範圍", min_value=10, max_value=240, step=1, key="div_older_w", disabled=not st.session_state.use_single_div)
+        with col_h: st.number_input("左X根不破", min_value=0, max_value=20, step=1, key="pivot_left")
+        with col_i: st.number_input("右Y根不破", min_value=0, max_value=20, step=1, key="pivot_right")
+        with col_j: st.number_input("近波低點數", min_value=0, max_value=20, step=1, key="recent_lows_cnt")
+        with col_k: st.number_input("前波低點數", min_value=0, max_value=20, step=1, key="older_lows_cnt")
         
         st.markdown("**4. 均線扣抵判斷設定 (扣低有利均線向上)**")
         col_k1, col_k2, col_k3, col_k4 = st.columns(4)
@@ -623,6 +669,10 @@ with tab2:
                             df = data.xs(ticker, axis=1, level=1).dropna(how='all') if isinstance(data.columns, pd.MultiIndex) else (data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame())
                             if df.empty or len(df) <= st.session_state.lookback_start + 20: continue
                             
+                            # 為了共振模組與後續背離判斷，在此先統一加上 KD 與 MACD
+                            df = TechnicalIndicators.add_kd(df)
+                            df = TechnicalIndicators.add_macd(df)
+                            
                             df['Pct_Change'] = df['Close'].pct_change() * 100
                             df['Volume_Lots'] = df['Volume'] / 1000
                             df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -634,30 +684,27 @@ with tab2:
                             df['BB_Upper'] = df['MA20'] + 2 * std20
                             df['BB_Lower'] = df['MA20'] - 2 * std20
                             
-                            if algo_mode in ['全部', '底部翻轉']:
-                                df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
-                            else:
-                                df['Candle_Score'] = pd.Series(0.0, index=df.index)
-                                
-                            if algo_mode in ['全部', 'VCP']:
-                                df['VCP_Score'] = VCPStrategy.evaluate(df)
-                            else:
-                                df['VCP_Score'] = pd.Series(0.0, index=df.index)
+                            # 依據選擇啟動計算分數
+                            df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
+                            df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
+                            df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(df) if algo_mode in ['全部', '指標共振'] else pd.Series(0.0, index=df.index)
                             
                             best_combined_score = -1
                             best_row, best_offset = None, 0
                             
                             for offset in range(st.session_state.lookback_end, st.session_state.lookback_start + 1):
                                 t_row = df.iloc[-1 - offset]
-                                r_score, v_score, vol_ma = t_row['Candle_Score'], t_row['VCP_Score'], t_row['Vol_MA20']
+                                r_score, v_score, reso_score, vol_ma = t_row['Candle_Score'], t_row['VCP_Score'], t_row['Reso_Score'], t_row['Vol_MA20']
                                 
                                 if vol_ma >= st.session_state.min_vol_ma20:
                                     is_r_pass = (algo_mode in ['全部', '底部翻轉']) and (r_score >= st.session_state.min_score)
                                     is_v_pass = (algo_mode in ['全部', 'VCP']) and (v_score >= st.session_state.min_vcp_score)
+                                    is_reso_pass = (algo_mode in ['全部', '指標共振']) and (reso_score >= st.session_state.min_reso_score)
                                     
-                                    if is_r_pass or is_v_pass:
-                                        if (r_score + v_score) > best_combined_score:
-                                            best_combined_score = r_score + v_score
+                                    if is_r_pass or is_v_pass or is_reso_pass:
+                                        combo_score = r_score + v_score + reso_score
+                                        if combo_score > best_combined_score:
+                                            best_combined_score = combo_score
                                             best_row, best_offset = t_row, offset
                             
                             if best_row is not None:
@@ -669,7 +716,8 @@ with tab2:
                                     "當日收盤": round(float(best_row['Close']), 2),
                                     "月均量(張)": int(best_row['Vol_MA20']),
                                     "反轉分數": round(float(best_row['Candle_Score']), 2),
-                                    "VCP分數": round(float(best_row['VCP_Score']), 2)
+                                    "VCP分數": round(float(best_row['VCP_Score']), 2),
+                                    "共振分數": round(float(best_row['Reso_Score']), 2)
                                 }
                         except Exception: continue
                 except Exception: pass
@@ -707,7 +755,7 @@ with tab2:
                                 else:
                                     item[f"扣抵狀態({n}MA)"] = "無資料"
                             
-                            daily_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(daily_df))
+                            # 指標已在第一階段計算完成，直接進行背離運算
                             for r_w, o_w in div_pairs:
                                 d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
                                 d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
@@ -737,6 +785,7 @@ with tab2:
                         base_tags = []
                         if item["反轉分數"] >= st.session_state.min_score: base_tags.append("底部翻轉")
                         if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP多頭收斂")
+                        if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
                         
                         div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
                         item["演算法建議結果"] = " & ".join(base_tags) + div_tag
@@ -764,12 +813,12 @@ with tab2:
                 
                 res_df = pd.DataFrame(final_results)
                 
-                base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '當日收盤', '月均量(張)']
+                base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
                 div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
                 kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
                 cols = base_cols + div_cols + kou_cols
                 
-                res_df = res_df[cols].sort_values(by=["反轉分數", "VCP分數"], ascending=[False, False]).reset_index(drop=True)
+                res_df = res_df[cols].sort_values(by=["共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False]).reset_index(drop=True)
                 res_df.index = res_df.index + 1
                 
                 st.dataframe(res_df, use_container_width=True)
