@@ -30,7 +30,7 @@ DEFAULT_PARAMS = {
     "min_score": 8.0,
     "min_vcp_score": 10.0,
     "min_reso_score": 10.0,
-    "min_vol_ma20": 1000,
+    "min_vol_ma20": 200,
     "use_single_div": False,
     "div_recent_w": 5,
     "div_older_w": 20,
