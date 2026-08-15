@@ -30,7 +30,7 @@ DEFAULT_PARAMS = {
     "min_score": 8.0,
     "min_vcp_score": 10.0,
     "min_reso_score": 10.0,
-    "min_vol_ma20": 200,
+    "min_vol_ma20": 1000,
     "use_single_div": False,
     "div_recent_w": 5,
     "div_older_w": 20,
@@ -43,14 +43,14 @@ DEFAULT_PARAMS = {
     "kou_di_20": True,
     "kou_di_60": True,
     "reso_kd_older_low": 20.0,
-    "reso_kd_older_high": 80.0,
+    "reso_kd_older_high": 50.0,
     "reso_kd_recent_low": 20.0,
-    "use_macd_abs": False,        # 新增：是否啟用MACD絕對數值濾網 (預設不指定)
+    "use_macd_abs": False,
     "reso_macd_older_low": 0.0,
     "reso_macd_recent_low": 0.0,
     "reso_cross_days": 3,
-    "use_backtest_date": False,   # 新增：是否啟用指定日期回測
-    "backtest_date": str(datetime.date.today()) # 新增：回測基準日
+    "use_backtest_date": False,
+    "backtest_date": str(datetime.date.today())
 }
 
 def load_config():
@@ -97,7 +97,6 @@ class TechnicalIndicators:
 # 模組 2：大盤位階與策略演算法核心
 # ==========================================
 class MarketRegimeFilter:
-    """大盤位階與期貨基準動態濾網"""
     @staticmethod
     def evaluate(session, backtest_date_obj=None):
         try:
@@ -133,7 +132,6 @@ class MarketRegimeFilter:
             return None
 
 class BottomReversalStrategy:
-    """左側交易：低檔強力翻轉判定模組"""
     @staticmethod
     def evaluate(df):
         body = abs(df['Close'] - df['Open'])
@@ -151,7 +149,6 @@ class BottomReversalStrategy:
         return candle_score
 
 class VCPStrategy:
-    """右側交易：VCP波動收斂型態判定模組"""
     @staticmethod
     def evaluate(df):
         bb_width = (df['BB_Upper'] - df['BB_Lower']) / df['MA20'] * 100
@@ -168,7 +165,6 @@ class VCPStrategy:
         return vcp_score
 
 class IndicatorResonanceStrategy:
-    """雙指標共振起漲：精細化KD與MACD波段條件限制"""
     @staticmethod
     def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, 
                  use_macd_abs=False, macd_older_low_th=0, macd_recent_low_th=0, cross_days=3):
@@ -192,10 +188,7 @@ class IndicatorResonanceStrategy:
         macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
 
         cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
-        
-        # MACD 核心判斷：底底高 (DIF近波最低 > 前波最低) + 近期金叉
         cond_macd = (recent_macd_low > older_macd_low) & macd_recent_cross
-        # 若使用者有啟用絕對數值濾網，才加上指定門檻限制
         if use_macd_abs:
             cond_macd = cond_macd & (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th)
             
@@ -210,7 +203,6 @@ class IndicatorResonanceStrategy:
         return resonance_score
 
 class DivergenceStrategy:
-    """底背離判定模組"""
     @staticmethod
     def check_bottom_divergence(
         df, price_col='Low', ind_col='K', ind_signal_col='D', 
@@ -271,9 +263,6 @@ class DivergenceStrategy:
                     
         return True
 
-# ==========================================
-# 資料抓取與共用函式 (含防阻擋機制)
-# ==========================================
 def get_yf_session():
     session = requests.Session()
     retry = Retry(total=3, read=3, connect=3, backoff_factor=1.5, status_forcelist=(429, 500, 502, 503, 504))
@@ -331,9 +320,6 @@ def get_stock_data(symbol):
         except Exception: continue
     return pd.DataFrame(), code
 
-# ==========================================
-# 介面主程式與 Session State 初始化防呆
-# ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
 if "config" not in st.session_state: st.session_state.config = load_config()
@@ -344,7 +330,6 @@ def apply_profile_to_state(profile_name):
     full_prof = DEFAULT_PARAMS.copy()
     full_prof.update(prof)
     for k, v in full_prof.items(): st.session_state[k] = v
-    # 同步日期物件
     st.session_state.backtest_date_obj = pd.to_datetime(full_prof["backtest_date"]).date()
     st.session_state.current_profile = profile_name
     st.session_state.config["last_used"] = profile_name
@@ -359,9 +344,6 @@ st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=Tru
 
 tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)"])
 
-# ----------------------------------------------------
-# 頁籤 1：單檔深度解析
-# ----------------------------------------------------
 with tab1:
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
 
@@ -535,9 +517,6 @@ with tab1:
                 plt.tight_layout()
                 st.pyplot(fig)
 
-# ----------------------------------------------------
-# 頁籤 2：全市場智慧掃描
-# ----------------------------------------------------
 with tab2:
     st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」或「雙指標共振」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
     
@@ -647,7 +626,6 @@ with tab2:
         
         yf_session = get_yf_session()
         
-        # 決定資料下載區間 (支援回測)
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
         total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70
@@ -697,7 +675,6 @@ with tab2:
                         try:
                             df = data.xs(ticker, axis=1, level=1).dropna(how='all') if isinstance(data.columns, pd.MultiIndex) else (data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame())
                             
-                            # 針對回測日期精確截斷資料
                             if st.session_state.use_backtest_date:
                                 target_dt = pd.to_datetime(st.session_state.backtest_date_obj)
                                 df = df[df.index.tz_localize(None).normalize() <= target_dt]
@@ -756,7 +733,7 @@ with tab2:
                                             best_row, best_offset = t_row, offset
                             
                             if best_row is not None:
-                                clean_ticker = ticker.replace(".TW", "").replace(".TWO", "")
+                                clean_ticker = ticker.split('.')[0]
                                 reversal_candidates[ticker] = {
                                     "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                     "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
