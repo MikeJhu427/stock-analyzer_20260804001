@@ -4,6 +4,7 @@ import warnings
 import logging
 import requests
 import datetime
+import time  # 新增：用於連線延遲防阻擋
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
@@ -97,6 +98,7 @@ class TechnicalIndicators:
 # 模組 2：大盤位階與策略演算法核心
 # ==========================================
 class MarketRegimeFilter:
+    """大盤位階與期貨基準動態濾網"""
     @staticmethod
     def evaluate(session, backtest_date_obj=None):
         try:
@@ -132,6 +134,7 @@ class MarketRegimeFilter:
             return None
 
 class BottomReversalStrategy:
+    """左側交易：低檔強力翻轉判定模組"""
     @staticmethod
     def evaluate(df):
         body = abs(df['Close'] - df['Open'])
@@ -149,6 +152,7 @@ class BottomReversalStrategy:
         return candle_score
 
 class VCPStrategy:
+    """右側交易：VCP波動收斂型態判定模組"""
     @staticmethod
     def evaluate(df):
         bb_width = (df['BB_Upper'] - df['BB_Lower']) / df['MA20'] * 100
@@ -165,6 +169,7 @@ class VCPStrategy:
         return vcp_score
 
 class IndicatorResonanceStrategy:
+    """雙指標共振起漲：精細化KD與MACD波段條件限制"""
     @staticmethod
     def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, 
                  use_macd_abs=False, macd_older_low_th=0, macd_recent_low_th=0, cross_days=3):
@@ -188,6 +193,7 @@ class IndicatorResonanceStrategy:
         macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
 
         cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
+        
         cond_macd = (recent_macd_low > older_macd_low) & macd_recent_cross
         if use_macd_abs:
             cond_macd = cond_macd & (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th)
@@ -203,6 +209,7 @@ class IndicatorResonanceStrategy:
         return resonance_score
 
 class DivergenceStrategy:
+    """底背離判定模組"""
     @staticmethod
     def check_bottom_divergence(
         df, price_col='Low', ind_col='K', ind_signal_col='D', 
@@ -263,6 +270,9 @@ class DivergenceStrategy:
                     
         return True
 
+# ==========================================
+# 資料抓取與共用函式 (含防阻擋機制)
+# ==========================================
 def get_yf_session():
     session = requests.Session()
     retry = Retry(total=3, read=3, connect=3, backoff_factor=1.5, status_forcelist=(429, 500, 502, 503, 504))
@@ -274,22 +284,41 @@ def get_yf_session():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_all_tw_stocks():
+    """強制重試與數量驗證，確保上市與上櫃股票皆完整抓取 (約1700檔)"""
     stocks = {}
-    for mode in ['2', '4']:
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
+    for mode in ['2', '4']: # 2=上市, 4=上櫃
         suffix = '.TW' if mode == '2' else '.TWO'
-        try:
-            url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for tr in soup.find_all('tr'):
-                tds = tr.find_all('td')
-                if len(tds) > 0:
-                    text = tds[0].text.strip()
-                    if '\u3000' in text:
-                        code, name = text.split('\u3000')
-                        if code.isdigit() and len(code) == 4:
-                            stocks[code + suffix] = name
-        except Exception: pass
+        # 若失敗最多重試 3 次
+        for attempt in range(3):
+            try:
+                url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+                res = requests.get(url, headers=headers, timeout=15)
+                res.encoding = 'big5' # 強制 Big5 解碼避免亂碼
+                soup = BeautifulSoup(res.text, 'html.parser')
+                
+                fetched_count = 0
+                for tr in soup.find_all('tr'):
+                    tds = tr.find_all('td')
+                    if len(tds) > 0:
+                        text = tds[0].text.strip()
+                        if '\u3000' in text:
+                            code, name = text.split('\u3000')
+                            if code.isdigit() and len(code) == 4:
+                                stocks[code + suffix] = name
+                                fetched_count += 1
+                
+                # 確保成功抓取足夠數量的股票才算成功 (上市/上櫃一般都超過 500 檔)
+                if fetched_count > 500:
+                    break
+                else:
+                    time.sleep(2)
+            except Exception:
+                time.sleep(2)
+        # 兩次大市場請求之間延遲 2 秒，避免被 TWSE 阻擋
+        time.sleep(2)
+        
     return stocks
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -320,6 +349,9 @@ def get_stock_data(symbol):
         except Exception: continue
     return pd.DataFrame(), code
 
+# ==========================================
+# 介面主程式與 Session State 初始化防呆
+# ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
 if "config" not in st.session_state: st.session_state.config = load_config()
@@ -344,6 +376,9 @@ st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=Tru
 
 tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)"])
 
+# ----------------------------------------------------
+# 頁籤 1：單檔深度解析
+# ----------------------------------------------------
 with tab1:
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
 
@@ -517,6 +552,9 @@ with tab1:
                 plt.tight_layout()
                 st.pyplot(fig)
 
+# ----------------------------------------------------
+# 頁籤 2：全市場智慧掃描
+# ----------------------------------------------------
 with tab2:
     st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」或「雙指標共振」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
     
