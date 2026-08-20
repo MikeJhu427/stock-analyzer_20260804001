@@ -168,7 +168,7 @@ class VCPStrategy:
 class IndicatorResonanceStrategy:
     @staticmethod
     def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, 
-                 use_macd_abs=False, macd_older_low_th=0, macd_recent_low_th=0, cross_days=3):
+                 use_macd_abs=False, macd_older_low_th=0.0, macd_recent_low_th=0.0, cross_days=3):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
 
@@ -190,9 +190,8 @@ class IndicatorResonanceStrategy:
 
         cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
         
-        # MACD 核心：近期低點必須大於前波低點 (底底高)
+        # MACD 核心判斷：底底高
         cond_macd = (recent_macd_low > older_macd_low) & macd_recent_cross
-        # 絕對數值濾網
         if use_macd_abs:
             cond_macd = cond_macd & (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th)
             
@@ -278,10 +277,8 @@ def get_yf_session():
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_all_tw_stocks():
-    """強制重試與數量驗證，確保上市與上櫃股票皆完整抓取 (約1700+檔)"""
     stocks = {}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
     for mode in ['2', '4']: 
         suffix = '.TW' if mode == '2' else '.TWO'
         for attempt in range(3):
@@ -301,15 +298,11 @@ def get_all_tw_stocks():
                             if code.isdigit() and len(code) == 4:
                                 stocks[code + suffix] = name
                                 fetched_count += 1
-                
-                if fetched_count > 500:
-                    break
-                else:
-                    time.sleep(2)
+                if fetched_count > 500: break
+                else: time.sleep(2)
             except Exception:
                 time.sleep(2)
         time.sleep(2)
-        
     return stocks
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -364,6 +357,9 @@ st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=Tru
 
 tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)"])
 
+# ----------------------------------------------------
+# 頁籤 1：單檔深度解析
+# ----------------------------------------------------
 with tab1:
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
 
@@ -537,6 +533,9 @@ with tab1:
                 plt.tight_layout()
                 st.pyplot(fig)
 
+# ----------------------------------------------------
+# 頁籤 2：全市場智慧掃描
+# ----------------------------------------------------
 with tab2:
     st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」或「雙指標共振」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
     
@@ -628,15 +627,15 @@ with tab2:
         st.markdown("**5. 指標共振演算法進階濾網 (依據上方波段範圍天數)**")
         col_r1, col_r2, col_r3, col_r4 = st.columns(4)
         with col_r1:
-            st.number_input("KD前波低點 <", value=st.session_state.reso_kd_older_low, step=1.0, key="reso_kd_older_low")
-            st.number_input("KD前波高點 <", value=st.session_state.reso_kd_older_high, step=1.0, key="reso_kd_older_high")
+            st.number_input("KD前波低點 <", step=1.0, key="reso_kd_older_low")
+            st.number_input("KD前波高點 <", step=1.0, key="reso_kd_older_high")
         with col_r2:
-            st.number_input("KD近波低點 >", value=st.session_state.reso_kd_recent_low, step=1.0, key="reso_kd_recent_low")
-            st.number_input("近期金叉天數 <=", value=st.session_state.reso_cross_days, step=1, key="reso_cross_days")
+            st.number_input("KD近波低點 >", step=1.0, key="reso_kd_recent_low")
+            st.number_input("近期金叉天數 <=", step=1, key="reso_cross_days")
         with col_r3:
             st.checkbox("啟用 MACD絕對數值濾網", key="use_macd_abs")
-            st.number_input("MACD前波低 <", value=st.session_state.reso_macd_older_low, step=0.1, key="reso_macd_older_low", disabled=not st.session_state.use_macd_abs)
-            st.number_input("MACD近波低 >", value=st.session_state.reso_macd_recent_low, step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0", disabled=not st.session_state.use_macd_abs)
+            st.number_input("MACD前波低 <", step=0.1, key="reso_macd_older_low", disabled=not st.session_state.use_macd_abs)
+            st.number_input("MACD近波低 >", step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0", disabled=not st.session_state.use_macd_abs)
 
     st.markdown("---")
     
@@ -685,10 +684,10 @@ with tab2:
             tickers = list(stock_dict.keys())
             reversal_candidates = {} 
             
-            chunk_size = 100
+            chunk_size = 40 # 【優化】降低單次請求數量，進一步防止 429 阻擋
             for i in range(0, len(tickers), chunk_size):
                 chunk = tickers[i:i+chunk_size]
-                status_text.text(f"[階段一] 正在全市場區間掃描 [{algo_mode}]：進度 {i} / {len(tickers)} 檔...")
+                status_text.text(f"[階段一] 正在全市場區間掃描 [{algo_mode}]：進度 {min(i+chunk_size, len(tickers))} / {len(tickers)} 檔...")
                 try:
                     data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
                     for ticker in chunk:
@@ -766,6 +765,8 @@ with tab2:
                                 }
                         except Exception: continue
                 except Exception: pass
+                
+                time.sleep(1.0) # 【關鍵修復】批次間隔延遲，徹底杜絕 yfinance 429 阻擋
                 progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
             
             reversal_list = list(reversal_candidates.values())
@@ -810,6 +811,7 @@ with tab2:
                             for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
                         
                         if dl_60m_kwargs is not None:
+                            time.sleep(0.5) # 防止 60分K 連續抓取被阻擋
                             m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", **dl_60m_kwargs)
                             if specific_offset > 0 and not daily_df.empty:
                                 target_date = daily_df.index[-1].date()
