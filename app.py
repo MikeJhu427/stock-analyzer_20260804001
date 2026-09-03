@@ -1155,6 +1155,17 @@ with tab2:
                         df['BB_Upper'] = df['MA20'] + 2 * std20
                         df['BB_Lower'] = df['MA20'] - 2 * std20
                         
+                        # 計算近期金叉判定狀態 (供輸出呈現)
+                        df['KD_Cross'] = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
+                        if st.session_state.reso_macd_cross_zero:
+                            df['MACD_Cross'] = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
+                        else:
+                            macd_turn_up = (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & (df['MACD_Hist'].shift(1) <= df['MACD_Hist'].shift(2))
+                            df['MACD_Cross'] = macd_turn_up | ((df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0))
+                            
+                        df['KD_Cross_Recent'] = df['KD_Cross'].rolling(window=st.session_state.reso_cross_days, min_periods=1).max() >= 1
+                        df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=st.session_state.reso_cross_days, min_periods=1).max() >= 1
+                        
                         df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
                         df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
                         
@@ -1223,6 +1234,9 @@ with tab2:
                                 "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                                 "當日收盤": round(float(best_row['Close']), 2),
                                 "月均量(張)": int(best_row['Vol_MA20']),
+                                "DIF": round(float(best_row['MACD']), 3),
+                                "KD金叉判定": "✅ 是" if best_row['KD_Cross_Recent'] else "❌ 否",
+                                "MACD金叉判定": "✅ 是" if best_row['MACD_Cross_Recent'] else "❌ 否",
                                 "反轉分數": round(float(best_row['Candle_Score']), 2),
                                 "VCP分數": round(float(best_row['VCP_Score']), 2),
                                 "共振分數": round(float(best_row['Reso_Score']), 2),
@@ -1325,7 +1339,8 @@ with tab2:
             status_text.empty(); progress_bar.empty()
             
             res_df = pd.DataFrame(final_results)
-            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            # 在基礎欄位中加入新的 DIF、KD金叉判定、MACD金叉判定
+            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
             div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
             kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
             cols = base_cols + div_cols + kou_cols
