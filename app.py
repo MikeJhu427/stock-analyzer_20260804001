@@ -55,6 +55,9 @@ DEFAULT_PARAMS = {
     "reso_macd_cross_zero": False,
     "reso_price_basis": "最低價 (Low)",
     "reso_macd_wave_logic": False,
+    "require_cross_confirm": True,
+    "use_cross_position_filter": True,
+    "cross_position_threshold": 70.0,
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -179,20 +182,17 @@ class IndicatorResonanceStrategy:
     def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=90, kd_recent_low_th=0.0, 
                  use_macd_abs=False, macd_older_low_th=0.0, macd_recent_low_th=0.0, cross_days=3,
                  require_price_higher_low=False, require_macd_cross_zero=False,
-                 reso_price_basis="最低價 (Low)", use_macd_wave_logic=False):
+                 reso_price_basis="最低價 (Low)", use_macd_wave_logic=False, require_cross_confirm=True):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
 
-        # 價格比較基準選擇
         price_col = 'Low' if reso_price_basis == "最低價 (Low)" else 'Close'
 
         recent_k_low = df['K'].rolling(window=recent_w, min_periods=1).min()
         older_k_low = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         older_k_high = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).max()
         
-        # MACD 比對邏輯：固定改抓 MACD_Hist (長柱)
         if use_macd_wave_logic:
-            # 零軸動能波段判定：找出水下區塊
             sign = np.sign(df['MACD_Hist'])
             sign = sign.replace(0, method='ffill').fillna(1)
             block_id = (sign != sign.shift(1)).cumsum().rename('block_id')
@@ -204,13 +204,10 @@ class IndicatorResonanceStrategy:
                 older_macd_low = pd.Series(np.nan, index=df.index)
             else:
                 block_mins = df['MACD_Hist'].groupby(block_id).transform('min')
-                
-                # 近期波段谷底 (往前填充保留最後一次水下紀錄)
                 recent_val = pd.Series(np.nan, index=df.index)
                 recent_val.loc[neg_mask] = block_mins[neg_mask]
                 recent_val = recent_val.ffill()
                 
-                # 前一波段谷底 (指定欄位避免重名解析錯誤)
                 unique_neg_blocks = df.loc[neg_mask, 'MACD_Hist'].groupby(block_id).min().reset_index()
                 unique_neg_blocks['prev_min'] = unique_neg_blocks['MACD_Hist'].shift(1)
                 prev_min_dict = dict(zip(unique_neg_blocks['block_id'], unique_neg_blocks['prev_min']))
@@ -222,7 +219,6 @@ class IndicatorResonanceStrategy:
                 recent_macd_low = recent_val
                 older_macd_low = older_val
         else:
-            # 原本的靜態天數框架
             recent_macd_low = df['MACD_Hist'].rolling(window=recent_w, min_periods=1).min()
             older_macd_low = df['MACD_Hist'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         
@@ -234,16 +230,19 @@ class IndicatorResonanceStrategy:
         if require_macd_cross_zero:
             macd_signal = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
         else:
-            # 寬鬆條件：柱狀圖谷底翻揚 (今天大於昨天，昨天小於前天) 或 已經實質金叉
             macd_turn_up = (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & (df['MACD_Hist'].shift(1) <= df['MACD_Hist'].shift(2))
             macd_signal = macd_turn_up | ((df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0))
 
         kd_recent_cross = kd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
         macd_recent_cross = macd_signal.rolling(window=cross_days, min_periods=1).max() >= 1
 
-        cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
-        
-        cond_macd = (recent_macd_low > older_macd_low) & macd_recent_cross
+        if require_cross_confirm:
+            cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
+            cond_macd = (recent_macd_low > older_macd_low) & macd_recent_cross
+        else:
+            cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th)
+            cond_macd = (recent_macd_low > older_macd_low)
+
         if use_macd_abs:
             cond_macd = cond_macd & (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th)
             
@@ -263,14 +262,18 @@ class IndicatorResonanceStrategy:
 class DivergenceStrategy:
     @staticmethod
     def check_bottom_divergence(
-        df, price_col='Low', ind_col='K', ind_signal_col='D', 
+        df, price_col='Low', ind_col='K', cross_col1='K', cross_col2='D',
         recent_w=5, older_w=20, recent_lows_cnt=0, older_lows_cnt=0,
-        pivot_left=0, pivot_right=0
+        pivot_left=0, pivot_right=0, require_cross_confirm=True, cross_days=3
     ):
-        # 優化後的背離演算法：明確切分近期與前波，放寬價格誤差
         if len(df) < recent_w + older_w: 
             return False
             
+        if require_cross_confirm:
+            cross = (df[cross_col1] > df[cross_col2]) & (df[cross_col1].shift(1) <= df[cross_col2].shift(1))
+            if not cross.iloc[-cross_days:].any():
+                return False
+
         recent_start = len(df) - recent_w
         older_start = recent_start - older_w
         older_end = recent_start
@@ -284,7 +287,6 @@ class DivergenceStrategy:
             r_i_min = np.min(inds[recent_start:])
             o_i_min = np.min(inds[older_start:older_end])
             
-            # 放寬容許度：只要價格 <= 前低 * 1.02 (容許雙底平底或破底)，且指標 > 前波最低指標，即為底背離
             return (r_p_min <= o_p_min * 1.02) and (r_i_min > o_i_min)
 
         def get_valid_pivots_iloc(start_loc, end_loc):
@@ -818,7 +820,8 @@ with tab1:
                     require_price_higher_low=st.session_state.reso_price_higher_low,
                     require_macd_cross_zero=st.session_state.reso_macd_cross_zero,
                     reso_price_basis=st.session_state.reso_price_basis,
-                    use_macd_wave_logic=st.session_state.reso_macd_wave_logic
+                    use_macd_wave_logic=st.session_state.reso_macd_wave_logic,
+                    require_cross_confirm=st.session_state.require_cross_confirm
                 )
                 
                 df = df.dropna(subset=['Momentum_Force', 'Max_Vol_Defense', 'VWMA20', 'Prev_MA5', 'Vol_MA20', 'MA60']).copy()
@@ -1048,6 +1051,15 @@ with tab2:
         with col_r5:
             st.radio("價格比較基準", ["最低價 (Low)", "收盤價 (Close)"], key="reso_price_basis")
             st.checkbox("MACD零軸動能波段判定", key="reso_macd_wave_logic", help="開啟後，MACD自動以0軸分界波段，無懼靜態天數限制精確比對。")
+            
+        st.markdown("**6. 金叉確認與進場位置建議過濾**")
+        col_x1, col_x2, col_x3 = st.columns(3)
+        with col_x1:
+            st.checkbox("嚴格要求金叉確認背離與共振", key="require_cross_confirm", help="啟用後，發生背離且在設定天數內發生指標金叉，才判定為有效。")
+        with col_x2:
+            st.checkbox("啟用進場位置建議 (K值過高提示)", key="use_cross_position_filter", help="依據觸發時的 K 值給予參考建議。")
+        with col_x3:
+            st.number_input("建議參考的 K值上限 <", step=1.0, key="cross_position_threshold", disabled=not st.session_state.use_cross_position_filter)
 
     st.markdown("---")
     
@@ -1161,7 +1173,8 @@ with tab2:
                                 require_price_higher_low=st.session_state.reso_price_higher_low,
                                 require_macd_cross_zero=st.session_state.reso_macd_cross_zero,
                                 reso_price_basis=st.session_state.reso_price_basis,
-                                use_macd_wave_logic=st.session_state.reso_macd_wave_logic
+                                use_macd_wave_logic=st.session_state.reso_macd_wave_logic,
+                                require_cross_confirm=st.session_state.require_cross_confirm
                             )
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
@@ -1194,6 +1207,16 @@ with tab2:
                         
                         if best_row is not None:
                             clean_ticker = ticker.split('.')[0]
+                            
+                            # 評估進場位置建議
+                            rec_status = "-"
+                            if st.session_state.use_cross_position_filter:
+                                k_val = float(best_row['K'])
+                                if k_val < st.session_state.cross_position_threshold:
+                                    rec_status = "✅ 建議參考"
+                                else:
+                                    rec_status = "⚠️ 位置偏高"
+
                             reversal_candidates[ticker] = {
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                 "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
@@ -1202,7 +1225,8 @@ with tab2:
                                 "月均量(張)": int(best_row['Vol_MA20']),
                                 "反轉分數": round(float(best_row['Candle_Score']), 2),
                                 "VCP分數": round(float(best_row['VCP_Score']), 2),
-                                "共振分數": round(float(best_row['Reso_Score']), 2)
+                                "共振分數": round(float(best_row['Reso_Score']), 2),
+                                "進場位置建議": rec_status
                             }
                     except Exception: continue
             except Exception: pass
@@ -1224,6 +1248,8 @@ with tab2:
             
             final_results = []
             price_col_for_div = 'Low' if st.session_state.reso_price_basis == "最低價 (Low)" else 'Close'
+            req_cross = st.session_state.require_cross_confirm
+            c_days = st.session_state.reso_cross_days
             
             for idx, item in enumerate(reversal_list):
                 try:
@@ -1244,8 +1270,12 @@ with tab2:
                                 item[f"扣抵狀態({n}MA)"] = "無資料"
                         
                         for r_w, o_w in div_pairs:
-                            d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, price_col_for_div, 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                            d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, price_col_for_div, 'MACD_Hist', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                            d_kd = DivergenceStrategy.check_bottom_divergence(
+                                daily_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                            )
+                            d_macd = DivergenceStrategy.check_bottom_divergence(
+                                daily_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                            )
                             res = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
                             item[f"日K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
                             if res: has_daily_div = True
@@ -1263,8 +1293,12 @@ with tab2:
                         if not m60_df.empty:
                             m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
                             for r_w, o_w in div_pairs:
-                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, price_col_for_div, 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, price_col_for_div, 'MACD_Hist', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                m_kd = DivergenceStrategy.check_bottom_divergence(
+                                    m60_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                                )
+                                m_macd = DivergenceStrategy.check_bottom_divergence(
+                                    m60_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                                )
                                 res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
                                 item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
                                 if res: has_m60_div = True
@@ -1291,7 +1325,7 @@ with tab2:
             status_text.empty(); progress_bar.empty()
             
             res_df = pd.DataFrame(final_results)
-            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
             div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
             kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
             cols = base_cols + div_cols + kou_cols
