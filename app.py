@@ -53,6 +53,8 @@ DEFAULT_PARAMS = {
     "reso_cross_days": 3,
     "reso_price_higher_low": False,
     "reso_macd_cross_zero": False,
+    "reso_price_basis": "最低價 (Low)",
+    "reso_macd_wave_logic": False,
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -176,19 +178,51 @@ class IndicatorResonanceStrategy:
     @staticmethod
     def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=90, kd_recent_low_th=0.0, 
                  use_macd_abs=False, macd_older_low_th=0.0, macd_recent_low_th=0.0, cross_days=3,
-                 require_price_higher_low=False, require_macd_cross_zero=False):
+                 require_price_higher_low=False, require_macd_cross_zero=False,
+                 reso_price_basis="最低價 (Low)", use_macd_wave_logic=False):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
+
+        # 價格比較基準選擇
+        price_col = 'Low' if reso_price_basis == "最低價 (Low)" else 'Close'
 
         recent_k_low = df['K'].rolling(window=recent_w, min_periods=1).min()
         older_k_low = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         older_k_high = df['K'].shift(recent_w).rolling(window=older_w, min_periods=1).max()
         
-        recent_macd_low = df['MACD'].rolling(window=recent_w, min_periods=1).min()
-        older_macd_low = df['MACD'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
+        # MACD 比對邏輯：固定改抓 MACD_Hist (長柱)
+        if use_macd_wave_logic:
+            # 零軸動能波段判定：找出水下區塊
+            sign = np.sign(df['MACD_Hist'])
+            sign = sign.replace(0, method='ffill').fillna(1)
+            block_id = (sign != sign.shift(1)).cumsum()
+            
+            neg_mask = sign < 0
+            block_mins = df['MACD_Hist'].groupby(block_id).transform('min')
+            
+            # 近期波段谷底 (往前填充保留最後一次水下紀錄)
+            recent_val = pd.Series(np.nan, index=df.index)
+            recent_val.loc[neg_mask] = block_mins[neg_mask]
+            recent_val = recent_val.ffill()
+            
+            # 前一波段谷底
+            unique_neg_blocks = df[neg_mask].groupby(block_id)['MACD_Hist'].min().reset_index()
+            unique_neg_blocks['prev_min'] = unique_neg_blocks['MACD_Hist'].shift(1)
+            prev_min_dict = dict(zip(unique_neg_blocks[block_id.name], unique_neg_blocks['prev_min']))
+            
+            older_val = pd.Series(np.nan, index=df.index)
+            older_val.loc[neg_mask] = block_id[neg_mask].map(prev_min_dict)
+            older_val = older_val.ffill()
+            
+            recent_macd_low = recent_val
+            older_macd_low = older_val
+        else:
+            # 原本的靜態天數框架
+            recent_macd_low = df['MACD_Hist'].rolling(window=recent_w, min_periods=1).min()
+            older_macd_low = df['MACD_Hist'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
         
-        recent_price_low = df['Low'].rolling(window=recent_w, min_periods=1).min()
-        older_price_low = df['Low'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
+        recent_price_low = df[price_col].rolling(window=recent_w, min_periods=1).min()
+        older_price_low = df[price_col].shift(recent_w).rolling(window=older_w, min_periods=1).min()
 
         kd_cross = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
         
@@ -787,7 +821,9 @@ with tab1:
                     macd_recent_low_th=st.session_state.reso_macd_recent_low,
                     cross_days=st.session_state.reso_cross_days,
                     require_price_higher_low=st.session_state.reso_price_higher_low,
-                    require_macd_cross_zero=st.session_state.reso_macd_cross_zero
+                    require_macd_cross_zero=st.session_state.reso_macd_cross_zero,
+                    reso_price_basis=st.session_state.reso_price_basis,
+                    use_macd_wave_logic=st.session_state.reso_macd_wave_logic
                 )
                 
                 df = df.dropna(subset=['Momentum_Force', 'Max_Vol_Defense', 'VWMA20', 'Prev_MA5', 'Vol_MA20', 'MA60']).copy()
@@ -1000,7 +1036,7 @@ with tab2:
         with col_k4: st.checkbox("啟用 60MA 扣抵判斷", key="kou_di_60")
             
         st.markdown("**5. 指標共振演算法進階濾網 (依據上方波段範圍天數)**")
-        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+        col_r1, col_r2, col_r3, col_r4, col_r5 = st.columns([1, 1, 1, 1, 1.2])
         with col_r1:
             st.number_input("KD前波低點 <", step=1.0, key="reso_kd_older_low")
             st.number_input("KD前波高點 <", step=1.0, key="reso_kd_older_high")
@@ -1014,6 +1050,9 @@ with tab2:
         with col_r4:
             st.checkbox("嚴格要求股價底底高", key="reso_price_higher_low", help="不勾選則允許股價破底但指標背離 (典型底背離)")
             st.checkbox("嚴格要求MACD金叉(>0)", key="reso_macd_cross_zero", help="不勾選則只要求柱狀圖谷底翻揚即可")
+        with col_r5:
+            st.radio("價格比較基準", ["最低價 (Low)", "收盤價 (Close)"], key="reso_price_basis")
+            st.checkbox("MACD零軸動能波段判定", key="reso_macd_wave_logic", help="開啟後，MACD自動以0軸分界波段，無懼靜態天數限制精確比對。")
 
     st.markdown("---")
     
@@ -1125,7 +1164,9 @@ with tab2:
                                 macd_recent_low_th=st.session_state.reso_macd_recent_low,
                                 cross_days=st.session_state.reso_cross_days,
                                 require_price_higher_low=st.session_state.reso_price_higher_low,
-                                require_macd_cross_zero=st.session_state.reso_macd_cross_zero
+                                require_macd_cross_zero=st.session_state.reso_macd_cross_zero,
+                                reso_price_basis=st.session_state.reso_price_basis,
+                                use_macd_wave_logic=st.session_state.reso_macd_wave_logic
                             )
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
