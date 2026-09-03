@@ -168,7 +168,7 @@ class VCPStrategy:
 
 class IndicatorResonanceStrategy:
     @staticmethod
-    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=50, kd_recent_low_th=20, 
+    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=90, kd_recent_low_th=20, 
                  use_macd_abs=False, macd_older_low_th=0.0, macd_recent_low_th=0.0, cross_days=3):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
