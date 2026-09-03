@@ -192,30 +192,35 @@ class IndicatorResonanceStrategy:
         
         # MACD 比對邏輯：固定改抓 MACD_Hist (長柱)
         if use_macd_wave_logic:
-            # 零軸動能波段判定：找出水下區塊
+            # 零軸動能波段判定：找出水下區塊 (將 block_id 重新命名避免與 MACD_Hist 衝突)
             sign = np.sign(df['MACD_Hist'])
             sign = sign.replace(0, method='ffill').fillna(1)
-            block_id = (sign != sign.shift(1)).cumsum()
+            block_id = (sign != sign.shift(1)).cumsum().rename('block_id')
             
             neg_mask = sign < 0
-            block_mins = df['MACD_Hist'].groupby(block_id).transform('min')
             
-            # 近期波段谷底 (往前填充保留最後一次水下紀錄)
-            recent_val = pd.Series(np.nan, index=df.index)
-            recent_val.loc[neg_mask] = block_mins[neg_mask]
-            recent_val = recent_val.ffill()
-            
-            # 前一波段谷底
-            unique_neg_blocks = df[neg_mask].groupby(block_id)['MACD_Hist'].min().reset_index()
-            unique_neg_blocks['prev_min'] = unique_neg_blocks['MACD_Hist'].shift(1)
-            prev_min_dict = dict(zip(unique_neg_blocks[block_id.name], unique_neg_blocks['prev_min']))
-            
-            older_val = pd.Series(np.nan, index=df.index)
-            older_val.loc[neg_mask] = block_id[neg_mask].map(prev_min_dict)
-            older_val = older_val.ffill()
-            
-            recent_macd_low = recent_val
-            older_macd_low = older_val
+            if not neg_mask.any():
+                recent_macd_low = pd.Series(np.nan, index=df.index)
+                older_macd_low = pd.Series(np.nan, index=df.index)
+            else:
+                block_mins = df['MACD_Hist'].groupby(block_id).transform('min')
+                
+                # 近期波段谷底 (往前填充保留最後一次水下紀錄)
+                recent_val = pd.Series(np.nan, index=df.index)
+                recent_val.loc[neg_mask] = block_mins[neg_mask]
+                recent_val = recent_val.ffill()
+                
+                # 前一波段谷底 (指定欄位避免重名解析錯誤)
+                unique_neg_blocks = df.loc[neg_mask, 'MACD_Hist'].groupby(block_id).min().reset_index()
+                unique_neg_blocks['prev_min'] = unique_neg_blocks['MACD_Hist'].shift(1)
+                prev_min_dict = dict(zip(unique_neg_blocks['block_id'], unique_neg_blocks['prev_min']))
+                
+                older_val = pd.Series(np.nan, index=df.index)
+                older_val.loc[neg_mask] = block_id[neg_mask].map(prev_min_dict)
+                older_val = older_val.ffill()
+                
+                recent_macd_low = recent_val
+                older_macd_low = older_val
         else:
             # 原本的靜態天數框架
             recent_macd_low = df['MACD_Hist'].rolling(window=recent_w, min_periods=1).min()
