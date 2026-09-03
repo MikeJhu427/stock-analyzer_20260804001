@@ -268,1027 +268,217 @@ class DivergenceStrategy:
         return True
 
 # ==========================================
-# 模組 3：財報三表地雷掃描 V2
-# 財報健康度 / 地雷風險引擎
+# 模組 3：財報三表地雷掃描 V3 (天數優化版)
 # ==========================================
 class FinancialAuditStrategy:
-
-    # --------------------------------------
-    # 基本工具
-    # --------------------------------------
     @staticmethod
     def _safe_float(value):
         try:
-            if pd.isna(value):
-                return np.nan
+            if pd.isna(value): return np.nan
             return float(value)
-        except Exception:
-            return np.nan
+        except Exception: return np.nan
 
     @staticmethod
     def _find_row(df, candidates):
-        """
-        Yahoo Finance 不同公司/版本可能使用不同科目名稱。
-        找不到時回傳 None，不再把缺資料當成 0。
-        """
-        if df is None or df.empty:
-            return None
-
+        if df is None or df.empty: return None
         index_map = {str(x).strip().lower(): x for x in df.index}
-
         for candidate in candidates:
             key = str(candidate).strip().lower()
-            if key in index_map:
-                return index_map[key]
-
-        # 模糊搜尋
+            if key in index_map: return index_map[key]
         for candidate in candidates:
             key = str(candidate).strip().lower()
             for idx in df.index:
                 idx_str = str(idx).strip().lower()
-                if key in idx_str:
-                    return idx
-
+                if key in idx_str: return idx
         return None
 
     @staticmethod
     def _get_series(df, candidates):
-        """
-        取得指定科目的時間序列。
-        找不到時回傳空 Series。
-        """
         row = FinancialAuditStrategy._find_row(df, candidates)
-
-        if row is None:
-            return pd.Series(dtype=float)
-
+        if row is None: return pd.Series(dtype=float)
         s = df.loc[row].copy()
-
-        values = []
-        for x in s.values:
-            values.append(FinancialAuditStrategy._safe_float(x))
-
-        s = pd.Series(values, index=s.index, dtype=float)
-        return s
+        return pd.Series([FinancialAuditStrategy._safe_float(x) for x in s.values], index=s.index, dtype=float)
 
     @staticmethod
     def _normalize_statement(df):
-        """
-        統一財報欄位：
-        - 欄位轉 datetime
-        - 由舊到新
-        - 移除重複日期
-        """
-        if df is None or df.empty:
-            return pd.DataFrame()
-
+        if df is None or df.empty: return pd.DataFrame()
         result = df.copy()
-
         new_columns = []
-
         for col in result.columns:
             try:
                 dt = pd.to_datetime(col)
                 if hasattr(dt, "tz_localize"):
-                    try:
-                        dt = dt.tz_localize(None)
-                    except Exception:
-                        pass
+                    try: dt = dt.tz_localize(None)
+                    except Exception: pass
                 new_columns.append(dt)
-            except Exception:
-                new_columns.append(col)
-
+            except Exception: new_columns.append(col)
         result.columns = new_columns
-
-        try:
-            result = result.loc[:, sorted(result.columns)]
-        except Exception:
-            pass
-
+        try: result = result.loc[:, sorted(result.columns)]
+        except Exception: pass
         result = result.loc[:, ~pd.Index(result.columns).duplicated()]
-
         return result
 
     @staticmethod
     def _growth(current, previous):
-        """
-        成長率。
-        前期接近 0 時不硬算，避免產生假性的幾千 %。
-        """
-        if pd.isna(current) or pd.isna(previous):
-            return np.nan
-
-        if abs(previous) < 1e-9:
-            return np.nan
-
+        if pd.isna(current) or pd.isna(previous) or abs(previous) < 1e-9: return np.nan
         return (current - previous) / abs(previous) * 100
 
     @staticmethod
     def _ratio(a, b):
-        if pd.isna(a) or pd.isna(b) or abs(b) < 1e-9:
-            return np.nan
+        if pd.isna(a) or pd.isna(b) or abs(b) < 1e-9: return np.nan
         return a / b
 
     @staticmethod
-    def _margin(profit, revenue):
-        if pd.isna(profit) or pd.isna(revenue) or abs(revenue) < 1e-9:
-            return np.nan
-        return profit / revenue * 100
-
-    @staticmethod
     def _get_common_periods(*dfs):
-        """
-        找三張表真正共同存在的財報期間。
-        不再使用 periods[-5] 這種假設。
-        """
-        valid = []
-
-        for df in dfs:
-            if df is not None and not df.empty:
-                valid.append(set(df.columns))
-
-        if not valid:
-            return []
-
+        valid = [set(df.columns) for df in dfs if df is not None and not df.empty]
+        if not valid: return []
         common = set.intersection(*valid)
+        try: return sorted(common)
+        except Exception: return list(common)
 
-        try:
-            return sorted(common)
-        except Exception:
-            return list(common)
-
-    # --------------------------------------
-    # 風險評分
-    # --------------------------------------
-    @staticmethod
-    def _risk_level(score):
-        if score < 20:
-            return "🟢 健康"
-        elif score < 40:
-            return "🟡 正常 / 觀察"
-        elif score < 60:
-            return "🟠 中度地雷"
-        elif score < 80:
-            return "🔴 高風險"
-        else:
-            return "☠️ 極高風險"
-
-    # --------------------------------------
-    # 主分析
-    # --------------------------------------
     @staticmethod
     def evaluate(ticker_symbol, session):
-
         try:
             stock = yf.Ticker(ticker_symbol, session=session)
-
-            inc_stmt = FinancialAuditStrategy._normalize_statement(
-                stock.quarterly_income_stmt
-            )
-
-            bal_sheet = FinancialAuditStrategy._normalize_statement(
-                stock.quarterly_balance_sheet
-            )
-
-            cash_flow = FinancialAuditStrategy._normalize_statement(
-                stock.quarterly_cashflow
-            )
+            inc_stmt = FinancialAuditStrategy._normalize_statement(stock.quarterly_income_stmt)
+            bal_sheet = FinancialAuditStrategy._normalize_statement(stock.quarterly_balance_sheet)
+            cash_flow = FinancialAuditStrategy._normalize_statement(stock.quarterly_cashflow)
 
             if inc_stmt.empty and bal_sheet.empty and cash_flow.empty:
-                return {
-                    "status": "error",
-                    "msg": f"無法取得 {ticker_symbol} 財報資料。"
-                }
+                return {"status": "error", "msg": f"無法取得 {ticker_symbol} 財報資料。"}
 
-            # --------------------------------------
-            # 科目定義
-            # --------------------------------------
+            revenue = FinancialAuditStrategy._get_series(inc_stmt, ["Total Revenue", "Operating Revenue"])
+            net_income = FinancialAuditStrategy._get_series(inc_stmt, ["Net Income", "Net Income Common Stockholders"])
+            operating_income = FinancialAuditStrategy._get_series(inc_stmt, ["Operating Income"])
+            gross_profit = FinancialAuditStrategy._get_series(inc_stmt, ["Gross Profit"])
+            cfo = FinancialAuditStrategy._get_series(cash_flow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+            capex = FinancialAuditStrategy._get_series(cash_flow, ["Capital Expenditure"])
+            ar = FinancialAuditStrategy._get_series(bal_sheet, ["Accounts Receivable", "Net Receivables"])
+            inventory = FinancialAuditStrategy._get_series(bal_sheet, ["Inventory", "Inventories"])
+            cash = FinancialAuditStrategy._get_series(bal_sheet, ["Cash And Cash Equivalents", "Cash Financial"])
+            debt = FinancialAuditStrategy._get_series(bal_sheet, ["Total Debt", "Long Term Debt"])
+            equity = FinancialAuditStrategy._get_series(bal_sheet, ["Stockholders Equity", "Common Stock Equity"])
+            current_assets = FinancialAuditStrategy._get_series(bal_sheet, ["Current Assets"])
+            current_liabilities = FinancialAuditStrategy._get_series(bal_sheet, ["Current Liabilities"])
 
-            revenue_keys = [
-                "Total Revenue",
-                "Operating Revenue",
-                "Operating Revenue"
-            ]
-
-            net_income_keys = [
-                "Net Income",
-                "Net Income Common Stockholders",
-                "Net Income Applicable To Common Shares"
-            ]
-
-            operating_income_keys = [
-                "Operating Income"
-            ]
-
-            gross_profit_keys = [
-                "Gross Profit"
-            ]
-
-            cfo_keys = [
-                "Operating Cash Flow",
-                "Cash Flow From Continuing Operating Activities",
-                "Total Cash From Operating Activities",
-                "Cash Flowsfromusedin Operating Activities"
-            ]
-
-            capex_keys = [
-                "Capital Expenditure",
-                "Capital Expenditures"
-            ]
-
-            ar_keys = [
-                "Accounts Receivable",
-                "Net Receivables",
-                "Receivables",
-                "Accounts Receivable Net"
-            ]
-
-            inventory_keys = [
-                "Inventory",
-                "Inventories"
-            ]
-
-            cash_keys = [
-                "Cash And Cash Equivalents",
-                "Cash Cash Equivalents And Short Term Investments",
-                "Cash Financial"
-            ]
-
-            debt_keys = [
-                "Total Debt",
-                "Long Term Debt And Capital Lease Obligation",
-                "Long Term Debt",
-                "Current Debt"
-            ]
-
-            equity_keys = [
-                "Stockholders Equity",
-                "Stockholders' Equity",
-                "Total Equity Gross Minority Interest",
-                "Common Stock Equity"
-            ]
-
-            current_assets_keys = [
-                "Current Assets"
-            ]
-
-            current_liabilities_keys = [
-                "Current Liabilities"
-            ]
-
-            interest_expense_keys = [
-                "Interest Expense",
-                "Interest Expense Non Operating"
-            ]
-
-            # --------------------------------------
-            # 取得時間序列
-            # --------------------------------------
-
-            revenue = FinancialAuditStrategy._get_series(
-                inc_stmt, revenue_keys
-            )
-
-            net_income = FinancialAuditStrategy._get_series(
-                inc_stmt, net_income_keys
-            )
-
-            operating_income = FinancialAuditStrategy._get_series(
-                inc_stmt, operating_income_keys
-            )
-
-            gross_profit = FinancialAuditStrategy._get_series(
-                inc_stmt, gross_profit_keys
-            )
-
-            cfo = FinancialAuditStrategy._get_series(
-                cash_flow, cfo_keys
-            )
-
-            capex = FinancialAuditStrategy._get_series(
-                cash_flow, capex_keys
-            )
-
-            ar = FinancialAuditStrategy._get_series(
-                bal_sheet, ar_keys
-            )
-
-            inventory = FinancialAuditStrategy._get_series(
-                bal_sheet, inventory_keys
-            )
-
-            cash = FinancialAuditStrategy._get_series(
-                bal_sheet, cash_keys
-            )
-
-            debt = FinancialAuditStrategy._get_series(
-                bal_sheet, debt_keys
-            )
-
-            equity = FinancialAuditStrategy._get_series(
-                bal_sheet, equity_keys
-            )
-
-            current_assets = FinancialAuditStrategy._get_series(
-                bal_sheet, current_assets_keys
-            )
-
-            current_liabilities = FinancialAuditStrategy._get_series(
-                bal_sheet, current_liabilities_keys
-            )
-
-            interest_expense = FinancialAuditStrategy._get_series(
-                inc_stmt, interest_expense_keys
-            )
-
-            # --------------------------------------
-            # 建立共同期間
-            # --------------------------------------
-
-            common_periods = FinancialAuditStrategy._get_common_periods(
-                inc_stmt,
-                bal_sheet,
-                cash_flow
-            )
-
-            # 如果三表完全沒有共同期間，
-            # 就採用各自最新期間進行分析
+            common_periods = FinancialAuditStrategy._get_common_periods(inc_stmt, bal_sheet, cash_flow)
             if not common_periods:
-
                 all_periods = set()
-
                 for df in [inc_stmt, bal_sheet, cash_flow]:
-                    if df is not None and not df.empty:
-                        all_periods.update(df.columns)
-
-                if not all_periods:
-                    return {
-                        "status": "error",
-                        "msg": f"{ticker_symbol} 財報期間無法辨識。"
-                    }
-
+                    if df is not None and not df.empty: all_periods.update(df.columns)
+                if not all_periods: return {"status": "error", "msg": "無財報期間"}
                 common_periods = sorted(all_periods)
 
             latest_period = common_periods[-1]
+            prior_period = common_periods[-5] if len(common_periods) >= 5 else (common_periods[-2] if len(common_periods) >= 2 else None)
+            comp_type = "YoY" if len(common_periods) >= 5 else "QoQ"
 
-            # --------------------------------------
-            # 取得最新值
-            # --------------------------------------
+            def val_at(s, p): return FinancialAuditStrategy._safe_float(s.loc[p]) if not s.empty and p in s.index else np.nan
 
-            def value_at(series, period):
-                if series.empty or period not in series.index:
-                    return np.nan
-                return FinancialAuditStrategy._safe_float(
-                    series.loc[period]
-                )
+            rev_now = val_at(revenue, latest_period)
+            ni_now = val_at(net_income, latest_period)
+            cfo_now = val_at(cfo, latest_period)
+            ar_now = val_at(ar, latest_period)
+            inv_now = val_at(inventory, latest_period)
+            capex_now = val_at(capex, latest_period)
+            
+            rev_prev = val_at(revenue, prior_period) if prior_period else np.nan
+            ni_prev = val_at(net_income, prior_period) if prior_period else np.nan
+            ar_prev = val_at(ar, prior_period) if prior_period else np.nan
+            inv_prev = val_at(inventory, prior_period) if prior_period else np.nan
 
-            rev_now = value_at(revenue, latest_period)
-            ni_now = value_at(net_income, latest_period)
-            cfo_now = value_at(cfo, latest_period)
-            capex_now = value_at(capex, latest_period)
+            rev_growth = FinancialAuditStrategy._growth(rev_now, rev_prev)
+            ni_growth = FinancialAuditStrategy._growth(ni_now, ni_prev)
+            
+            # V3 核心優化：改算收現天數(DSO)與週轉天數(DIO)
+            dso_now = (ar_now / rev_now) * 90 if pd.notna(rev_now) and rev_now > 0 else np.nan
+            dio_now = (inv_now / rev_now) * 90 if pd.notna(rev_now) and rev_now > 0 else np.nan
+            dso_prev = (ar_prev / rev_prev) * 90 if pd.notna(rev_prev) and rev_prev > 0 else np.nan
+            dio_prev = (inv_prev / rev_prev) * 90 if pd.notna(rev_prev) and rev_prev > 0 else np.nan
+            
+            dso_diff = dso_now - dso_prev if pd.notna(dso_now) and pd.notna(dso_prev) else np.nan
+            dio_diff = dio_now - dio_prev if pd.notna(dio_now) and pd.notna(dio_prev) else np.nan
 
-            ar_now = value_at(ar, latest_period)
-            inv_now = value_at(inventory, latest_period)
-
-            cash_now = value_at(cash, latest_period)
-            debt_now = value_at(debt, latest_period)
-            equity_now = value_at(equity, latest_period)
-
-            current_assets_now = value_at(
-                current_assets, latest_period
-            )
-
-            current_liabilities_now = value_at(
-                current_liabilities, latest_period
-            )
-
-            op_income_now = value_at(
-                operating_income, latest_period
-            )
-
-            gross_profit_now = value_at(
-                gross_profit, latest_period
-            )
-
-            interest_now = value_at(
-                interest_expense, latest_period
-            )
-
-            # --------------------------------------
-            # 找 4 季前資料
-            # --------------------------------------
-
-            prior_period = None
-
-            if len(common_periods) >= 5:
-                prior_period = common_periods[-5]
-            elif len(common_periods) >= 2:
-                prior_period = common_periods[-2]
-
-            rev_prev = value_at(revenue, prior_period) if prior_period else np.nan
-            ni_prev = value_at(net_income, prior_period) if prior_period else np.nan
-            ar_prev = value_at(ar, prior_period) if prior_period else np.nan
-            inv_prev = value_at(inventory, prior_period) if prior_period else np.nan
-            debt_prev = value_at(debt, prior_period) if prior_period else np.nan
-            equity_prev = value_at(equity, prior_period) if prior_period else np.nan
-
-            op_income_prev = (
-                value_at(operating_income, prior_period)
-                if prior_period else np.nan
-            )
-
-            gross_profit_prev = (
-                value_at(gross_profit, prior_period)
-                if prior_period else np.nan
-            )
-
-            # --------------------------------------
-            # YoY / QoQ
-            # --------------------------------------
-
-            if len(common_periods) >= 5:
-                comparison_type = "YoY"
-            else:
-                comparison_type = "QoQ"
-
-            revenue_growth = FinancialAuditStrategy._growth(
-                rev_now, rev_prev
-            )
-
-            ni_growth = FinancialAuditStrategy._growth(
-                ni_now, ni_prev
-            )
-
-            ar_growth = FinancialAuditStrategy._growth(
-                ar_now, ar_prev
-            )
-
-            inventory_growth = FinancialAuditStrategy._growth(
-                inv_now, inv_prev
-            )
-
-            debt_growth = FinancialAuditStrategy._growth(
-                debt_now, debt_prev
-            )
-
-            # --------------------------------------
-            # 利潤率
-            # --------------------------------------
-
-            gross_margin_now = FinancialAuditStrategy._margin(
-                gross_profit_now,
-                rev_now
-            )
-
-            gross_margin_prev = FinancialAuditStrategy._margin(
-                gross_profit_prev,
-                rev_prev
-            )
-
-            operating_margin_now = FinancialAuditStrategy._margin(
-                op_income_now,
-                rev_now
-            )
-
-            operating_margin_prev = FinancialAuditStrategy._margin(
-                op_income_prev,
-                rev_prev
-            )
-
-            net_margin_now = FinancialAuditStrategy._margin(
-                ni_now,
-                rev_now
-            )
-
-            net_margin_prev = FinancialAuditStrategy._margin(
-                ni_prev,
-                rev_prev
-            )
-
-            # --------------------------------------
-            # CFO / NI
-            # --------------------------------------
-
-            cfo_to_ni = FinancialAuditStrategy._ratio(
-                cfo_now,
-                ni_now
-            )
-
-            # --------------------------------------
-            # FCF
-            # --------------------------------------
-
-            if not pd.isna(cfo_now) and not pd.isna(capex_now):
-                # Yahoo 的 CapEx 通常為負數
-                if capex_now < 0:
-                    fcf_now = cfo_now + capex_now
-                else:
-                    fcf_now = cfo_now - capex_now
-            else:
-                fcf_now = np.nan
-
-            # --------------------------------------
-            # 工作資本
-            # --------------------------------------
-
-            ar_to_revenue = FinancialAuditStrategy._ratio(
-                ar_now,
-                rev_now
-            )
-
-            inv_to_revenue = FinancialAuditStrategy._ratio(
-                inv_now,
-                rev_now
-            )
-
-            ar_revenue_gap = (
-                ar_growth - revenue_growth
-                if not pd.isna(ar_growth)
-                and not pd.isna(revenue_growth)
-                else np.nan
-            )
-
-            inventory_revenue_gap = (
-                inventory_growth - revenue_growth
-                if not pd.isna(inventory_growth)
-                and not pd.isna(revenue_growth)
-                else np.nan
-            )
-
-            # --------------------------------------
-            # 負債
-            # --------------------------------------
-
-            debt_equity = FinancialAuditStrategy._ratio(
-                debt_now,
-                equity_now
-            )
-
-            cash_debt = FinancialAuditStrategy._ratio(
-                cash_now,
-                debt_now
-            )
-
-            current_ratio = FinancialAuditStrategy._ratio(
-                current_assets_now,
-                current_liabilities_now
-            )
-
-            # --------------------------------------
-            # 利息覆蓋
-            # --------------------------------------
-
-            interest_coverage = FinancialAuditStrategy._ratio(
-                op_income_now,
-                abs(interest_now)
-                if not pd.isna(interest_now)
-                else np.nan
-            )
-
-            # ======================================
-            # 風險評分
-            # ======================================
+            cfo_to_ni = FinancialAuditStrategy._ratio(cfo_now, ni_now)
+            fcf_now = (cfo_now + capex_now) if pd.notna(cfo_now) and pd.notna(capex_now) and capex_now < 0 else (cfo_now - capex_now if pd.notna(cfo_now) and pd.notna(capex_now) else np.nan)
+            
+            current_ratio = FinancialAuditStrategy._ratio(val_at(current_assets, latest_period), val_at(current_liabilities, latest_period))
+            debt_equity = FinancialAuditStrategy._ratio(val_at(debt, latest_period), val_at(equity, latest_period))
+            
+            gm_now = FinancialAuditStrategy._ratio(val_at(gross_profit, latest_period), rev_now) * 100
+            om_now = FinancialAuditStrategy._ratio(val_at(operating_income, latest_period), rev_now) * 100
 
             risk_score = 0
-
             warnings = []
+            positives = []
 
-            positive_signals = []
-
-            # --------------------------------------
-            # A. 獲利含金量 25 分
-            # --------------------------------------
-
-            earning_score = 0
-
-            if not pd.isna(ni_now) and not pd.isna(cfo_now):
-
+            # A. 現金流含金量 (降階懲罰，避免台股 Q1 季報假性轉負錯殺)
+            if pd.notna(ni_now) and pd.notna(cfo_now):
                 if ni_now > 0 and cfo_now < 0:
-                    earning_score += 15
-                    warnings.append(
-                        "【高危｜獲利含金量】淨利為正但營業現金流為負，"
-                        "存在獲利尚未轉化為現金的異常。"
-                    )
-
-                elif ni_now > 0 and not pd.isna(cfo_to_ni):
-
-                    if cfo_to_ni < 0.3:
-                        earning_score += 12
-                        warnings.append(
-                            f"【高危｜獲利含金量】CFO/淨利僅 "
-                            f"{cfo_to_ni:.2f}。"
-                        )
-
-                    elif cfo_to_ni < 0.7:
-                        earning_score += 7
-                        warnings.append(
-                            f"【注意｜獲利含金量】CFO/淨利偏低，"
-                            f"目前為 {cfo_to_ni:.2f}。"
-                        )
-
+                    risk_score += 8
+                    warnings.append("【警訊｜現金流】單季淨利為正但 CFO 為負 (注意是否為 Q1 獎金發放季節性因素或 YF 累計誤差)。")
+                elif ni_now > 0 and pd.notna(cfo_to_ni):
+                    if cfo_to_ni < 0.5:
+                        risk_score += 5
+                        warnings.append(f"【觀察｜現金流】單季 CFO/淨利比例偏低 ({cfo_to_ni:.2f}x)。")
                     elif cfo_to_ni >= 1.0:
-                        positive_signals.append(
-                            f"CFO/淨利 {cfo_to_ni:.2f}，獲利現金化良好"
-                        )
+                        positives.append("營業現金流充足 (CFO > 淨利)")
 
-            risk_score += min(earning_score, 25)
+            # B. 應收帳款天數 (DSO) 檢驗 (取代原本粗暴的佔比)
+            if pd.notna(dso_now):
+                if dso_now > 150:
+                    risk_score += 10
+                    warnings.append(f"【高危｜應收】收現天數高達 {dso_now:.0f} 天，需留意呆帳風險。")
+                elif dso_now > 120:
+                    risk_score += 5
+                    warnings.append(f"【警訊｜應收】收現天數達 {dso_now:.0f} 天，票期偏長。")
+                
+            if pd.notna(dso_diff):
+                if dso_diff > 30:
+                    risk_score += 10
+                    warnings.append(f"【警訊｜應收】收現天數較同期惡化增加 {dso_diff:.0f} 天。")
 
-            # --------------------------------------
-            # B. 應收帳款 20 分
-            # --------------------------------------
+            # C. 存貨週轉天數 (DIO) 檢驗
+            if pd.notna(dio_now):
+                if dio_now > 180:
+                    risk_score += 10
+                    warnings.append(f"【高危｜存貨】存貨週轉天數高達 {dio_now:.0f} 天，具庫存跌價與積壓風險。")
+                elif dio_now > 120:
+                    risk_score += 5
+                    warnings.append(f"【警訊｜存貨】存貨週轉天數達 {dio_now:.0f} 天，庫存偏高。")
+                    
+            if pd.notna(dio_diff):
+                if dio_diff > 45:
+                    risk_score += 10
+                    warnings.append(f"【高危｜存貨】庫存去化嚴重放緩，週轉天數較同期暴增 {dio_diff:.0f} 天。")
 
-            ar_score = 0
-
-            if not pd.isna(ar_revenue_gap):
-
-                if ar_revenue_gap >= 30:
-                    ar_score += 12
-                    warnings.append(
-                        f"【高危｜應收】應收成長比營收高 "
-                        f"{ar_revenue_gap:.1f} 個百分點。"
-                    )
-
-                elif ar_revenue_gap >= 15:
-                    ar_score += 8
-                    warnings.append(
-                        f"【警訊｜應收】應收成長明顯快於營收 "
-                        f"({ar_revenue_gap:.1f} 個百分點)。"
-                    )
-
-                elif ar_revenue_gap >= 5:
-                    ar_score += 4
-                    warnings.append(
-                        f"【觀察｜應收】應收增速略高於營收 "
-                        f"({ar_revenue_gap:.1f} 個百分點)。"
-                    )
-
-            if not pd.isna(ar_to_revenue):
-                if ar_to_revenue >= 0.35:
-                    ar_score += 8
-                    warnings.append(
-                        f"【應收結構】應收帳款約占單季營收 "
-                        f"{ar_to_revenue * 100:.1f}%。"
-                    )
-                elif ar_to_revenue >= 0.25:
-                    ar_score += 4
-
-            risk_score += min(ar_score, 20)
-
-            # --------------------------------------
-            # C. 存貨 20 分
-            # --------------------------------------
-
-            inventory_score = 0
-
-            if not pd.isna(inventory_revenue_gap):
-
-                if inventory_revenue_gap >= 40:
-                    inventory_score += 12
-                    warnings.append(
-                        f"【高危｜存貨】存貨成長比營收高 "
-                        f"{inventory_revenue_gap:.1f} 個百分點。"
-                    )
-
-                elif inventory_revenue_gap >= 20:
-                    inventory_score += 8
-                    warnings.append(
-                        f"【警訊｜存貨】存貨增速明顯高於營收 "
-                        f"({inventory_revenue_gap:.1f} 個百分點)。"
-                    )
-
-                elif inventory_revenue_gap >= 10:
-                    inventory_score += 4
-                    warnings.append(
-                        f"【觀察｜存貨】存貨增速略高於營收。"
-                    )
-
-            if not pd.isna(inv_to_revenue):
-
-                if inv_to_revenue >= 0.50:
-                    inventory_score += 8
-                    warnings.append(
-                        f"【存貨結構】存貨約占單季營收 "
-                        f"{inv_to_revenue * 100:.1f}%。"
-                    )
-
-                elif inv_to_revenue >= 0.30:
-                    inventory_score += 4
-
-            risk_score += min(inventory_score, 20)
-
-            # --------------------------------------
-            # D. 自由現金流 10 分
-            # --------------------------------------
-
-            fcf_score = 0
-
-            if not pd.isna(fcf_now):
-
-                if fcf_now < 0 and ni_now > 0:
-                    fcf_score += 7
-                    warnings.append(
-                        "【警訊｜自由現金流】公司有獲利但自由現金流為負。"
-                    )
-
-                elif fcf_now < 0:
-                    fcf_score += 4
-
-                elif fcf_now > 0 and cfo_now > 0:
-                    positive_signals.append(
-                        "自由現金流為正"
-                    )
-
-            risk_score += min(fcf_score, 10)
-
-            # --------------------------------------
-            # E. 負債與償債 15 分
-            # --------------------------------------
-
-            debt_score = 0
-
-            if not pd.isna(debt_equity):
-
-                if debt_equity >= 2.0:
-                    debt_score += 8
-                    warnings.append(
-                        f"【高危｜負債】Debt/Equity = "
-                        f"{debt_equity:.2f}。"
-                    )
-
-                elif debt_equity >= 1.0:
-                    debt_score += 5
-                    warnings.append(
-                        f"【注意｜負債】Debt/Equity = "
-                        f"{debt_equity:.2f}。"
-                    )
-
-            if not pd.isna(cash_debt):
-
-                if cash_debt < 0.2:
-                    debt_score += 5
-                    warnings.append(
-                        f"【注意｜流動性】現金/負債僅 "
-                        f"{cash_debt:.2f}。"
-                    )
-
-            if not pd.isna(current_ratio):
-
-                if current_ratio < 1.0:
-                    debt_score += 5
-                    warnings.append(
-                        f"【高危｜短期償債】流動比率僅 "
-                        f"{current_ratio:.2f}。"
-                    )
-
-                elif current_ratio < 1.5:
-                    debt_score += 2
-
-            risk_score += min(debt_score, 15)
-
-            # --------------------------------------
-            # F. 獲利能力趨勢 10 分
-            # --------------------------------------
-
-            profitability_score = 0
-
-            if (
-                not pd.isna(gross_margin_now)
-                and not pd.isna(gross_margin_prev)
-            ):
-
-                gm_change = gross_margin_now - gross_margin_prev
-
-                if gm_change <= -10:
-                    profitability_score += 5
-                    warnings.append(
-                        f"【高危｜毛利率】毛利率下降 "
-                        f"{abs(gm_change):.1f} 個百分點。"
-                    )
-
-                elif gm_change <= -5:
-                    profitability_score += 3
-                    warnings.append(
-                        f"【警訊｜毛利率】毛利率下降 "
-                        f"{abs(gm_change):.1f} 個百分點。"
-                    )
-
-            if (
-                not pd.isna(operating_margin_now)
-                and not pd.isna(operating_margin_prev)
-            ):
-
-                om_change = (
-                    operating_margin_now -
-                    operating_margin_prev
-                )
-
-                if om_change <= -10:
-                    profitability_score += 5
-                    warnings.append(
-                        f"【高危｜營益率】營業利益率下降 "
-                        f"{abs(om_change):.1f} 個百分點。"
-                    )
-
-                elif om_change <= -5:
-                    profitability_score += 3
-
-            risk_score += min(profitability_score, 10)
-
-            # --------------------------------------
-            # 最終限制
-            # --------------------------------------
+            # D. 短期償債
+            if pd.notna(current_ratio) and current_ratio < 1.0:
+                risk_score += 10
+                warnings.append(f"【高危｜流動性】流動比率 {current_ratio:.2f} 小於 1，短期資金吃緊。")
 
             risk_score = min(100, max(0, round(risk_score, 1)))
-
-            risk_level = FinancialAuditStrategy._risk_level(
-                risk_score
-            )
-
-            # --------------------------------------
-            # 建立診斷結論
-            # --------------------------------------
-
-            if risk_score >= 80:
-                conclusion = (
-                    "☠️ 極高風險：三表中存在多項重大異常，"
-                    "建議進一步查看完整年報、法說會與存貨/應收明細。"
-                )
-
-            elif risk_score >= 60:
-                conclusion = (
-                    "🔴 高風險：已出現多項需要注意的財務結構問題，"
-                    "不宜僅以 EPS 或本益比判斷公司價值。"
-                )
-
-            elif risk_score >= 40:
-                conclusion = (
-                    "🟠 中度風險：存在部分財報異常，"
-                    "需要追蹤下一季是否延續。"
-                )
-
-            elif risk_score >= 20:
-                conclusion = (
-                    "🟡 觀察：目前沒有重大地雷，但已有部分指標需要追蹤。"
-                )
-
-            else:
-                conclusion = (
-                    "🟢 健康：目前三表交叉勾稽沒有發現重大異常。"
-                )
-
-            # --------------------------------------
-            # 建立結果
-            # --------------------------------------
+            
+            if risk_score >= 60: conclusion = "🔴 高風險：出現顯著財務結構惡化跡象，請務必查閱財報附註明細。"
+            elif risk_score >= 30: conclusion = "🟠 中度風險：部分天數或現金流指標轉弱，需追蹤後續去化狀況。"
+            elif risk_score >= 15: conclusion = "🟡 觀察：無重大地雷，屬於產業正常波動範圍。"
+            else: conclusion = "🟢 健康：財務結構與週轉天數均處於健康水準。"
 
             return {
-                "status": "success",
-
-                "當期季報": (
-                    latest_period.strftime("%Y-%m-%d")
-                    if hasattr(latest_period, "strftime")
-                    else str(latest_period)
-                ),
-
-                "比較基準": comparison_type,
-
-                "風險分數": risk_score,
-                "風險等級": risk_level,
-
-                "營收成長(%)": (
-                    round(revenue_growth, 2)
-                    if not pd.isna(revenue_growth)
-                    else np.nan
-                ),
-
-                "淨利成長(%)": (
-                    round(ni_growth, 2)
-                    if not pd.isna(ni_growth)
-                    else np.nan
-                ),
-
-                "稅後淨利(千)": (
-                    round(ni_now / 1000, 2)
-                    if not pd.isna(ni_now)
-                    else np.nan
-                ),
-
-                "營業現金流CFO(千)": (
-                    round(cfo_now / 1000, 2)
-                    if not pd.isna(cfo_now)
-                    else np.nan
-                ),
-
-                "自由現金流FCF(千)": (
-                    round(fcf_now / 1000, 2)
-                    if not pd.isna(fcf_now)
-                    else np.nan
-                ),
-
-                "CFO/淨利": (
-                    round(cfo_to_ni, 2)
-                    if not pd.isna(cfo_to_ni)
-                    else np.nan
-                ),
-
-                "應收成長(%)": (
-                    round(ar_growth, 2)
-                    if not pd.isna(ar_growth)
-                    else np.nan
-                ),
-
-                "營收-應收差": (
-                    round(ar_revenue_gap, 2)
-                    if not pd.isna(ar_revenue_gap)
-                    else np.nan
-                ),
-
-                "存貨成長(%)": (
-                    round(inventory_growth, 2)
-                    if not pd.isna(inventory_growth)
-                    else np.nan
-                ),
-
-                "營收-存貨差": (
-                    round(inventory_revenue_gap, 2)
-                    if not pd.isna(inventory_revenue_gap)
-                    else np.nan
-                ),
-
-                "應收/營收": (
-                    round(ar_to_revenue, 3)
-                    if not pd.isna(ar_to_revenue)
-                    else np.nan
-                ),
-
-                "存貨/營收": (
-                    round(inv_to_revenue, 3)
-                    if not pd.isna(inv_to_revenue)
-                    else np.nan
-                ),
-
-                "Debt/Equity": (
-                    round(debt_equity, 2)
-                    if not pd.isna(debt_equity)
-                    else np.nan
-                ),
-
-                "Cash/Debt": (
-                    round(cash_debt, 2)
-                    if not pd.isna(cash_debt)
-                    else np.nan
-                ),
-
-                "流動比率": (
-                    round(current_ratio, 2)
-                    if not pd.isna(current_ratio)
-                    else np.nan
-                ),
-
-                "毛利率": (
-                    round(gross_margin_now, 2)
-                    if not pd.isna(gross_margin_now)
-                    else np.nan
-                ),
-
-                "營益率": (
-                    round(operating_margin_now, 2)
-                    if not pd.isna(operating_margin_now)
-                    else np.nan
-                ),
-
-                "淨利率": (
-                    round(net_margin_now, 2)
-                    if not pd.isna(net_margin_now)
-                    else np.nan
-                ),
-
-                "警訊數": len(warnings),
-
-                "診斷明細": (
-                    "\n".join(warnings)
-                    if warnings
-                    else "✅ 目前未發現明顯財報異常。"
-                ),
-
-                "正向訊號": (
-                    "\n".join(positive_signals)
-                    if positive_signals
-                    else "無"
-                ),
-
-                "結論": conclusion
+                "status": "success", "當期季報": latest_period.strftime("%Y-%m-%d") if hasattr(latest_period, "strftime") else str(latest_period),
+                "比較基準": comp_type, "風險分數": risk_score, "結論": conclusion,
+                "營收成長(%)": rev_growth, "淨利成長(%)": ni_growth, 
+                "稅後淨利(千)": ni_now / 1000 if pd.notna(ni_now) else np.nan,
+                "營業現金流CFO(千)": cfo_now / 1000 if pd.notna(cfo_now) else np.nan,
+                "自由現金流FCF(千)": fcf_now / 1000 if pd.notna(fcf_now) else np.nan,
+                "CFO/淨利": cfo_to_ni, "DSO_now": dso_now, "DSO_diff": dso_diff,
+                "DIO_now": dio_now, "DIO_diff": dio_diff, "流動比率": current_ratio,
+                "Debt/Equity": debt_equity, "毛利率": gm_now, "營益率": om_now,
+                "警訊數": len(warnings), "診斷明細": "\n".join(warnings) if warnings else "✅ 財報天數指標皆在健康水位。",
+                "正向訊號": "\n".join(positives) if positives else "無"
             }
-
         except Exception as e:
-
-            logging.exception(
-                f"FinancialAuditStrategy.evaluate error: {ticker_symbol}"
-            )
-
-            return {
-                "status": "error",
-                "msg": f"解析 {ticker_symbol} 發生錯誤：{str(e)}"
-            }
+            return {"status": "error", "msg": f"解析 {ticker_symbol} 發生錯誤：{str(e)}"}
 
 # ==========================================
 # 網路請求與全域快取
@@ -1395,7 +585,7 @@ st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
 # 增加第三個頁籤
-tab1, tab2, tab3 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)", "📑 財報三表地雷掃描 (基本面 V2)"])
+tab1, tab2, tab3 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)", "📑 財報三表地雷掃描 (基本面 V3)"])
 
 # ----------------------------------------------------
 # 頁籤 1：單檔深度解析
@@ -1919,9 +1109,8 @@ with tab2:
                 status_text.empty(); progress_bar.empty()
                 st.info(f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。")
 
-
 # ----------------------------------------------------
-# 頁籤 3：財報三表地雷掃描 (基本面 V2)
+# 頁籤 3：財報三表地雷掃描 (基本面 V3)
 # ----------------------------------------------------
 def fmt_val(val, suffix="", is_int=False):
     """安全格式化數值，避免 NaN 報錯"""
@@ -1937,7 +1126,7 @@ with tab3:
     if audit_mode == "單檔查詢":
         c1, c2 = st.columns([4, 1])
         with c1: 
-            audit_input = st.text_input("輸入單一股票代號", value="2330", key="audit_single").strip()
+            audit_input = st.text_input("輸入單一股票代號", value="6147", key="audit_single").strip()
         with c2: 
             st.write(""); st.write("")
             audit_btn = st.button("檢驗財報", type="primary", use_container_width=True)
@@ -1952,58 +1141,51 @@ with tab3:
                 if res["status"] == "error":
                     st.error(res["msg"])
                 else:
-                    st.subheader(f"📑 {name} ({audit_input}) 財報健康度與地雷風險報告 (V2)")
+                    st.subheader(f"📑 {name} ({audit_input}) 財報健康度與地雷風險報告 (V3)")
                     st.markdown(f"**當期季報：{res['當期季報']} | 比較基準：{res['比較基準']}**")
                     
-                    # 顯示結論與分數
-                    risk_color = "red" if res['風險分數'] >= 60 else ("orange" if res['風險分數'] >= 40 else "green")
-                    st.markdown(f"### 風險等級：<span style='color:{risk_color}'>{res['風險等級']}</span> (風險分數：**{res['風險分數']}**/100)", unsafe_allow_html=True)
+                    risk_color = "red" if res['風險分數'] >= 60 else ("orange" if res['風險分數'] >= 30 else "green")
+                    st.markdown(f"### 風險等級：<span style='color:{risk_color}'>{res['結論'].split('：')[0]}</span> (風險分數：**{res['風險分數']}**/100)", unsafe_allow_html=True)
                     st.info(f"**結論：** {res['結論']}")
                     
-                    # 顯示警訊與正向訊號
                     if res["警訊數"] > 0:
-                        st.error(f"⚠️ 發現 {res['警訊數']} 項潛在地雷訊號：\n\n" + res["診斷明細"])
+                        st.error(f"⚠️ 發現 {res['警訊數']} 項潛在地雷/警示訊號：\n\n" + res["診斷明細"])
                     if res["正向訊號"] != "無":
                         st.success(f"🌟 正向訊號：\n\n" + res["正向訊號"])
                         
                     st.markdown("---")
                     st.markdown("### 📊 核心指標數據")
                     
-                    # 第一排：利潤率與成長率
                     col_a, col_b, col_c, col_d = st.columns(4)
                     col_a.metric("營收 YoY", fmt_val(res['營收成長(%)'], "%"))
                     col_b.metric("毛利率", fmt_val(res['毛利率'], "%"))
                     col_c.metric("營益率", fmt_val(res['營益率'], "%"))
                     col_d.metric("淨利率", fmt_val(res['淨利率'], "%"))
                     
-                    # 第二排：含金量
                     col_e, col_f, col_g, col_h = st.columns(4)
                     col_e.metric("稅後淨利(千)", fmt_val(res['稅後淨利(千)'], is_int=True))
                     col_f.metric("營業現金流 CFO(千)", fmt_val(res['營業現金流CFO(千)'], is_int=True))
                     col_g.metric("自由現金流 FCF(千)", fmt_val(res['自由現金流FCF(千)'], is_int=True))
                     col_h.metric("CFO / 淨利比", fmt_val(res['CFO/淨利'], " 倍"))
                     
-                    # 第三排：資產膨脹
                     col_i, col_j, col_k, col_l = st.columns(4)
                     col_i.metric("應收 YoY", fmt_val(res['應收成長(%)'], "%"))
-                    col_j.metric("營收-應收 YoY 差", fmt_val(res['營收-應收差'], "%"))
+                    col_j.metric("收現天數(DSO)", fmt_val(res['DSO_now'], " 天"))
                     col_k.metric("存貨 YoY", fmt_val(res['存貨成長(%)'], "%"))
-                    col_l.metric("營收-存貨 YoY 差", fmt_val(res['營收-存貨差'], "%"))
+                    col_l.metric("週轉天數(DIO)", fmt_val(res['DIO_now'], " 天"))
                     
-                    # 第四排：財務與流動性
                     col_m, col_n, col_o, col_p = st.columns(4)
                     col_m.metric("流動比率", fmt_val(res['流動比率']))
                     col_n.metric("Debt / Equity", fmt_val(res['Debt/Equity']))
-                    col_o.metric("Cash / Debt", fmt_val(res['Cash/Debt']))
-                    col_p.metric("淨利 YoY", fmt_val(res['淨利成長(%)'], "%"))
+                    col_o.metric("DSO 年增減", fmt_val(res['DSO_diff'], " 天"))
+                    col_p.metric("DIO 年增減", fmt_val(res['DIO_diff'], " 天"))
 
     else:
         st.write("請貼上你想健檢的股票清單（可使用逗號、空白、或換行分隔），系統將逐一產出報表供下載。")
-        batch_input = st.text_area("輸入自選股清單", value="2330, 2454, 3231, 2382, 2376", height=100)
+        batch_input = st.text_area("輸入自選股清單", value="2330, 2454, 3231, 6147, 1909", height=100)
         batch_btn = st.button("執行批次健檢", type="primary")
         
         if batch_btn and batch_input.strip():
-            # 解析字串
             raw_tickers = re.split(r'[,\s\n]+', batch_input.strip())
             valid_tickers = [t.strip() for t in raw_tickers if t.strip()]
             
@@ -2028,14 +1210,14 @@ with tab3:
                             "代號": t_input,
                             "名稱": name,
                             "當期季報": res["當期季報"],
-                            "風險等級": res["風險等級"],
+                            "風險等級": res["結論"].split('：')[0],
                             "風險分數": res["風險分數"],
                             "營收 YoY(%)": fmt_val(res['營收成長(%)']),
                             "毛利率(%)": fmt_val(res['毛利率']),
                             "稅後淨利(千)": fmt_val(res['稅後淨利(千)'], is_int=True),
                             "CFO/淨利(倍)": fmt_val(res['CFO/淨利']),
-                            "營收-應收差": fmt_val(res['營收-應收差']),
-                            "營收-存貨差": fmt_val(res['營收-存貨差']),
+                            "收現天數(DSO)": fmt_val(res['DSO_now']),
+                            "週轉天數(DIO)": fmt_val(res['DIO_now']),
                             "警訊數": res["警訊數"],
                             "結論": res["結論"],
                             "診斷明細": res["診斷明細"].replace("\n", " | ")
@@ -2049,7 +1231,6 @@ with tab3:
                 if batch_results:
                     st.success(f"🎉 批次健檢完成！共成功分析 {len(batch_results)} 檔標的。")
                     batch_df = pd.DataFrame(batch_results)
-                    # 照著風險分數由高到低排序，把地雷排在前面
                     batch_df = batch_df.sort_values(by="風險分數", ascending=False).reset_index(drop=True)
                     batch_df.index = batch_df.index + 1
                     
@@ -2059,7 +1240,7 @@ with tab3:
                     st.download_button(
                         label="📥 下載財報健檢報告 (CSV)",
                         data=csv,
-                        file_name=f'financial_audit_V2_{datetime.date.today()}.csv',
+                        file_name=f'financial_audit_V3_{datetime.date.today()}.csv',
                         mime='text/csv'
                     )
                 else:
