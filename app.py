@@ -60,7 +60,6 @@ def load_config():
         try:
             with open(PARAMS_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                # 強制更新「預設參數」，避免舊的 JSON 存檔覆蓋程式碼中的最新修改
                 if "profiles" not in config:
                     config["profiles"] = {}
                 config["profiles"]["預設參數 (Default)"] = DEFAULT_PARAMS.copy()
@@ -940,9 +939,18 @@ with tab2:
                     
         st.markdown("---")
         
-        st.markdown("**1. 演算法選擇**")
-        algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振'], index=0, horizontal=True)
-        if algo_mode == '全部':
+        st.markdown("**1. 掃描模式與演算法選擇**")
+        col_m1, col_m2, col_m3 = st.columns([1, 1, 2])
+        with col_m1:
+            scan_target_mode = st.radio("掃描對象", ['全市場掃描', '指定個股測試'], index=0, horizontal=True)
+        with col_m2:
+            test_ticker_input = ""
+            if scan_target_mode == '指定個股測試':
+                test_ticker_input = st.text_input("輸入測試股票代號", value="2330", placeholder="例如: 2330").strip()
+        with col_m3:
+            algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振'], index=0, horizontal=True)
+            
+        if algo_mode == '全部' and scan_target_mode == '全市場掃描':
             st.warning("💡 提示：您目前選擇【全部】演算法，標的只要符合「任一」條件即會列出。請務必查看表格中的『演算法建議結果』確認觸發類型！")
 
         st.markdown("**2. 基礎掃描參數與時光機回測設定**")
@@ -997,7 +1005,22 @@ with tab2:
         status_text.text("⏳ [初始化] 正在同步台股最新代號與名稱清單，請稍候...")
         
         yf_session = get_yf_session()
+        stock_dict = get_all_tw_stocks()
         
+        if not stock_dict:
+            status_text.empty(); progress_bar.empty(); st.error("❌ 無法取得台股清單，請檢查網路連線。")
+            st.stop()
+            
+        # 決定掃描標的
+        if scan_target_mode == "指定個股測試":
+            if not test_ticker_input:
+                status_text.empty(); progress_bar.empty(); st.error("❌ 請輸入測試股票代號！")
+                st.stop()
+            target_yf_ticker = resolve_ticker(test_ticker_input, stock_dict)
+            tickers = [target_yf_ticker]
+        else:
+            tickers = list(stock_dict.keys())
+            
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
         total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70
@@ -1029,204 +1052,215 @@ with tab2:
             
         market_info = MarketRegimeFilter.evaluate(yf_session, st.session_state.backtest_date_obj if st.session_state.use_backtest_date else None)
         
-        stock_dict = get_all_tw_stocks()
+        reversal_candidates = {} 
+        chunk_size = 40 
         
-        if not stock_dict:
-            status_text.empty(); progress_bar.empty(); st.error("❌ 無法取得台股清單，請檢查網路連線。")
-        else:
-            tickers = list(stock_dict.keys())
-            reversal_candidates = {} 
-            
-            chunk_size = 40 
-            for i in range(0, len(tickers), chunk_size):
-                chunk = tickers[i:i+chunk_size]
-                status_text.text(f"[階段一] 正在全市場區間掃描 [{algo_mode}]：進度 {min(i+chunk_size, len(tickers))} / {len(tickers)} 檔...")
-                try:
-                    data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
-                    for ticker in chunk:
-                        try:
-                            if isinstance(data.columns, pd.MultiIndex):
-                                if ticker in data.columns.get_level_values(0):
-                                    df = data.xs(ticker, axis=1, level=0).dropna(how='all')
-                                elif ticker in data.columns.get_level_values(1):
-                                    df = data.xs(ticker, axis=1, level=1).dropna(how='all')
-                                else:
-                                    df = pd.DataFrame()
-                            else:
-                                df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
-                            
-                            if st.session_state.use_backtest_date:
-                                target_dt = pd.to_datetime(st.session_state.backtest_date_obj)
-                                df = df[df.index.tz_localize(None).normalize() <= target_dt]
-                                
-                            if df.empty or len(df) <= st.session_state.lookback_start + 20: continue
-                            
-                            df = TechnicalIndicators.add_kd(df)
-                            df = TechnicalIndicators.add_macd(df)
-                            
-                            df['Pct_Change'] = df['Close'].pct_change() * 100
-                            df['Volume_Lots'] = df['Volume'] / 1000
-                            df['MA20'] = df['Close'].rolling(window=20).mean()
-                            df['MA60'] = df['Close'].rolling(window=60).mean()
-                            df['BIAS20'] = (df['Close'] - df['MA20']) / (df['MA20'] + 1e-8) * 100
-                            df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
-                            
-                            std20 = df['Close'].rolling(window=20).std()
-                            df['BB_Upper'] = df['MA20'] + 2 * std20
-                            df['BB_Lower'] = df['MA20'] - 2 * std20
-                            
-                            df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
-                            df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
-                            
-                            if algo_mode in ['全部', '指標共振']:
-                                df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
-                                    df,
-                                    recent_w=st.session_state.div_recent_w,
-                                    older_w=st.session_state.div_older_w,
-                                    kd_older_low_th=st.session_state.reso_kd_older_low,
-                                    kd_older_high_th=st.session_state.reso_kd_older_high,
-                                    kd_recent_low_th=st.session_state.reso_kd_recent_low,
-                                    use_macd_abs=st.session_state.use_macd_abs,
-                                    macd_older_low_th=st.session_state.reso_macd_older_low,
-                                    macd_recent_low_th=st.session_state.reso_macd_recent_low,
-                                    cross_days=st.session_state.reso_cross_days
-                                )
-                            else:
-                                df['Reso_Score'] = pd.Series(0.0, index=df.index)
-                            
-                            best_combined_score = -1
-                            best_row, best_offset = None, 0
-                            
-                            for offset in range(st.session_state.lookback_end, st.session_state.lookback_start + 1):
-                                if len(df) <= offset + 1: continue
-                                t_row = df.iloc[-1 - offset]
-                                r_score, v_score, reso_score, vol_ma = t_row['Candle_Score'], t_row['VCP_Score'], t_row['Reso_Score'], t_row['Vol_MA20']
-                                
-                                if vol_ma >= st.session_state.min_vol_ma20:
-                                    is_r_pass = (algo_mode in ['全部', '底部翻轉']) and (r_score >= st.session_state.min_score)
-                                    is_v_pass = (algo_mode in ['全部', 'VCP']) and (v_score >= st.session_state.min_vcp_score)
-                                    is_reso_pass = (algo_mode in ['全部', '指標共振']) and (reso_score >= st.session_state.min_reso_score)
-                                    
-                                    if is_r_pass or is_v_pass or is_reso_pass:
-                                        combo_score = r_score + v_score + reso_score
-                                        if combo_score > best_combined_score:
-                                            best_combined_score = combo_score
-                                            best_row, best_offset = t_row, offset
-                            
-                            if best_row is not None:
-                                clean_ticker = ticker.split('.')[0]
-                                reversal_candidates[ticker] = {
-                                    "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
-                                    "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
-                                    "觸發日期": best_row.name.strftime('%Y-%m-%d'),
-                                    "當日收盤": round(float(best_row['Close']), 2),
-                                    "月均量(張)": int(best_row['Vol_MA20']),
-                                    "反轉分數": round(float(best_row['Candle_Score']), 2),
-                                    "VCP分數": round(float(best_row['VCP_Score']), 2),
-                                    "共振分數": round(float(best_row['Reso_Score']), 2)
-                                }
-                        except Exception: continue
-                except Exception: pass
-                
-                time.sleep(1.0) 
-                progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
-            
-            reversal_list = list(reversal_candidates.values())
-            
-            kou_di_periods = []
-            if st.session_state.kou_di_5: kou_di_periods.append(5)
-            if st.session_state.kou_di_10: kou_di_periods.append(10)
-            if st.session_state.kou_di_20: kou_di_periods.append(20)
-            if st.session_state.kou_di_60: kou_di_periods.append(60)
-            
-            if reversal_list:
-                progress_bar.progress(0)
-                status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
-                
-                final_results = []
-                for idx, item in enumerate(reversal_list):
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i+chunk_size]
+            status_text.text(f"[階段一] 正在全市場區間掃描 [{algo_mode}]：進度 {min(i+chunk_size, len(tickers))} / {len(tickers)} 檔...")
+            try:
+                data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
+                for ticker in chunk:
                     try:
-                        ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
-                        has_daily_div, has_m60_div = False, False
-                        rl_cnt, ol_cnt = st.session_state.recent_lows_cnt, st.session_state.older_lows_cnt
-                        p_left, p_right = st.session_state.pivot_left, st.session_state.pivot_right
-                        
-                        if not daily_df.empty:
-                            if specific_offset > 0: daily_df = daily_df.iloc[:-specific_offset]
-                            
-                            for n in kou_di_periods:
-                                if len(daily_df) >= n:
-                                    curr_p = daily_df['Close'].iloc[-1]
-                                    drop_p = daily_df['Close'].iloc[-n]
-                                    item[f"扣抵狀態({n}MA)"] = "✅ 扣低" if curr_p > drop_p else "❌ 扣高"
-                                else:
-                                    item[f"扣抵狀態({n}MA)"] = "無資料"
-                            
-                            for r_w, o_w in div_pairs:
-                                d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                res = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
-                                item[f"日K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
-                                if res: has_daily_div = True
-                        else:
-                            for r_w, o_w in div_pairs: item[f"日K背離({r_w},{o_w})"] = "無資料"
-                            for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
-                        
-                        if dl_60m_kwargs is not None:
-                            time.sleep(0.5) 
-                            m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", **dl_60m_kwargs)
-                            if specific_offset > 0 and not daily_df.empty:
-                                target_date = daily_df.index[-1].date()
-                                m60_df = m60_df[[d.date() <= target_date for d in m60_df.index]]
-                                
-                            if not m60_df.empty:
-                                m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
-                                for r_w, o_w in div_pairs:
-                                    m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                    m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                    res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
-                                    item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
-                                    if res: has_m60_div = True
+                        if isinstance(data.columns, pd.MultiIndex):
+                            if ticker in data.columns.get_level_values(0):
+                                df = data.xs(ticker, axis=1, level=0).dropna(how='all')
+                            elif ticker in data.columns.get_level_values(1):
+                                df = data.xs(ticker, axis=1, level=1).dropna(how='all')
                             else:
-                                for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
+                                df = pd.DataFrame()
+                        else:
+                            df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
+                        
+                        if st.session_state.use_backtest_date:
+                            target_dt = pd.to_datetime(st.session_state.backtest_date_obj)
+                            df = df[df.index.tz_localize(None).normalize() <= target_dt]
+                            
+                        if df.empty or len(df) <= st.session_state.lookback_start + 20: continue
+                        
+                        df = TechnicalIndicators.add_kd(df)
+                        df = TechnicalIndicators.add_macd(df)
+                        
+                        df['Pct_Change'] = df['Close'].pct_change() * 100
+                        df['Volume_Lots'] = df['Volume'] / 1000
+                        df['MA20'] = df['Close'].rolling(window=20).mean()
+                        df['MA60'] = df['Close'].rolling(window=60).mean()
+                        df['BIAS20'] = (df['Close'] - df['MA20']) / (df['MA20'] + 1e-8) * 100
+                        df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
+                        
+                        std20 = df['Close'].rolling(window=20).std()
+                        df['BB_Upper'] = df['MA20'] + 2 * std20
+                        df['BB_Lower'] = df['MA20'] - 2 * std20
+                        
+                        df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
+                        df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
+                        
+                        if algo_mode in ['全部', '指標共振']:
+                            df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
+                                df,
+                                recent_w=st.session_state.div_recent_w,
+                                older_w=st.session_state.div_older_w,
+                                kd_older_low_th=st.session_state.reso_kd_older_low,
+                                kd_older_high_th=st.session_state.reso_kd_older_high,
+                                kd_recent_low_th=st.session_state.reso_kd_recent_low,
+                                use_macd_abs=st.session_state.use_macd_abs,
+                                macd_older_low_th=st.session_state.reso_macd_older_low,
+                                macd_recent_low_th=st.session_state.reso_macd_recent_low,
+                                cross_days=st.session_state.reso_cross_days
+                            )
+                        else:
+                            df['Reso_Score'] = pd.Series(0.0, index=df.index)
+                        
+                        # 儲存供稍後詳細表格顯示用
+                        if scan_target_mode == "指定個股測試":
+                            st.session_state.test_stock_df = df.copy()
+                            st.session_state.test_ticker_name = stock_dict.get(ticker, ticker)
+                        
+                        best_combined_score = -1
+                        best_row, best_offset = None, 0
+                        force_pass = (scan_target_mode == "指定個股測試")
+                        
+                        for offset in range(st.session_state.lookback_end, st.session_state.lookback_start + 1):
+                            if len(df) <= offset + 1: continue
+                            t_row = df.iloc[-1 - offset]
+                            r_score, v_score, reso_score, vol_ma = t_row['Candle_Score'], t_row['VCP_Score'], t_row['Reso_Score'], t_row['Vol_MA20']
+                            
+                            if vol_ma >= st.session_state.min_vol_ma20 or force_pass:
+                                is_r_pass = (algo_mode in ['全部', '底部翻轉']) and (r_score >= st.session_state.min_score)
+                                is_v_pass = (algo_mode in ['全部', 'VCP']) and (v_score >= st.session_state.min_vcp_score)
+                                is_reso_pass = (algo_mode in ['全部', '指標共振']) and (reso_score >= st.session_state.min_reso_score)
+                                
+                                # 若為指定個股測試，則無條件使其通過以便檢視背離/扣抵狀態
+                                if is_r_pass or is_v_pass or is_reso_pass or force_pass:
+                                    combo_score = r_score + v_score + reso_score
+                                    if combo_score > best_combined_score or best_row is None:
+                                        best_combined_score = combo_score
+                                        best_row, best_offset = t_row, offset
+                        
+                        if best_row is not None:
+                            clean_ticker = ticker.split('.')[0]
+                            reversal_candidates[ticker] = {
+                                "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
+                                "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
+                                "觸發日期": best_row.name.strftime('%Y-%m-%d'),
+                                "當日收盤": round(float(best_row['Close']), 2),
+                                "月均量(張)": int(best_row['Vol_MA20']),
+                                "反轉分數": round(float(best_row['Candle_Score']), 2),
+                                "VCP分數": round(float(best_row['VCP_Score']), 2),
+                                "共振分數": round(float(best_row['Reso_Score']), 2)
+                            }
+                    except Exception: continue
+            except Exception: pass
+            
+            time.sleep(1.0) 
+            progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
+        
+        reversal_list = list(reversal_candidates.values())
+        
+        kou_di_periods = []
+        if st.session_state.kou_di_5: kou_di_periods.append(5)
+        if st.session_state.kou_di_10: kou_di_periods.append(10)
+        if st.session_state.kou_di_20: kou_di_periods.append(20)
+        if st.session_state.kou_di_60: kou_di_periods.append(60)
+        
+        if reversal_list:
+            progress_bar.progress(0)
+            status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
+            
+            final_results = []
+            for idx, item in enumerate(reversal_list):
+                try:
+                    ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
+                    has_daily_div, has_m60_div = False, False
+                    rl_cnt, ol_cnt = st.session_state.recent_lows_cnt, st.session_state.older_lows_cnt
+                    p_left, p_right = st.session_state.pivot_left, st.session_state.pivot_right
+                    
+                    if not daily_df.empty:
+                        if specific_offset > 0: daily_df = daily_df.iloc[:-specific_offset]
+                        
+                        for n in kou_di_periods:
+                            if len(daily_df) >= n:
+                                curr_p = daily_df['Close'].iloc[-1]
+                                drop_p = daily_df['Close'].iloc[-n]
+                                item[f"扣抵狀態({n}MA)"] = "✅ 扣低" if curr_p > drop_p else "❌ 扣高"
+                            else:
+                                item[f"扣抵狀態({n}MA)"] = "無資料"
+                        
+                        for r_w, o_w in div_pairs:
+                            d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                            d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                            res = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
+                            item[f"日K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
+                            if res: has_daily_div = True
+                    else:
+                        for r_w, o_w in div_pairs: item[f"日K背離({r_w},{o_w})"] = "無資料"
+                        for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
+                    
+                    if dl_60m_kwargs is not None:
+                        time.sleep(0.5) 
+                        m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", **dl_60m_kwargs)
+                        if specific_offset > 0 and not daily_df.empty:
+                            target_date = daily_df.index[-1].date()
+                            m60_df = m60_df[[d.date() <= target_date for d in m60_df.index]]
+                            
+                        if not m60_df.empty:
+                            m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
+                            for r_w, o_w in div_pairs:
+                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
+                                item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
+                                if res: has_m60_div = True
                         else:
                             for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
+                    else:
+                        for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
 
-                        base_tags = []
-                        if item["反轉分數"] >= st.session_state.min_score: base_tags.append("底部翻轉")
-                        if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP收斂")
-                        if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
+                    base_tags = []
+                    if item["反轉分數"] >= st.session_state.min_score: base_tags.append("底部翻轉")
+                    if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP收斂")
+                    if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
+                    
+                    if not base_tags and scan_target_mode == "指定個股測試":
+                        base_tags.append("未達標(測試)")
                         
-                        div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
-                        item["演算法建議結果"] = " & ".join(base_tags) + div_tag
-                        
-                        final_results.append(item)
-                    except Exception: pass
-                    progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
+                    div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
+                    item["演算法建議結果"] = " & ".join(base_tags) + div_tag
+                    
+                    final_results.append(item)
+                except Exception: pass
+                progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
-                status_text.empty(); progress_bar.empty()
-                
-                # 排序並儲存結果到 Session State 以防止重新渲染時消失
-                res_df = pd.DataFrame(final_results)
-                base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
-                div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
-                kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
-                cols = base_cols + div_cols + kou_cols
-                
-                res_df = res_df[cols].sort_values(by=["共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False]).reset_index(drop=True)
-                res_df.index = res_df.index + 1
-                
-                st.session_state.scan_res_df = res_df
-                st.session_state.scan_algo_mode = algo_mode
-                st.session_state.market_info = market_info
-                
-                date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
-                st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔符合條件的標的 {date_str}。"
+            status_text.empty(); progress_bar.empty()
+            
+            res_df = pd.DataFrame(final_results)
+            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
+            kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
+            cols = base_cols + div_cols + kou_cols
+            
+            res_df = res_df[cols].sort_values(by=["共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False]).reset_index(drop=True)
+            res_df.index = res_df.index + 1
+            
+            st.session_state.scan_res_df = res_df
+            st.session_state.scan_algo_mode = algo_mode
+            st.session_state.scan_target_mode_saved = scan_target_mode
+            st.session_state.market_info = market_info
+            
+            date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
+            if scan_target_mode == "指定個股測試":
+                st.session_state.scan_msg = f"🎉 測試完成！已為您匯出個股 {date_str} 的計算結果與下方詳細參數表。"
             else:
-                status_text.empty(); progress_bar.empty()
-                st.session_state.scan_res_df = pd.DataFrame()
-                st.session_state.scan_algo_mode = algo_mode
-                st.session_state.market_info = market_info
+                st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔符合條件的標的 {date_str}。"
+        else:
+            status_text.empty(); progress_bar.empty()
+            st.session_state.scan_res_df = pd.DataFrame()
+            st.session_state.scan_algo_mode = algo_mode
+            st.session_state.scan_target_mode_saved = scan_target_mode
+            st.session_state.market_info = market_info
+            if scan_target_mode == "指定個股測試":
+                st.session_state.scan_msg = f"無法取得測試標的資料，請確認代號是否正確。"
+            else:
                 st.session_state.scan_msg = f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。"
 
     # 確保掃描結果在點擊按鈕或重新渲染時不會消失
@@ -1250,6 +1284,7 @@ with tab2:
             
         res_df = st.session_state.scan_res_df
         algo_mode_saved = st.session_state.get("scan_algo_mode", "全部")
+        target_mode_saved = st.session_state.get("scan_target_mode_saved", "全市場掃描")
         
         if not res_df.empty:
             st.dataframe(res_df, use_container_width=True)
@@ -1262,14 +1297,45 @@ with tab2:
                 mime='text/csv'
             )
             
-            # --- 新增跨分頁連動功能 ---
+            # --- 若為指定個股測試模式，印出每日指標詳細表供參數調整參考 ---
+            if target_mode_saved == '指定個股測試' and 'test_stock_df' in st.session_state:
+                st.markdown("---")
+                st.markdown(f"### 🛠️ 參數測試詳細指標結果 - {st.session_state.get('test_ticker_name', '')}")
+                st.write("顯示回測設定區間內的每日指標計算結果，協助您觀察分數變化與調整門檻參數。")
+                
+                debug_df = st.session_state.test_stock_df.copy()
+                if not debug_df.empty:
+                    # 擷取使用者設定的回測區間 (往前多抓10天做對照)
+                    start_offset = st.session_state.lookback_start + 10
+                    end_offset = st.session_state.lookback_end
+                    
+                    start_idx = max(0, len(debug_df) - 1 - start_offset)
+                    end_idx = max(1, len(debug_df) - end_offset)
+                    
+                    debug_df = debug_df.iloc[start_idx:end_idx].copy()
+                    
+                    debug_df['BB_Width(%)'] = (debug_df['BB_Upper'] - debug_df['BB_Lower']) / (debug_df['MA20'] + 1e-8) * 100
+                    
+                    show_cols = ['Close', 'Volume_Lots', 'Vol_MA20', 'Candle_Score', 'VCP_Score', 'Reso_Score', 'K', 'D', 'MACD', 'MACD_Hist', 'BB_Width(%)']
+                    show_cols = [c for c in show_cols if c in debug_df.columns]
+                    
+                    disp_df = debug_df[show_cols].sort_index(ascending=False)
+                    disp_df.index = disp_df.index.strftime('%Y-%m-%d')
+                    
+                    format_dict = {
+                        'Close': "{:.2f}", 'Volume_Lots': "{:.0f}", 'Vol_MA20': "{:.0f}",
+                        'Candle_Score': "{:.2f}", 'VCP_Score': "{:.2f}", 'Reso_Score': "{:.2f}",
+                        'K': "{:.2f}", 'D': "{:.2f}", 'MACD': "{:.3f}", 'MACD_Hist': "{:.3f}", 'BB_Width(%)': "{:.2f}"
+                    }
+                    
+                    st.dataframe(disp_df.style.format(format_dict), use_container_width=True)
+            
+            # --- 跨分頁連動功能 ---
             st.markdown("---")
             st.markdown("### 🧬 進階基本面健檢連動")
             
             def transfer_to_audit():
-                # 擷取所有選出來的標的並轉為逗號分隔的字串
                 tickers_str = ", ".join(res_df['股票代號'].astype(str).tolist())
-                # 寫入第 3 分頁的變數
                 st.session_state.batch_input_area = tickers_str
                 st.session_state.run_batch_audit = True
                 st.session_state.audit_mode = "自選股批次掃描"
@@ -1422,9 +1488,6 @@ with tab3:
                     st.success(f"🎉 批次健檢完成！共成功分析 {len(batch_results)} 檔標的。")
                     batch_df = pd.DataFrame(batch_results)
                     
-                    # 💡 依照要求，嚴格執行從「最佳到最差」排序：
-                    # 體質分數 (高 -> 低, ascending=False)
-                    # 風險分數 (低 -> 高, ascending=True)
                     batch_df = batch_df.sort_values(by=["體質分數", "風險分數"], ascending=[False, True]).reset_index(drop=True)
                     batch_df.index = batch_df.index + 1
                     
