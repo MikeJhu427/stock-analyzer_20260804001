@@ -59,7 +59,12 @@ def load_config():
     if os.path.exists(PARAMS_FILE):
         try:
             with open(PARAMS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+                # 強制更新「預設參數」，避免舊的 JSON 存檔覆蓋程式碼中的最新修改
+                if "profiles" not in config:
+                    config["profiles"] = {}
+                config["profiles"]["預設參數 (Default)"] = DEFAULT_PARAMS.copy()
+                return config
         except Exception as e:
             logging.warning(f"讀取設定檔失敗，將套用預設值: {e}")
     return {"last_used": "預設參數 (Default)", "profiles": {"預設參數 (Default)": DEFAULT_PARAMS.copy()}}
