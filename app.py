@@ -192,7 +192,7 @@ class IndicatorResonanceStrategy:
         
         # MACD 比對邏輯：固定改抓 MACD_Hist (長柱)
         if use_macd_wave_logic:
-            # 零軸動能波段判定：找出水下區塊 (將 block_id 重新命名避免與 MACD_Hist 衝突)
+            # 零軸動能波段判定：找出水下區塊
             sign = np.sign(df['MACD_Hist'])
             sign = sign.replace(0, method='ffill').fillna(1)
             block_id = (sign != sign.shift(1)).cumsum().rename('block_id')
@@ -264,40 +264,28 @@ class DivergenceStrategy:
     @staticmethod
     def check_bottom_divergence(
         df, price_col='Low', ind_col='K', ind_signal_col='D', 
-        recent_w=20, older_w=60, recent_lows_cnt=0, older_lows_cnt=0,
+        recent_w=5, older_w=20, recent_lows_cnt=0, older_lows_cnt=0,
         pivot_left=0, pivot_right=0
     ):
-        if len(df) < older_w: return False
-        recent_start, recent_end = len(df) - recent_w, len(df)
-        older_start, older_end = len(df) - older_w, recent_start
-        if recent_start < 0 or older_start < 0: return False
+        # 優化後的背離演算法：明確切分近期與前波，放寬價格誤差
+        if len(df) < recent_w + older_w: 
+            return False
             
-        prices, k_vals, d_vals = df[price_col].values, df[ind_col].values, df[ind_signal_col].values
-        recent_prices = prices[recent_start:recent_end]
-        if len(recent_prices) == 0: return False
+        recent_start = len(df) - recent_w
+        older_start = recent_start - older_w
+        older_end = recent_start
         
-        idx1_iloc = recent_start + np.argmin(recent_prices)
-        p1, i1 = prices[idx1_iloc], k_vals[idx1_iloc]
+        prices = df[price_col].values
+        inds = df[ind_col].values
         
-        def check_divergence_condition(p_iloc):
-            p2, i2 = prices[p_iloc], k_vals[p_iloc]
-            if not (p2 > p1 and i2 < i1): return False 
-            s_idx, e_idx = min(idx1_iloc, p_iloc), max(idx1_iloc, p_iloc)
-            if e_idx - s_idx + 1 > 2:
-                cross_found = False
-                for j in range(s_idx + 1, e_idx + 1):
-                    if k_vals[j] < d_vals[j] and k_vals[j-1] >= d_vals[j-1]:
-                        cross_found = True
-                        break
-                if not cross_found: return False
-            else: return False
-            return True
-
         if recent_lows_cnt == 0 and older_lows_cnt == 0 and pivot_left == 0 and pivot_right == 0:
-            older_prices = prices[older_start:older_end]
-            if len(older_prices) == 0: return False
-            idx2_iloc = older_start + np.argmin(older_prices)
-            return check_divergence_condition(idx2_iloc)
+            r_p_min = np.min(prices[recent_start:])
+            o_p_min = np.min(prices[older_start:older_end])
+            r_i_min = np.min(inds[recent_start:])
+            o_i_min = np.min(inds[older_start:older_end])
+            
+            # 放寬容許度：只要價格 <= 前低 * 1.02 (容許雙底平底或破底)，且指標 > 前波最低指標，即為底背離
+            return (r_p_min <= o_p_min * 1.02) and (r_i_min > o_i_min)
 
         def get_valid_pivots_iloc(start_loc, end_loc):
             pivots = []
@@ -306,20 +294,22 @@ class DivergenceStrategy:
                 if prices[i_loc] == np.min(prices[s:e]): pivots.append(i_loc)
             return pivots
 
-        if recent_lows_cnt > 0:
-            recent_pivots_iloc = get_valid_pivots_iloc(recent_start, recent_end)
-            if idx1_iloc in recent_pivots_iloc: recent_pivots_iloc.remove(idx1_iloc)
-            if not recent_pivots_iloc: return False
-            for p_iloc in sorted(recent_pivots_iloc, key=lambda x: prices[x])[:recent_lows_cnt]:
-                if not check_divergence_condition(p_iloc): return False
-                    
-        if older_lows_cnt > 0:
-            older_pivots_iloc = get_valid_pivots_iloc(older_start, older_end)
-            if not older_pivots_iloc: return False
-            for p_iloc in sorted(older_pivots_iloc, key=lambda x: prices[x])[:older_lows_cnt]:
-                if not check_divergence_condition(p_iloc): return False
-                    
-        return True
+        r_pivots = get_valid_pivots_iloc(recent_start, len(df))
+        o_pivots = get_valid_pivots_iloc(older_start, older_end)
+        
+        if recent_lows_cnt > 0: r_pivots = sorted(r_pivots, key=lambda x: prices[x])[:recent_lows_cnt]
+        if older_lows_cnt > 0: o_pivots = sorted(o_pivots, key=lambda x: prices[x])[:older_lows_cnt]
+        
+        if not r_pivots: r_pivots = [recent_start + np.argmin(prices[recent_start:])]
+        if not o_pivots: o_pivots = [older_start + np.argmin(prices[older_start:older_end])]
+        
+        for r_idx in r_pivots:
+            for o_idx in o_pivots:
+                r_i_val = np.min(inds[max(recent_start, r_idx-2) : min(len(inds), r_idx+3)])
+                o_i_val = np.min(inds[max(older_start, o_idx-2) : min(older_end, o_idx+3)])
+                if prices[r_idx] <= prices[o_idx] * 1.02 and r_i_val > o_i_val:
+                    return True
+        return False
 
 # ==========================================
 # 模組 3：財報雙軌評鑑系統 V4 (體質評分 + 地雷掃描)
@@ -1233,6 +1223,8 @@ with tab2:
             status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
             
             final_results = []
+            price_col_for_div = 'Low' if st.session_state.reso_price_basis == "最低價 (Low)" else 'Close'
+            
             for idx, item in enumerate(reversal_list):
                 try:
                     ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
@@ -1252,8 +1244,8 @@ with tab2:
                                 item[f"扣抵狀態({n}MA)"] = "無資料"
                         
                         for r_w, o_w in div_pairs:
-                            d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                            d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                            d_kd = DivergenceStrategy.check_bottom_divergence(daily_df, price_col_for_div, 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                            d_macd = DivergenceStrategy.check_bottom_divergence(daily_df, price_col_for_div, 'MACD_Hist', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
                             res = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
                             item[f"日K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
                             if res: has_daily_div = True
@@ -1271,8 +1263,8 @@ with tab2:
                         if not m60_df.empty:
                             m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
                             for r_w, o_w in div_pairs:
-                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
-                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, 'Low', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                m_kd = DivergenceStrategy.check_bottom_divergence(m60_df, price_col_for_div, 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
+                                m_macd = DivergenceStrategy.check_bottom_divergence(m60_df, price_col_for_div, 'MACD_Hist', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right)
                                 res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
                                 item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
                                 if res: has_m60_div = True
@@ -1370,8 +1362,13 @@ with tab2:
                 
                 debug_df = st.session_state.test_stock_df.copy()
                 if not debug_df.empty:
-                    # 擷取使用者設定的回測區間 (往前多抓10天做對照)
-                    start_offset = st.session_state.lookback_start + 10
+                    # 擷取使用者設定的回測區間 (往前多抓前波與近波範圍天數做對照)
+                    if st.session_state.use_single_div:
+                        max_older_w = st.session_state.div_older_w
+                    else:
+                        max_older_w = max(20, 60) # 預設的三組比對最大天數為60
+                        
+                    start_offset = st.session_state.lookback_start + max_older_w + st.session_state.div_recent_w
                     end_offset = st.session_state.lookback_end
                     
                     start_idx = max(0, len(debug_df) - 1 - start_offset)
@@ -1381,14 +1378,14 @@ with tab2:
                     
                     debug_df['BB_Width(%)'] = (debug_df['BB_Upper'] - debug_df['BB_Lower']) / (debug_df['MA20'] + 1e-8) * 100
                     
-                    show_cols = ['Close', 'Volume_Lots', 'Vol_MA20', 'Candle_Score', 'VCP_Score', 'Reso_Score', 'K', 'D', 'MACD', 'MACD_Hist', 'BB_Width(%)']
+                    show_cols = ['Close', 'Low', 'Volume_Lots', 'Vol_MA20', 'Candle_Score', 'VCP_Score', 'Reso_Score', 'K', 'D', 'MACD', 'MACD_Hist', 'BB_Width(%)']
                     show_cols = [c for c in show_cols if c in debug_df.columns]
                     
                     disp_df = debug_df[show_cols].sort_index(ascending=False)
                     disp_df.index = disp_df.index.strftime('%Y-%m-%d')
                     
                     format_dict = {
-                        'Close': "{:.2f}", 'Volume_Lots': "{:.0f}", 'Vol_MA20': "{:.0f}",
+                        'Close': "{:.2f}", 'Low': "{:.2f}", 'Volume_Lots': "{:.0f}", 'Vol_MA20': "{:.0f}",
                         'Candle_Score': "{:.2f}", 'VCP_Score': "{:.2f}", 'Reso_Score': "{:.2f}",
                         'K': "{:.2f}", 'D': "{:.2f}", 'MACD': "{:.3f}", 'MACD_Hist': "{:.3f}", 'BB_Width(%)': "{:.2f}"
                     }
