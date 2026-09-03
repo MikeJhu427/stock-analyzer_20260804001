@@ -46,11 +46,13 @@ DEFAULT_PARAMS = {
     "kou_di_60": False,
     "reso_kd_older_low": 20.0,
     "reso_kd_older_high": 90.0,
-    "reso_kd_recent_low": 20.0,
+    "reso_kd_recent_low": 0.0,
     "use_macd_abs": False,
     "reso_macd_older_low": 0.0,
     "reso_macd_recent_low": 0.0,
     "reso_cross_days": 3,
+    "reso_price_higher_low": False,
+    "reso_macd_cross_zero": False,
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -172,8 +174,9 @@ class VCPStrategy:
 
 class IndicatorResonanceStrategy:
     @staticmethod
-    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=90, kd_recent_low_th=20, 
-                 use_macd_abs=False, macd_older_low_th=0.0, macd_recent_low_th=0.0, cross_days=3):
+    def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=90, kd_recent_low_th=0.0, 
+                 use_macd_abs=False, macd_older_low_th=0.0, macd_recent_low_th=0.0, cross_days=3,
+                 require_price_higher_low=False, require_macd_cross_zero=False):
         if len(df) < recent_w + older_w:
             return pd.Series(0.0, index=df.index)
 
@@ -188,10 +191,16 @@ class IndicatorResonanceStrategy:
         older_price_low = df['Low'].shift(recent_w).rolling(window=older_w, min_periods=1).min()
 
         kd_cross = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
-        macd_cross = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
+        
+        if require_macd_cross_zero:
+            macd_signal = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
+        else:
+            # 寬鬆條件：柱狀圖谷底翻揚 (今天大於昨天，昨天小於前天) 或 已經實質金叉
+            macd_turn_up = (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & (df['MACD_Hist'].shift(1) <= df['MACD_Hist'].shift(2))
+            macd_signal = macd_turn_up | ((df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0))
 
         kd_recent_cross = kd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
-        macd_recent_cross = macd_cross.rolling(window=cross_days, min_periods=1).max() >= 1
+        macd_recent_cross = macd_signal.rolling(window=cross_days, min_periods=1).max() >= 1
 
         cond_kd = (older_k_low < kd_older_low_th) & (older_k_high < kd_older_high_th) & (recent_k_low > kd_recent_low_th) & kd_recent_cross
         
@@ -199,7 +208,10 @@ class IndicatorResonanceStrategy:
         if use_macd_abs:
             cond_macd = cond_macd & (older_macd_low < macd_older_low_th) & (recent_macd_low > macd_recent_low_th)
             
-        cond_price = recent_price_low > older_price_low
+        if require_price_higher_low:
+            cond_price = recent_price_low > older_price_low
+        else:
+            cond_price = pd.Series(True, index=df.index)
 
         resonance_score = pd.Series(0.0, index=df.index)
         valid_mask = cond_kd & cond_macd & cond_price
@@ -773,7 +785,9 @@ with tab1:
                     use_macd_abs=st.session_state.use_macd_abs,
                     macd_older_low_th=st.session_state.reso_macd_older_low,
                     macd_recent_low_th=st.session_state.reso_macd_recent_low,
-                    cross_days=st.session_state.reso_cross_days
+                    cross_days=st.session_state.reso_cross_days,
+                    require_price_higher_low=st.session_state.reso_price_higher_low,
+                    require_macd_cross_zero=st.session_state.reso_macd_cross_zero
                 )
                 
                 df = df.dropna(subset=['Momentum_Force', 'Max_Vol_Defense', 'VWMA20', 'Prev_MA5', 'Vol_MA20', 'MA60']).copy()
@@ -997,6 +1011,9 @@ with tab2:
             st.checkbox("啟用 MACD絕對數值濾網", key="use_macd_abs")
             st.number_input("MACD前波低 <", step=0.1, key="reso_macd_older_low", disabled=not st.session_state.use_macd_abs)
             st.number_input("MACD近波低 >", step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0", disabled=not st.session_state.use_macd_abs)
+        with col_r4:
+            st.checkbox("嚴格要求股價底底高", key="reso_price_higher_low", help="不勾選則允許股價破底但指標背離 (典型底背離)")
+            st.checkbox("嚴格要求MACD金叉(>0)", key="reso_macd_cross_zero", help="不勾選則只要求柱狀圖谷底翻揚即可")
 
     st.markdown("---")
     
@@ -1106,7 +1123,9 @@ with tab2:
                                 use_macd_abs=st.session_state.use_macd_abs,
                                 macd_older_low_th=st.session_state.reso_macd_older_low,
                                 macd_recent_low_th=st.session_state.reso_macd_recent_low,
-                                cross_days=st.session_state.reso_cross_days
+                                cross_days=st.session_state.reso_cross_days,
+                                require_price_higher_low=st.session_state.reso_price_higher_low,
+                                require_macd_cross_zero=st.session_state.reso_macd_cross_zero
                             )
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
