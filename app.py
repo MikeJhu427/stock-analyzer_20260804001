@@ -140,7 +140,6 @@ class BottomReversalStrategy:
         upper_shadow = df['High'] - df[['Open', 'Close']].max(axis=1)
         lower_shadow = df[['Open', 'Close']].min(axis=1) - df['Low']
         total_range = (df['High'] - df['Low']).replace(0, 0.001)
-        # 加上 1e-8 避免除以 0 的錯誤
         vol_mult = (df['Volume_Lots'] / (df['Vol_MA20'] + 1e-8)).clip(0.5, 3.0)
 
         cond_low_pin = (df['BIAS20'] <= 0) & (lower_shadow > body * 1.5) & (lower_shadow > total_range * 0.4)
@@ -154,7 +153,6 @@ class BottomReversalStrategy:
 class VCPStrategy:
     @staticmethod
     def evaluate(df):
-        # 加上 1e-8 防呆避免 MA20 為 0 的情況
         bb_width = (df['BB_Upper'] - df['BB_Lower']) / (df['MA20'] + 1e-8) * 100
         cond_uptrend = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60'])
         cond_vol_dry = df['Volume_Lots'] < df['Vol_MA20']
@@ -679,6 +677,11 @@ def resolve_ticker(symbol, stock_dict):
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
+# 初始化跨分頁連動狀態
+if "audit_mode" not in st.session_state: st.session_state.audit_mode = "單檔查詢"
+if "batch_input_area" not in st.session_state: st.session_state.batch_input_area = "2330, 2454, 3231, 6147, 1909"
+if "run_batch_audit" not in st.session_state: st.session_state.run_batch_audit = False
+
 if "config" not in st.session_state: st.session_state.config = load_config()
 if "current_profile" not in st.session_state: st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
@@ -732,12 +735,12 @@ with tab1:
                 df['Prev_MA5'] = df['MA5'].shift(1)
                 df['MA20'] = df['Close'].rolling(window=20).mean()
                 df['MA60'] = df['Close'].rolling(window=60).mean()
-                df['BIAS20'] = (df['Close'] - df['MA20']) / df['MA20'] * 100
+                df['BIAS20'] = (df['Close'] - df['MA20']) / (df['MA20'] + 1e-8) * 100
                 df['Std20'] = df['Close'].rolling(window=20).std()
                 df['BB_Upper'] = df['MA20'] + 2 * df['Std20']
                 df['BB_Lower'] = df['MA20'] - 2 * df['Std20']
                 
-                df['VWMA20'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
+                df['VWMA20'] = (df['Close'] * df['Volume']).rolling(20).sum() / (df['Volume'].rolling(20).sum() + 1e-8)
                 df['Prev_VWMA20'] = df['VWMA20'].shift(1)
                 df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
                 
@@ -876,8 +879,6 @@ with tab1:
                 
                 plt.tight_layout()
                 st.pyplot(fig)
-                
-                # 防漏記憶體：徹底關閉與釋放 Matplotlib Figure
                 plt.close(fig)
 
 # ----------------------------------------------------
@@ -1039,7 +1040,6 @@ with tab2:
                     data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
                     for ticker in chunk:
                         try:
-                            # 防禦 MultiIndex 不同版本的錯誤提取
                             if isinstance(data.columns, pd.MultiIndex):
                                 if ticker in data.columns.get_level_values(0):
                                     df = data.xs(ticker, axis=1, level=0).dropna(how='all')
@@ -1200,21 +1200,9 @@ with tab2:
                     progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
                 status_text.empty(); progress_bar.empty()
-                date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
-                st.success(f"🎉 掃描完成！本次共精選出 **{len(final_results)}** 檔符合條件的標的 {date_str}。")
                 
-                if market_info:
-                    st.markdown("### 🌐 大盤位階與期貨基準動態濾網評估結果")
-                    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-                    m_col1.metric("加權指數收盤", market_info["加權指數收盤"])
-                    m_col2.metric("月線 (MA20)", market_info["月線 (MA20)"])
-                    m_col3.metric("季線 (MA60)", market_info["季線 (MA60)"])
-                    m_col4.metric("約當大台基礎", market_info["自動運算基準價值 (約當大台基礎)"])
-                    st.info(f"**大盤環境判定：** {market_info['大盤環境判定']}")
-                    st.markdown("---")
-                
+                # 排序並儲存結果到 Session State 以防止重新渲染時消失
                 res_df = pd.DataFrame(final_results)
-                
                 base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
                 div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
                 kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
@@ -1223,18 +1211,68 @@ with tab2:
                 res_df = res_df[cols].sort_values(by=["共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False]).reset_index(drop=True)
                 res_df.index = res_df.index + 1
                 
-                st.dataframe(res_df, use_container_width=True)
+                st.session_state.scan_res_df = res_df
+                st.session_state.scan_algo_mode = algo_mode
+                st.session_state.market_info = market_info
                 
-                csv = res_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="📥 下載建議清單 (CSV)",
-                    data=csv,
-                    file_name=f'stock_scan_{algo_mode}_results.csv',
-                    mime='text/csv'
-                )
+                date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
+                st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔符合條件的標的 {date_str}。"
             else:
                 status_text.empty(); progress_bar.empty()
-                st.info(f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。")
+                st.session_state.scan_res_df = pd.DataFrame()
+                st.session_state.scan_algo_mode = algo_mode
+                st.session_state.market_info = market_info
+                st.session_state.scan_msg = f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。"
+
+    # 確保掃描結果在點擊按鈕或重新渲染時不會消失
+    if "scan_res_df" in st.session_state:
+        # 重新渲染大盤結果與提示訊息
+        if not st.session_state.scan_res_df.empty:
+            st.success(st.session_state.scan_msg)
+        else:
+            st.info(st.session_state.scan_msg)
+            
+        market_info = st.session_state.get("market_info")
+        if market_info:
+            st.markdown("### 🌐 大盤位階與期貨基準動態濾網評估結果")
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            m_col1.metric("加權指數收盤", market_info["加權指數收盤"])
+            m_col2.metric("月線 (MA20)", market_info["月線 (MA20)"])
+            m_col3.metric("季線 (MA60)", market_info["季線 (MA60)"])
+            m_col4.metric("約當大台基礎", market_info["自動運算基準價值 (約當大台基礎)"])
+            st.info(f"**大盤環境判定：** {market_info['大盤環境判定']}")
+            st.markdown("---")
+            
+        res_df = st.session_state.scan_res_df
+        algo_mode_saved = st.session_state.get("scan_algo_mode", "全部")
+        
+        if not res_df.empty:
+            st.dataframe(res_df, use_container_width=True)
+            
+            csv = res_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 下載建議清單 (CSV)",
+                data=csv,
+                file_name=f'stock_scan_{algo_mode_saved}_results.csv',
+                mime='text/csv'
+            )
+            
+            # --- 新增跨分頁連動功能 ---
+            st.markdown("---")
+            st.markdown("### 🧬 進階基本面健檢連動")
+            
+            def transfer_to_audit():
+                # 擷取所有選出來的標的並轉為逗號分隔的字串
+                tickers_str = ", ".join(res_df['股票代號'].astype(str).tolist())
+                # 寫入第 3 分頁的變數
+                st.session_state.batch_input_area = tickers_str
+                st.session_state.run_batch_audit = True
+                st.session_state.audit_mode = "自選股批次掃描"
+                
+            st.button("🚀 將上述標的傳送至【財報雙軌健檢】(第3分頁) 進行基本面分析", type="primary", on_click=transfer_to_audit)
+            
+            if st.session_state.get('run_batch_audit', False):
+                st.success("✅ **傳送成功！已自動載入標的。** 請手動點擊上方的 **【📑 財報體質與雙軌健檢 (基本面 V4)】** 分頁查看綜合評分（系統將自動從最佳到最差排序）。")
 
 # ----------------------------------------------------
 # 頁籤 3：財報體質與雙軌健檢 (基本面 V4)
@@ -1248,7 +1286,8 @@ def fmt_val(val, suffix="", is_int=False):
 with tab3:
     st.write("透過財報三表（損益表、資產負債表、現金流量表）交叉勾稽，提供**「防雷風險檢驗」**與**「優良體質評鑑」**雙軌判定，挖掘具備護城河、真實造血力與安全結構的卓越企業。")
     
-    audit_mode = st.radio("請選擇操作模式", ["單檔查詢", "自選股批次掃描"], horizontal=True)
+    # 使用 Session State 同步切換狀態
+    audit_mode = st.radio("請選擇操作模式", ["單檔查詢", "自選股批次掃描"], horizontal=True, key="audit_mode")
     
     if audit_mode == "單檔查詢":
         c1, c2 = st.columns([4, 1])
@@ -1318,10 +1357,18 @@ with tab3:
 
     else:
         st.write("請貼上你想健檢的股票清單（可使用逗號、空白、或換行分隔），系統將產出包含**「體質評分」**與**「地雷風險」**的綜合比較清單。")
-        batch_input = st.text_area("輸入自選股清單", value="2330, 2454, 3231, 6147, 1909", height=100)
+        
+        # 接收來自第 2 分頁的標的字串
+        batch_input = st.text_area("輸入自選股清單", height=100, key="batch_input_area")
         batch_btn = st.button("執行批次雙軌健檢", type="primary")
         
-        if batch_btn and batch_input.strip():
+        # 如果使用者點擊按鈕，或是從第 2 分頁傳過來的自動執行指令被觸發
+        if batch_btn or st.session_state.get('run_batch_audit', False):
+            
+            # 若為自動觸發，執行一次後便關閉開關，避免無限迴圈
+            if st.session_state.get('run_batch_audit', False):
+                st.session_state.run_batch_audit = False
+                
             raw_tickers = re.split(r'[,\s\n]+', batch_input.strip())
             valid_tickers = [t.strip() for t in raw_tickers if t.strip()]
             
@@ -1369,6 +1416,10 @@ with tab3:
                 if batch_results:
                     st.success(f"🎉 批次健檢完成！共成功分析 {len(batch_results)} 檔標的。")
                     batch_df = pd.DataFrame(batch_results)
+                    
+                    # 💡 依照要求，嚴格執行從「最佳到最差」排序：
+                    # 體質分數 (高 -> 低, ascending=False)
+                    # 風險分數 (低 -> 高, ascending=True)
                     batch_df = batch_df.sort_values(by=["體質分數", "風險分數"], ascending=[False, True]).reset_index(drop=True)
                     batch_df.index = batch_df.index + 1
                     
