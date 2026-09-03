@@ -5,6 +5,7 @@ import logging
 import requests
 import datetime
 import time
+import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
@@ -266,6 +267,86 @@ class DivergenceStrategy:
                     
         return True
 
+# ==========================================
+# 模組 3：財報三表交叉勾稽 (新增模組)
+# ==========================================
+class FinancialAuditStrategy:
+    @staticmethod
+    def evaluate(ticker_symbol, session):
+        try:
+            stock = yf.Ticker(ticker_symbol, session=session)
+            inc_stmt = stock.quarterly_income_stmt
+            bal_sheet = stock.quarterly_balance_sheet
+            cash_flow = stock.quarterly_cashflow
+            
+            if inc_stmt.empty or bal_sheet.empty or cash_flow.empty:
+                return {"status": "error", "msg": f"無法取得 {ticker_symbol} 完整三表數據 (可能非上市櫃公司或 Yahoo 無資料)"}
+
+            # 確保欄位依時間排序（由舊到新）
+            inc_stmt = inc_stmt.sort_index(axis=1)
+            bal_sheet = bal_sheet.sort_index(axis=1)
+            cash_flow = cash_flow.sort_index(axis=1)
+
+            periods = inc_stmt.columns
+            if len(periods) < 2:
+                return {"status": "error", "msg": f"{ticker_symbol} 季報期數不足，無法進行比對"}
+
+            curr = periods[-1]
+            prev = periods[-5] if len(periods) >= 5 else periods[-2]
+            comp_type = "YoY (同期相比)" if len(periods) >= 5 else "QoQ (前季相比)"
+
+            def get_val(df, keys, period):
+                for k in keys:
+                    if k in df.index:
+                        val = df.loc[k, period]
+                        return float(val) if pd.notna(val) else 0.0
+                return 0.0
+
+            rev_curr = get_val(inc_stmt, ['Total Revenue', 'Operating Revenue'], curr)
+            rev_prev = get_val(inc_stmt, ['Total Revenue', 'Operating Revenue'], prev)
+            ni_curr = get_val(inc_stmt, ['Net Income', 'Net Income Common Stockholders'], curr)
+            cfo_curr = get_val(cash_flow, ['Operating Cash Flow', 'Cash Flowsfromusedin Operating Activities', 'Total Cash From Operating Activities'], curr)
+            ar_curr = get_val(bal_sheet, ['Accounts Receivable', 'Net Receivables', 'Receivables'], curr)
+            ar_prev = get_val(bal_sheet, ['Accounts Receivable', 'Net Receivables', 'Receivables'], prev)
+            inv_curr = get_val(bal_sheet, ['Inventory'], curr)
+            inv_prev = get_val(bal_sheet, ['Inventory'], prev)
+
+            calc_growth = lambda c, p: ((c - p) / abs(p) * 100) if p != 0 else 0.0
+            rev_growth = calc_growth(rev_curr, rev_prev)
+            ar_growth = calc_growth(ar_curr, ar_prev)
+            inv_growth = calc_growth(inv_curr, inv_prev)
+            cfo_to_ni = (cfo_curr / ni_curr) if ni_curr != 0 else 0.0
+
+            warnings = []
+            if ni_curr > 0 and cfo_curr < 0:
+                warnings.append("【高危】淨利為正，但營業活動現金流(CFO)為負，具黑字倒閉風險。")
+            elif ni_curr > 0 and cfo_to_ni < 0.7:
+                warnings.append(f"【注意】獲利含金量偏低：CFO/淨利比率僅 {cfo_to_ni:.2f}。")
+
+            if ar_growth > rev_growth + 10:
+                warnings.append(f"【警訊】應收帳款成長({ar_growth:.1f}%)遠大於營收成長({rev_growth:.1f}%)。")
+
+            if inv_growth > rev_growth + 15:
+                warnings.append(f"【警訊】存貨成長({inv_growth:.1f}%)遠大於營收成長({rev_growth:.1f}%)。")
+
+            return {
+                "status": "success",
+                "當期季報": curr.strftime('%Y-%m-%d'),
+                "比較基準": comp_type,
+                "營收成長(%)": round(rev_growth, 2),
+                "稅後淨利(千)": round(ni_curr/1000, 2),
+                "營業現金流CFO(千)": round(cfo_curr/1000, 2),
+                "應收成長(%)": round(ar_growth, 2),
+                "存貨成長(%)": round(inv_growth, 2),
+                "警訊數": len(warnings),
+                "診斷明細": "\n".join(warnings) if warnings else "✅ 無明顯交叉勾稽異常，結構良好。"
+            }
+        except Exception as e:
+            return {"status": "error", "msg": f"解析 {ticker_symbol} 發生錯誤: {str(e)}"}
+
+# ==========================================
+# 網路請求與全域快取
+# ==========================================
 def get_yf_session():
     session = requests.Session()
     retry = Retry(total=3, read=3, connect=3, backoff_factor=1.5, status_forcelist=(429, 500, 502, 503, 504))
@@ -333,6 +414,18 @@ def get_stock_data(symbol):
         except Exception: continue
     return pd.DataFrame(), code
 
+def resolve_ticker(symbol, stock_dict):
+    code = str(symbol).strip().upper()
+    if code.endswith(".TW") or code.endswith(".TWO"): return code
+    tw = f"{code}.TW"
+    two = f"{code}.TWO"
+    if tw in stock_dict: return tw
+    if two in stock_dict: return two
+    return tw 
+
+# ==========================================
+# Streamlit UI 主程式
+# ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
 if "config" not in st.session_state: st.session_state.config = load_config()
@@ -355,10 +448,11 @@ if missing_keys or "backtest_date_obj" not in st.session_state:
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)"])
+# 增加第三個頁籤
+tab1, tab2, tab3 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)", "📑 財報三表地雷掃描 (基本面)"])
 
 # ----------------------------------------------------
-# 頁籤 1：單檔深度解析
+# 頁籤 1：單檔深度解析 (原封不動保留)
 # ----------------------------------------------------
 with tab1:
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
@@ -534,7 +628,7 @@ with tab1:
                 st.pyplot(fig)
 
 # ----------------------------------------------------
-# 頁籤 2：全市場智慧掃描
+# 頁籤 2：全市場智慧掃描 (原封不動保留)
 # ----------------------------------------------------
 with tab2:
     st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」或「雙指標共振」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
@@ -684,7 +778,7 @@ with tab2:
             tickers = list(stock_dict.keys())
             reversal_candidates = {} 
             
-            chunk_size = 40 # 【優化】降低單次請求數量，進一步防止 429 阻擋
+            chunk_size = 40 
             for i in range(0, len(tickers), chunk_size):
                 chunk = tickers[i:i+chunk_size]
                 status_text.text(f"[階段一] 正在全市場區間掃描 [{algo_mode}]：進度 {min(i+chunk_size, len(tickers))} / {len(tickers)} 檔...")
@@ -766,7 +860,7 @@ with tab2:
                         except Exception: continue
                 except Exception: pass
                 
-                time.sleep(1.0) # 【關鍵修復】批次間隔延遲，徹底杜絕 yfinance 429 阻擋
+                time.sleep(1.0) 
                 progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
             
             reversal_list = list(reversal_candidates.values())
@@ -811,7 +905,7 @@ with tab2:
                             for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
                         
                         if dl_60m_kwargs is not None:
-                            time.sleep(0.5) # 防止 60分K 連續抓取被阻擋
+                            time.sleep(0.5) 
                             m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", **dl_60m_kwargs)
                             if specific_offset > 0 and not daily_df.empty:
                                 target_date = daily_df.index[-1].date()
@@ -878,3 +972,109 @@ with tab2:
             else:
                 status_text.empty(); progress_bar.empty()
                 st.info(f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。")
+
+# ----------------------------------------------------
+# 頁籤 3：財報三表地雷掃描 (全新模組)
+# ----------------------------------------------------
+with tab3:
+    st.write("透過財報三表（損益表、資產負債表、現金流量表）交叉勾稽，避開潛在的「黑字倒閉、塞貨膨風、庫存積壓」地雷股。")
+    
+    audit_mode = st.radio("請選擇操作模式", ["單檔查詢", "自選股批次掃描"], horizontal=True)
+    
+    if audit_mode == "單檔查詢":
+        c1, c2 = st.columns([4, 1])
+        with c1: 
+            audit_input = st.text_input("輸入單一股票代號", value="2330", key="audit_single").strip()
+        with c2: 
+            st.write(""); st.write("")
+            audit_btn = st.button("檢驗財報", type="primary", use_container_width=True)
+            
+        if audit_btn and audit_input:
+            with st.spinner(f"⏳ 正在抓取 [{audit_input}] 季報資料並進行交叉比對..."):
+                stock_dict = get_all_tw_stocks()
+                yf_ticker = resolve_ticker(audit_input, stock_dict)
+                name = stock_dict.get(yf_ticker, audit_input)
+                
+                res = FinancialAuditStrategy.evaluate(yf_ticker, get_yf_session())
+                if res["status"] == "error":
+                    st.error(res["msg"])
+                else:
+                    st.subheader(f"📑 {name} ({audit_input}) 財報交叉勾稽報告")
+                    st.markdown(f"**當期季報：{res['當期季報']} | 比較基準：{res['比較基準']}**")
+                    
+                    if res["警訊數"] > 0:
+                        st.error(f"⚠️ 發現 {res['警訊數']} 項潛在地雷訊號：\n\n" + res["診斷明細"])
+                    else:
+                        st.success(res["診斷明細"])
+                        
+                    col_a, col_b, col_c, col_d = st.columns(4)
+                    col_a.metric("營收成長", f"{res['營收成長(%)']}%")
+                    col_b.metric("稅後淨利", f"{res['稅後淨利(千)']:,} 千")
+                    col_c.metric("營業現金流(CFO)", f"{res['營業現金流CFO(千)']:,} 千")
+                    col_d.metric("CFO/淨利", f"{res['營業現金流CFO(千)'] / res['稅後淨利(千)'] if res['稅後淨利(千)'] != 0 else 0 :.2f}")
+                    
+                    col_e, col_f, col_g, col_h = st.columns(4)
+                    col_e.metric("應收帳款成長", f"{res['應收成長(%)']}%")
+                    col_f.metric("營收-應收成長差", f"{res['營收成長(%)'] - res['應收成長(%)']:.1f}%")
+                    col_g.metric("存貨成長", f"{res['存貨成長(%)']}%")
+                    col_h.metric("營收-存貨成長差", f"{res['營收成長(%)'] - res['存貨成長(%)']:.1f}%")
+
+    else:
+        st.write("請貼上你想健檢的股票清單（可使用逗號、空白、或換行分隔），系統將逐一產出報表供下載。")
+        batch_input = st.text_area("輸入自選股清單", value="2330, 2454, 3231, 2382, 2376", height=100)
+        batch_btn = st.button("執行批次健檢", type="primary")
+        
+        if batch_btn and batch_input.strip():
+            # 解析字串
+            raw_tickers = re.split(r'[,\s\n]+', batch_input.strip())
+            valid_tickers = [t.strip() for t in raw_tickers if t.strip()]
+            
+            if not valid_tickers:
+                st.warning("⚠️ 找不到有效的股票代號。")
+            else:
+                stock_dict = get_all_tw_stocks()
+                session = get_yf_session()
+                
+                batch_results = []
+                status_text = st.empty()
+                p_bar = st.progress(0)
+                
+                for idx, t_input in enumerate(valid_tickers):
+                    status_text.text(f"⏳ 正在分析 {t_input} ... ({idx+1}/{len(valid_tickers)})")
+                    yf_t = resolve_ticker(t_input, stock_dict)
+                    name = stock_dict.get(yf_t, t_input)
+                    
+                    res = FinancialAuditStrategy.evaluate(yf_t, session)
+                    if res["status"] == "success":
+                        batch_results.append({
+                            "代號": t_input,
+                            "名稱": name,
+                            "當期季報": res["當期季報"],
+                            "營收 YoY(%)": res["營收成長(%)"],
+                            "應收 YoY(%)": res["應收成長(%)"],
+                            "存貨 YoY(%)": res["存貨成長(%)"],
+                            "稅後淨利(千)": res["稅後淨利(千)"],
+                            "CFO(千)": res["營業現金流CFO(千)"],
+                            "警訊數": res["警訊數"],
+                            "診斷明細": res["診斷明細"].replace("\n", " | ")
+                        })
+                    time.sleep(0.5) 
+                    p_bar.progress(min(1.0, (idx + 1) / len(valid_tickers)))
+                    
+                status_text.empty()
+                p_bar.empty()
+                
+                if batch_results:
+                    st.success(f"🎉 批次健檢完成！共成功分析 {len(batch_results)} 檔標的。")
+                    batch_df = pd.DataFrame(batch_results)
+                    st.dataframe(batch_df, use_container_width=True)
+                    
+                    csv = batch_df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        label="📥 下載財報健檢報告 (CSV)",
+                        data=csv,
+                        file_name=f'financial_audit_{datetime.date.today()}.csv',
+                        mime='text/csv'
+                    )
+                else:
+                    st.error("❌ 清單內的所有標的皆無法取得有效財報數據，請確認代號正確性或 Yahoo 資料庫狀態。")
