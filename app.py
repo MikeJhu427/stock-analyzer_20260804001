@@ -22,6 +22,15 @@ warnings.filterwarnings("ignore")
 logging.getLogger('matplotlib.font_manager').disabled = True
 
 # ==========================================
+# 輸出欄位顯示設定 (程式內部維護，不與 UI 參數混在一起)
+# ==========================================
+OUTPUT_COLUMN_CONFIG = {
+    "show_ma120_240_bear_align": True,  # 顯示 年線/半年線空排 (120MA < 240MA)
+    "show_ma240_slope": True,           # 顯示 年線斜率(%)
+    "show_ma120_slope": True            # 顯示 半年線斜率(%)
+}
+
+# ==========================================
 # 參數設定檔管理模組 (JSON 本機儲存)
 # ==========================================
 PARAMS_FILE = "params_config.json"
@@ -1257,7 +1266,17 @@ with tab2:
         if st.session_state.kou_di_60: kou_di_periods.append(60)
         
         if reversal_list:
+            candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
             progress_bar.progress(0)
+            status_text.text(f"[階段二] 正在下載初步標的長天期資料以計算年線/半年線...")
+            
+            long_dl_kwargs = {"period": "2y"}
+            if st.session_state.use_backtest_date:
+                start_long = end_dt - datetime.timedelta(days=1000) # 確保有超過240天
+                long_dl_kwargs = {"start": start_long.strftime('%Y-%m-%d'), "end": end_dt.strftime('%Y-%m-%d')}
+            
+            long_data = yf.download(candidate_tickers, threads=False, progress=False, session=yf_session, **long_dl_kwargs)
+            
             status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
             
             final_results = []
@@ -1267,14 +1286,56 @@ with tab2:
             
             for idx, item in enumerate(reversal_list):
                 try:
-                    ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
+                    ticker = item.pop("_Full_Ticker")
+                    specific_offset = item.pop("_Offset")
+                    daily_df = item.pop("_Daily_DF")
                     has_daily_div, has_m60_div = False, False
                     rl_cnt, ol_cnt = st.session_state.recent_lows_cnt, st.session_state.older_lows_cnt
                     p_left, p_right = st.session_state.pivot_left, st.session_state.pivot_right
                     
+                    # === 年線與半年線計算 ===
+                    item['年線/半年線空排'] = "無資料"
+                    item['半年線斜率(%)'] = "無資料"
+                    item['年線斜率(%)'] = "無資料"
+                    
+                    try:
+                        if isinstance(long_data.columns, pd.MultiIndex):
+                            if ticker in long_data.columns.get_level_values(0):
+                                long_df = long_data.xs(ticker, axis=1, level=0).dropna(how='all')
+                            elif ticker in long_data.columns.get_level_values(1):
+                                long_df = long_data.xs(ticker, axis=1, level=1).dropna(how='all')
+                            else:
+                                long_df = pd.DataFrame()
+                        else:
+                            long_df = long_data.dropna(how='all') if len(candidate_tickers) == 1 else pd.DataFrame()
+                            
+                        if not long_df.empty:
+                            if st.session_state.use_backtest_date:
+                                target_dt = pd.to_datetime(st.session_state.backtest_date_obj)
+                                long_df = long_df[long_df.index.tz_localize(None).normalize() <= target_dt]
+                                
+                            if specific_offset > 0:
+                                long_df = long_df.iloc[:-specific_offset]
+                                
+                            if len(long_df) >= 120:
+                                ma120 = long_df['Close'].rolling(120).mean()
+                                c_ma120 = ma120.iloc[-1]
+                                p_ma120 = ma120.iloc[-2]
+                                item['半年線斜率(%)'] = round((c_ma120 - p_ma120) / p_ma120 * 100, 3)
+                                
+                            if len(long_df) >= 240:
+                                ma240 = long_df['Close'].rolling(240).mean()
+                                c_ma240 = ma240.iloc[-1]
+                                p_ma240 = ma240.iloc[-2]
+                                item['年線斜率(%)'] = round((c_ma240 - p_ma240) / p_ma240 * 100, 3)
+                                
+                                is_bear = c_ma120 < c_ma240
+                                item['年線/半年線空排'] = "✅ 是" if is_bear else "❌ 否"
+                    except Exception as e:
+                        pass
+                    # ==========================
+                    
                     if not daily_df.empty:
-                        if specific_offset > 0: daily_df = daily_df.iloc[:-specific_offset]
-                        
                         for n in kou_di_periods:
                             if len(daily_df) >= n:
                                 curr_p = daily_df['Close'].iloc[-1]
@@ -1341,6 +1402,15 @@ with tab2:
             res_df = pd.DataFrame(final_results)
             # 在基礎欄位中加入新的 DIF、KD金叉判定、MACD金叉判定
             base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            
+            # 動態加入新增的 MA 欄位
+            if OUTPUT_COLUMN_CONFIG.get("show_ma120_240_bear_align", True):
+                base_cols.append('年線/半年線空排')
+            if OUTPUT_COLUMN_CONFIG.get("show_ma240_slope", True):
+                base_cols.append('年線斜率(%)')
+            if OUTPUT_COLUMN_CONFIG.get("show_ma120_slope", True):
+                base_cols.append('半年線斜率(%)')
+                
             div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
             kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
             cols = base_cols + div_cols + kou_cols
