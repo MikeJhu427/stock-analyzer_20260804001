@@ -1463,15 +1463,31 @@ with tab2:
         target_mode_saved = st.session_state.get("scan_target_mode_saved", "全市場掃描")
         
         if not res_df.empty:
-            st.dataframe(res_df, use_container_width=True)
-            
-            csv = res_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 下載建議清單 (CSV)",
-                data=csv,
-                file_name=f'stock_scan_{algo_mode_saved}_results.csv',
-                mime='text/csv'
+            st.markdown("### 📋 自訂輸出欄位與順序")
+            # 提供額外功能讓使用者調整順序，預設為固定好的 res_df.columns
+            all_columns = res_df.columns.tolist()
+            selected_cols = st.multiselect(
+                "您可以新增/移除欄位，或依序點選、拖曳標籤來改變表格顯示順序：",
+                options=all_columns,
+                default=all_columns,
+                key="custom_column_order"
             )
+            
+            # 若使用者將欄位全清空，則顯示空表格以免報錯
+            display_df = res_df[selected_cols] if selected_cols else pd.DataFrame()
+            
+            if not display_df.empty:
+                st.dataframe(display_df, use_container_width=True)
+                
+                csv = display_df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label="📥 下載建議清單 (CSV)",
+                    data=csv,
+                    file_name=f'stock_scan_{algo_mode_saved}_results.csv',
+                    mime='text/csv'
+                )
+            else:
+                st.warning("⚠️ 請至少選擇一個欄位來顯示資料。")
             
             # --- 若為指定個股測試模式，印出每日指標詳細表供參數調整參考 ---
             if target_mode_saved == '指定個股測試' and 'test_stock_df' in st.session_state:
