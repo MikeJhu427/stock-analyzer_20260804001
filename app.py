@@ -67,6 +67,7 @@ DEFAULT_PARAMS = {
     "require_cross_confirm": True,
     "use_cross_position_filter": True,
     "cross_position_threshold": 70.0,
+    "use_weekly_filter": True, # [新增] 週K共振與背離判定預設開啟
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -115,7 +116,6 @@ class TechnicalIndicators:
         df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
         return df
     
-    # === [新增] 供老手濾網使用的 RSI ===
     @staticmethod
     def add_rsi(df, period=14):
         df = df.copy()
@@ -129,7 +129,7 @@ class TechnicalIndicators:
         return df
 
 # ==========================================
-# [新增模組] 老手實戰交易濾網 (完全獨立，鬆散耦合)
+# 老手實戰交易濾網 (獨立評估模組)
 # ==========================================
 class ExpertTradingStrategy:
     @staticmethod
@@ -184,6 +184,56 @@ class ExpertTradingStrategy:
         if w_bull and not d_bull: return "🟡 短期回檔 (勿加碼)"
         if not w_bull and d_bull: return "🟠 跌深反彈 (非回升)"
         return "🔴 同步轉空 (觀望)"
+
+# ==========================================
+# [新增] 週K線共振與背離獨立運算模組
+# ==========================================
+class WeeklyAnalysisStrategy:
+    @staticmethod
+    def evaluate(long_df, div_pairs, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, price_col):
+        if long_df is None or long_df.empty or len(long_df) < 20:
+            return {"週K共振": "無資料", "週K背離": "無資料"}
+        
+        try:
+            # 確保時區乾淨以防 resample 報錯
+            df = long_df.copy()
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+                
+            w_df = df.resample('W-FRI').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+            }).dropna()
+            
+            if len(w_df) < 20:
+                return {"週K共振": "資料不足", "週K背離": "資料不足"}
+                
+            w_df = TechnicalIndicators.add_kd(w_df)
+            w_df = TechnicalIndicators.add_macd(w_df)
+            
+            last_row = w_df.iloc[-1]
+            kd_bull = last_row['K'] > last_row['D']
+            macd_bull = last_row['MACD_Hist'] > 0
+            
+            if kd_bull and macd_bull: reso_str = "✅ 雙共振"
+            elif kd_bull: reso_str = "KD偏多"
+            elif macd_bull: reso_str = "MACD偏多"
+            else: reso_str = "❌ 無"
+            
+            div_res = []
+            for r_w, o_w in div_pairs:
+                d_kd = DivergenceStrategy.check_bottom_divergence(
+                    w_df, price_col, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                )
+                d_macd = DivergenceStrategy.check_bottom_divergence(
+                    w_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                )
+                if d_kd: div_res.append(f"KD({r_w},{o_w})")
+                if d_macd: div_res.append(f"MACD({r_w},{o_w})")
+                
+            div_str = "+".join(list(dict.fromkeys(div_res))) if div_res else "無"
+            return {"週K共振": reso_str, "週K背離": div_str}
+        except Exception as e:
+            return {"週K共振": "錯誤", "週K背離": "錯誤"}
 
 # ==========================================
 # 模組 2：大盤位階與策略演算法核心
@@ -871,7 +921,7 @@ with tab1:
                 
                 df = TechnicalIndicators.add_kd(df)
                 df = TechnicalIndicators.add_macd(df)
-                df = TechnicalIndicators.add_rsi(df) # 增加 RSI 計算
+                df = TechnicalIndicators.add_rsi(df)
                 
                 df['Pct_Change'] = df['Close'].pct_change() * 100
                 df['Volume_Lots'] = df['Volume'] / 1000
@@ -948,7 +998,6 @@ with tab1:
                     st.warning(f"**指標共振分數：{reso_score}** ({reso_status})\n\n*(門檻：{st.session_state.min_reso_score} 分)*")
                 st.markdown("---")
                 
-                # === [鬆散耦合] 插入老手實戰濾網結果 ===
                 st.markdown("### 🧙‍♂️ 老手實戰交易濾網 (獨立評估模組)")
                 expert_res_df = ExpertTradingStrategy.evaluate(df)
                 last_expert = expert_res_df.iloc[-1]
@@ -966,7 +1015,6 @@ with tab1:
                     pos_advice = ExpertTradingStrategy.get_position_advice(last_expert['多空指標數'])
                     st.warning(f"**三指標共振持股建議：**\n\n{pos_advice} (同步偏多數: {last_expert['多空指標數']})")
                 st.markdown("---")
-                # ==========================================
                 
                 st.markdown(f"**更新日期：{last_date} | 最新收盤價：{last_row['Close']:.2f}**")
                 with st.container(height=165):
@@ -1181,6 +1229,9 @@ with tab2:
         with col_x3:
             st.number_input("建議參考的 K值上限 <", step=1.0, key="cross_position_threshold", disabled=not st.session_state.use_cross_position_filter)
 
+        st.markdown("**7. 進階輔助濾網 (長天期驗證)**")
+        st.checkbox("啟用週K線共振與底背離判定 (預設開啟)", key="use_weekly_filter", help="在第二階段自動下載長天期資料並還原為週K線作大格局的背離與共振判斷。")
+
     st.markdown("---")
     
     if st.button("🚀 開始智慧區間掃描", type="primary"):
@@ -1264,7 +1315,6 @@ with tab2:
                         df = TechnicalIndicators.add_kd(df)
                         df = TechnicalIndicators.add_macd(df)
                         
-                        # === [鬆散耦合] 導入老手濾網指標與運算 ===
                         df = TechnicalIndicators.add_rsi(df)
                         expert_res_df = ExpertTradingStrategy.evaluate(df)
                         
@@ -1366,7 +1416,6 @@ with tab2:
                                 "VCP分數": round(float(best_row['VCP_Score']), 2),
                                 "共振分數": round(float(best_row['Reso_Score']), 2),
                                 "進場位置建議": rec_status,
-                                # === [鬆散耦合] 新增老手實戰匯出欄位 ===
                                 "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
                                 "多週期KD": ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
@@ -1451,8 +1500,18 @@ with tab2:
                                 
                                 is_bear = c_ma120 < c_ma240
                                 item['年線/半年線空排'] = "✅ 是" if is_bear else "❌ 否"
+                                
+                            # === [新增] 週K共振與背離 (傳入長天期數據) ===
+                            if st.session_state.use_weekly_filter:
+                                wk_res = WeeklyAnalysisStrategy.evaluate(
+                                    long_df, div_pairs, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, price_col_for_div
+                                )
+                                item["週K共振"] = wk_res["週K共振"]
+                                item["週K背離"] = wk_res["週K背離"]
                     except Exception as e:
-                        pass
+                        if st.session_state.use_weekly_filter:
+                            item["週K共振"] = "錯誤"
+                            item["週K背離"] = "錯誤"
                     # ==========================
                     
                     if not daily_df.empty:
@@ -1520,8 +1579,14 @@ with tab2:
             status_text.empty(); progress_bar.empty()
             
             res_df = pd.DataFrame(final_results)
-            # === [鬆散耦合] 在基礎欄位中加入新的老手實戰欄位 ===
+            
             base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            
+            # === 動態插入週K判定欄位 ===
+            if st.session_state.use_weekly_filter:
+                insert_idx = base_cols.index('盤整過濾') + 1
+                base_cols.insert(insert_idx, '週K共振')
+                base_cols.insert(insert_idx + 1, '週K背離')
             
             # 動態加入新增的 MA 欄位
             if OUTPUT_COLUMN_CONFIG.get("show_ma120_240_bear_align", True):
