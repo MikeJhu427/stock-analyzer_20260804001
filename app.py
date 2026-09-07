@@ -114,6 +114,76 @@ class TechnicalIndicators:
         df['MACD_Signal'] = df['MACD'].ewm(span=signal, adjust=False).mean()
         df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
         return df
+    
+    # === [新增] 供老手濾網使用的 RSI ===
+    @staticmethod
+    def add_rsi(df, period=14):
+        df = df.copy()
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        rs = avg_gain / (avg_loss + 1e-8)
+        df['RSI'] = 100 - (100 / (1 + rs))
+        return df
+
+# ==========================================
+# [新增模組] 老手實戰交易濾網 (完全獨立，鬆散耦合)
+# ==========================================
+class ExpertTradingStrategy:
+    @staticmethod
+    def evaluate(df):
+        res = pd.DataFrame(index=df.index)
+        if len(df) < 20:
+            res['RSI盤整'] = False
+            res['多空指標數'] = 0
+            res['日KD多'] = False
+            res['週KD多'] = False
+            return res
+
+        # 1. 盤整判定 (RSI 45-55連續5天)
+        is_consolidation = df['RSI'].between(45, 55).rolling(5).sum() == 5
+        
+        # 2. 部位管理指標 (KD, MACD, RSI)
+        kd_bull = df['K'] > df['D']
+        macd_bull = df['MACD_Hist'] > 0
+        rsi_bull = df['RSI'] > 50
+        bull_count = kd_bull.astype(int) + macd_bull.astype(int) + rsi_bull.astype(int)
+        
+        # 3. 週KD判定 (降維轉換)
+        try:
+            w_df = df[['Open', 'High', 'Low', 'Close']].resample('W-FRI').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
+            }).dropna()
+            w_df = TechnicalIndicators.add_kd(w_df)
+            w_df['W_Bull'] = w_df['K'] > w_df['D']
+            # 將週指標對應回日線 (向前填充)
+            w_bull_series = w_df['W_Bull'].reindex(df.index, method='ffill').fillna(False)
+        except Exception:
+            w_bull_series = pd.Series(False, index=df.index)
+            
+        res['RSI盤整'] = is_consolidation
+        res['多空指標數'] = bull_count
+        res['日KD多'] = kd_bull
+        res['週KD多'] = w_bull_series
+        return res
+
+    @staticmethod
+    def get_position_advice(bull_count):
+        if pd.isna(bull_count): return "-"
+        if bull_count == 3: return "7成 (同步偏多)"
+        if bull_count == 2: return "5成 (偏多震盪)"
+        if bull_count == 1: return "3成 (偏空震盪)"
+        return "1成以下 (同步偏空)"
+        
+    @staticmethod
+    def get_multi_tf_advice(w_bull, d_bull):
+        if pd.isna(w_bull) or pd.isna(d_bull): return "-"
+        if w_bull and d_bull: return "🟢 同步轉多 (勝率高)"
+        if w_bull and not d_bull: return "🟡 短期回檔 (勿加碼)"
+        if not w_bull and d_bull: return "🟠 跌深反彈 (非回升)"
+        return "🔴 同步轉空 (觀望)"
 
 # ==========================================
 # 模組 2：大盤位階與策略演算法核心
@@ -801,6 +871,7 @@ with tab1:
                 
                 df = TechnicalIndicators.add_kd(df)
                 df = TechnicalIndicators.add_macd(df)
+                df = TechnicalIndicators.add_rsi(df) # 增加 RSI 計算
                 
                 df['Pct_Change'] = df['Close'].pct_change() * 100
                 df['Volume_Lots'] = df['Volume'] / 1000
@@ -876,6 +947,26 @@ with tab1:
                     reso_status = "✅ 達標入選" if reso_score >= st.session_state.min_reso_score else "❌ 未達標"
                     st.warning(f"**指標共振分數：{reso_score}** ({reso_status})\n\n*(門檻：{st.session_state.min_reso_score} 分)*")
                 st.markdown("---")
+                
+                # === [鬆散耦合] 插入老手實戰濾網結果 ===
+                st.markdown("### 🧙‍♂️ 老手實戰交易濾網 (獨立評估模組)")
+                expert_res_df = ExpertTradingStrategy.evaluate(df)
+                last_expert = expert_res_df.iloc[-1]
+                
+                col_e1, col_e2, col_e3 = st.columns(3)
+                with col_e1:
+                    if last_expert['RSI盤整']:
+                        st.error("⚠️ **震盪盤整中**\n\n(RSI 45~55糾結，建議停用指標改看區間)")
+                    else:
+                        st.success("✅ **具備趨勢動能**\n\n(脫離盤整區，指標參考價值高)")
+                with col_e2:
+                    m_tf_advice = ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
+                    st.info(f"**多週期 KD 狀態：**\n\n{m_tf_advice}")
+                with col_e3:
+                    pos_advice = ExpertTradingStrategy.get_position_advice(last_expert['多空指標數'])
+                    st.warning(f"**三指標共振持股建議：**\n\n{pos_advice} (同步偏多數: {last_expert['多空指標數']})")
+                st.markdown("---")
+                # ==========================================
                 
                 st.markdown(f"**更新日期：{last_date} | 最新收盤價：{last_row['Close']:.2f}**")
                 with st.container(height=165):
@@ -1173,6 +1264,10 @@ with tab2:
                         df = TechnicalIndicators.add_kd(df)
                         df = TechnicalIndicators.add_macd(df)
                         
+                        # === [鬆散耦合] 導入老手濾網指標與運算 ===
+                        df = TechnicalIndicators.add_rsi(df)
+                        expert_res_df = ExpertTradingStrategy.evaluate(df)
+                        
                         df['Pct_Change'] = df['Close'].pct_change() * 100
                         df['Volume_Lots'] = df['Volume'] / 1000
                         df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -1247,6 +1342,7 @@ with tab2:
                         
                         if best_row is not None:
                             clean_ticker = ticker.split('.')[0]
+                            last_expert = expert_res_df.iloc[-1 - best_offset] # 對應時間點的老手判定
                             
                             # 評估進場位置建議
                             rec_status = "-"
@@ -1269,7 +1365,11 @@ with tab2:
                                 "反轉分數": round(float(best_row['Candle_Score']), 2),
                                 "VCP分數": round(float(best_row['VCP_Score']), 2),
                                 "共振分數": round(float(best_row['Reso_Score']), 2),
-                                "進場位置建議": rec_status
+                                "進場位置建議": rec_status,
+                                # === [鬆散耦合] 新增老手實戰匯出欄位 ===
+                                "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
+                                "建議水位": ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
+                                "多週期KD": ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
                             }
                     except Exception: continue
             except Exception: pass
@@ -1420,8 +1520,8 @@ with tab2:
             status_text.empty(); progress_bar.empty()
             
             res_df = pd.DataFrame(final_results)
-            # 在基礎欄位中加入新的 DIF、KD金叉判定、MACD金叉判定
-            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            # === [鬆散耦合] 在基礎欄位中加入新的老手實戰欄位 ===
+            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
             
             # 動態加入新增的 MA 欄位
             if OUTPUT_COLUMN_CONFIG.get("show_ma120_240_bear_align", True):
