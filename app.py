@@ -67,7 +67,7 @@ DEFAULT_PARAMS = {
     "require_cross_confirm": True,
     "use_cross_position_filter": True,
     "cross_position_threshold": 70.0,
-    "use_weekly_filter": True, # [新增] 週K共振與背離判定預設開啟
+    "use_weekly_filter": True, # 週K共振與背離判定預設開啟
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -186,7 +186,7 @@ class ExpertTradingStrategy:
         return "🔴 同步轉空 (觀望)"
 
 # ==========================================
-# [新增] 週K線共振與背離獨立運算模組
+# 週K線共振與背離獨立運算模組
 # ==========================================
 class WeeklyAnalysisStrategy:
     @staticmethod
@@ -1109,6 +1109,15 @@ with tab2:
     
     with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
         st.markdown("""
+        **【演算法核心邏輯說明】**
+        *   **底部翻轉 (Bottom Reversal)**：尋找下跌趨勢末端的轉折訊號。邏輯包含：K線下影線長度需大於實體與整體波動的一定比例（如釘子線），或出現低檔帶量長紅K。分數越高代表買盤反撲力道越強。
+        *   **VCP收斂 (Volatility Contraction)**：尋找均線多頭排列且進行量縮震盪的標的。邏輯：股價站上月線且大於季線、近期成交量低於月均量（量縮），且布林通道極度壓縮。分數越高代表收斂越緊密。
+        *   **指標共振 (Indicator Resonance)**：結合動能與趨勢的雙重確認。邏輯：KD指標在指定天數內發生低檔背離或金叉，同時MACD柱狀體縮腳翻揚或突破零軸金叉。兩者同步發出多頭訊號即判定為共振。
+        *   **老手實戰濾網 (Expert Filter)**：包含盤整過濾（RSI 45-55糾結）、部位建議（綜合KD、MACD、RSI偏多數量）、多週期KD（結合週KD與日KD判斷大方向與小轉折）。
+        
+        ---
+        
+        **【詳細參數設定對照表】**
         | 參數名稱 | 模組分類 | 定義與邏輯說明 |
         | :--- | :--- | :--- |
         | **回測基準日** | 基礎過濾 | 啟用後，系統下載的歷史資料將自動截斷至該日期。讓您能精準回到過去任意一天執行策略回測。 |
@@ -1364,9 +1373,13 @@ with tab2:
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
                         
-                        # 儲存供稍後詳細表格顯示用
+                        # 將 expert_res_df 與原資料整合，供個股測試時完整呈現
                         if scan_target_mode == "指定個股測試":
-                            st.session_state.test_stock_df = df.copy()
+                            combined_debug = df.copy()
+                            for c in expert_res_df.columns:
+                                if c not in combined_debug.columns:
+                                    combined_debug[c] = expert_res_df[c]
+                            st.session_state.test_stock_df = combined_debug
                             st.session_state.test_ticker_name = stock_dict.get(ticker, ticker)
                         
                         best_combined_score = -1
@@ -1501,7 +1514,7 @@ with tab2:
                                 is_bear = c_ma120 < c_ma240
                                 item['年線/半年線空排'] = "✅ 是" if is_bear else "❌ 否"
                                 
-                            # === [新增] 週K共振與背離 (傳入長天期數據) ===
+                            # 週K共振與背離 (傳入長天期數據)
                             if st.session_state.use_weekly_filter:
                                 wk_res = WeeklyAnalysisStrategy.evaluate(
                                     long_df, div_pairs, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, price_col_for_div
@@ -1582,7 +1595,7 @@ with tab2:
             
             base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
             
-            # === 動態插入週K判定欄位 ===
+            # 動態插入週K判定欄位
             if st.session_state.use_weekly_filter:
                 insert_idx = base_cols.index('盤整過濾') + 1
                 base_cols.insert(insert_idx, '週K共振')
@@ -1678,7 +1691,7 @@ with tab2:
             if target_mode_saved == '指定個股測試' and 'test_stock_df' in st.session_state:
                 st.markdown("---")
                 st.markdown(f"### 🛠️ 參數測試詳細指標結果 - {st.session_state.get('test_ticker_name', '')}")
-                st.write("顯示回測設定區間內的每日指標計算結果，協助您觀察分數變化與調整門檻參數。")
+                st.write("顯示回測設定區間內的每日指標計算結果，協助您觀察分數變化與調整門檻參數 (全中文欄位整合展示)。")
                 
                 debug_df = st.session_state.test_stock_df.copy()
                 if not debug_df.empty:
@@ -1696,18 +1709,42 @@ with tab2:
                     
                     debug_df = debug_df.iloc[start_idx:end_idx].copy()
                     
+                    # 補齊要展示的底層資訊
                     debug_df['BB_Width(%)'] = (debug_df['BB_Upper'] - debug_df['BB_Lower']) / (debug_df['MA20'] + 1e-8) * 100
                     
-                    show_cols = ['Close', 'Low', 'Volume_Lots', 'Vol_MA20', 'Candle_Score', 'VCP_Score', 'Reso_Score', 'K', 'D', 'MACD', 'MACD_Hist', 'BB_Width(%)']
+                    # 進行所有輸出欄位的統一命名與去重複 (映射為全中文欄位)
+                    rename_map = {
+                        'Close': '收盤價',
+                        'Low': '最低價',
+                        'Volume_Lots': '成交量(張)',
+                        'Vol_MA20': '月均量(張)',
+                        'Candle_Score': '反轉分數',
+                        'VCP_Score': 'VCP分數',
+                        'Reso_Score': '共振分數',
+                        'K': 'K值',
+                        'D': 'D值',
+                        'MACD': 'MACD_DIF',
+                        'MACD_Hist': 'MACD柱狀體',
+                        'BB_Width(%)': '布林寬度(%)',
+                        'KD_Cross_Recent': 'KD近期金叉',
+                        'MACD_Cross_Recent': 'MACD近期金叉',
+                        'RSI盤整': 'RSI盤整中',
+                        '多空指標數': '多空指標數',
+                        '日KD多': '日KD偏多',
+                        '週KD多': '週KD偏多'
+                    }
+                    
+                    show_cols = list(rename_map.keys())
                     show_cols = [c for c in show_cols if c in debug_df.columns]
                     
                     disp_df = debug_df[show_cols].sort_index(ascending=False)
+                    disp_df.rename(columns=rename_map, inplace=True)
                     disp_df.index = disp_df.index.strftime('%Y-%m-%d')
                     
                     format_dict = {
-                        'Close': "{:.2f}", 'Low': "{:.2f}", 'Volume_Lots': "{:.0f}", 'Vol_MA20': "{:.0f}",
-                        'Candle_Score': "{:.2f}", 'VCP_Score': "{:.2f}", 'Reso_Score': "{:.2f}",
-                        'K': "{:.2f}", 'D': "{:.2f}", 'MACD': "{:.3f}", 'MACD_Hist': "{:.3f}", 'BB_Width(%)': "{:.2f}"
+                        '收盤價': "{:.2f}", '最低價': "{:.2f}", '成交量(張)': "{:.0f}", '月均量(張)': "{:.0f}",
+                        '反轉分數': "{:.2f}", 'VCP分數': "{:.2f}", '共振分數': "{:.2f}",
+                        'K值': "{:.2f}", 'D值': "{:.2f}", 'MACD_DIF': "{:.3f}", 'MACD柱狀體': "{:.3f}", '布林寬度(%)': "{:.2f}"
                     }
                     
                     st.dataframe(disp_df.style.format(format_dict), use_container_width=True)
