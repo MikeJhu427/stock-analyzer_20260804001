@@ -443,7 +443,7 @@ class DivergenceStrategy:
         return False
 
 # ==========================================
-# 模組 3：三表交叉分析與異常診斷引擎 (V6 成長防誤判升級版)
+# 模組 3：三表交叉分析與異常診斷引擎 (V7 獲利品質與金融豁免升級版)
 # ==========================================
 class FinancialAuditStrategy:
     @staticmethod
@@ -507,6 +507,17 @@ class FinancialAuditStrategy:
     def evaluate(ticker_symbol, session):
         try:
             stock = yf.Ticker(ticker_symbol, session=session)
+            
+            # --- 金融業識別機制 ---
+            ticker_base = str(ticker_symbol).split('.')[0]
+            is_financial = ticker_base.startswith('28') or ticker_base.startswith('58') or ticker_base.startswith('60')
+            try:
+                if not is_financial:
+                    if stock.info.get('sector') == 'Financial Services':
+                        is_financial = True
+            except Exception:
+                pass
+            
             inc_stmt = FinancialAuditStrategy._normalize_statement(stock.quarterly_income_stmt)
             bal_sheet = FinancialAuditStrategy._normalize_statement(stock.quarterly_balance_sheet)
             cash_flow = FinancialAuditStrategy._normalize_statement(stock.quarterly_cashflow)
@@ -583,6 +594,8 @@ class FinancialAuditStrategy:
             v_cl = val_at(contract_liab, latest)
             v_cash = val_at(cash, latest)
             v_debt = val_at(debt, latest) if pd.notna(val_at(debt, latest)) else 0.0
+            v_assets = val_at(t_assets, latest)
+            v_equity = val_at(equity, latest)
             
             # --- Extract Trends (4Q) ---
             t4_rev = get_trend(revenue, periods_4q)
@@ -617,6 +630,11 @@ class FinancialAuditStrategy:
             cfo_ni_ratio = FinancialAuditStrategy._ratio(v_cfo, v_ni)
             cl_rev_ratio = FinancialAuditStrategy._ratio(v_cl, v_rev) * 100
             
+            # ROE & ROA Annualized
+            roe_annual = (v_ni / v_equity * 4 * 100) if pd.notna(v_ni) and pd.notna(v_equity) and v_equity > 0 else np.nan
+            roa_annual = (v_ni / v_assets * 4 * 100) if pd.notna(v_ni) and pd.notna(v_assets) and v_assets > 0 else np.nan
+            equity_multiplier = (v_assets / v_equity) if pd.notna(v_assets) and pd.notna(v_equity) and v_equity > 0 else np.nan
+            
             dso = (v_ar / v_rev) * 90 if (pd.notna(v_rev) and v_rev > 0 and pd.notna(v_ar)) else np.nan
             if pd.notna(v_cogs) and v_cogs > 0 and pd.notna(v_inv):
                 inv_days = (v_inv / v_cogs) * 90
@@ -626,7 +644,7 @@ class FinancialAuditStrategy:
                 inv_days = np.nan
 
             # ==========================================
-            # 交叉診斷與風險共振分析引擎 (V6重構)
+            # 交叉診斷與風險共振分析引擎 (V7重構)
             # ==========================================
             cross_analysis = []
             risk_resonance = []
@@ -738,11 +756,18 @@ class FinancialAuditStrategy:
                 
                 if rev_stalled and cl_state != "A" and not inv_surge:
                     cfo_neg_count = sum([1 for val in t4_cfo if pd.notna(val) and val < 0])
-                    if cfo_neg_count >= 2:
+                    # 金融業免除借款壓力判定
+                    debt_crisis = False if is_financial else (pd.notna(v_debt) and pd.notna(v_cash) and v_cash > 0 and (v_debt > v_cash * 2.5))
+                    
+                    if cfo_neg_count >= 2 and (rev_stalled or debt_crisis):
                         is_black_bankruptcy = True
                         risk_score += 30
-                        cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負且缺乏營收成長動能，獲利品質嚴重堪慮。")
-                        risk_resonance.append("🚨【黑字倒閉風險】長期獲利無法轉化為現金，且無成長擴張支撐，公司靠吃老本或借款維持，屬重大財務警訊。")
+                        if not is_financial:
+                            cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負且缺乏營收成長動能或面臨債務壓力，獲利品質嚴重堪慮。")
+                            risk_resonance.append("🚨【黑字倒閉風險】長期獲利無法轉化為現金，且無成長擴張支撐，公司靠吃老本或借款維持，屬重大財務警訊。")
+                        else:
+                            cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負，需留意營運資金流動性。")
+                            risk_resonance.append("🚨【現金流耗損風險】長期獲利無法轉化為現金，營業現金流持續流出。")
                         watch_list.append("CFO 必須盡快轉正，否則面臨流動性危機。")
                 else:
                     rev_high_growth = (pd.notna(rev_qoq) and rev_qoq > 10) or (pd.notna(rev_yoy) and rev_yoy > 10)
@@ -803,14 +828,46 @@ class FinancialAuditStrategy:
                 else:
                     risk_score += 15
             
-            # 資本失衡加罰 (致命級別)
-            if pd.notna(v_debt) and pd.notna(v_cash) and v_cash > 0 and (v_debt > v_cash * 2.0) and pd.notna(v_ni) and v_ni < 0:
-                risk_score += 15
-                if risk_score < 70: risk_score = 70
-                risk_resonance.append("🚨【資本結構失衡】高額負債伴隨營運虧損，償債能力高度堪慮。")
-            # 一般債務壓力
-            elif pd.notna(v_cash) and pd.notna(v_debt) and v_debt > v_cash * 1.5: 
-                risk_score += 15
+            # 債務與資本結構壓力 (金融業智能豁免)
+            if pd.notna(v_cash) and pd.notna(v_debt) and v_debt > v_cash * 1.5:
+                if not is_financial:
+                    # 一般企業資本失衡加罰 (致命級別)
+                    if v_debt > v_cash * 2.0 and pd.notna(v_ni) and v_ni < 0:
+                        risk_score += 15
+                        if risk_score < 70: risk_score = 70
+                        risk_resonance.append("🚨【資本結構失衡】高額負債伴隨營運虧損，償債能力高度堪慮。")
+                    else:
+                        risk_score += 15
+                else:
+                    if "【金融業特性】負債結構主要為客戶存款與壽險準備金，不適用一般製造業負債比率評估。" not in cross_analysis:
+                        cross_analysis.append("【金融業特性】負債結構主要為客戶存款與壽險準備金，不適用一般製造業負債比率評估。")
+
+            # --- 7. ROE / ROA 獲利能力與杜邦槓桿診斷 ---
+            if pd.notna(roe_annual):
+                if roe_annual >= 20: quality_score += 15
+                elif roe_annual >= 12: quality_score += 10
+                elif roe_annual >= 8: quality_score += 5
+                elif roe_annual < 0: quality_score -= 10; risk_score += 10
+                
+            if pd.notna(roa_annual):
+                if not is_financial:
+                    if roa_annual >= 10: quality_score += 10
+                    elif roa_annual < 0: risk_score += 10
+                else:
+                    if roa_annual >= 1.0: quality_score += 10
+                    elif roa_annual >= 0.6: quality_score += 5
+                    elif roa_annual < 0: risk_score += 10
+
+            # 杜邦槓桿虛胖與高效率造血診斷
+            if not is_financial:
+                if (pd.notna(roe_annual) and roe_annual > 15 and pd.notna(roa_annual) and roa_annual < 3) or (pd.notna(equity_multiplier) and equity_multiplier > 4.5):
+                    risk_score += 10
+                    risk_resonance.append("⚠️【高財務槓桿推升 ROE】股東權益報酬率主要依賴高負債支撐，實質資產利用率偏弱，需留意景氣下行時的償債壓力。")
+                elif pd.notna(roe_annual) and roe_annual > 15 and pd.notna(roa_annual) and roa_annual >= 10:
+                    positives.append("💎【高效率造血】資產與股東權益報酬率優異，具備實質競爭優勢與定價權。")
+            else:
+                if pd.notna(roe_annual) and roe_annual > 15 and pd.notna(roa_annual) and roa_annual >= 1.0:
+                    positives.append("💎【高效率造血】資產與股東權益報酬率優異，具備實質競爭優勢與定價權。")
 
             # 分數上下界限安全處理
             quality_score = min(100, max(0, int(quality_score)))
@@ -841,6 +898,8 @@ class FinancialAuditStrategy:
             core_metrics = [
                 {"指標": "營業收入 (Revenue)", "最新": fmt(v_rev), "QoQ": fmt(rev_qoq, "%"), "YoY": fmt(rev_yoy, "%"), "4Q趨勢": t4_rev},
                 {"指標": "稅後淨利 (Net Income)", "最新": fmt(v_ni), "QoQ": fmt(ni_qoq, "%"), "YoY": fmt(ni_yoy, "%"), "4Q趨勢": t4_ni},
+                {"指標": "年化 ROE (股東權益報酬率)", "最新": fmt(roe_annual, "%"), "QoQ": "-", "YoY": "-", "4Q趨勢": []},
+                {"指標": "年化 ROA (資產報酬率)", "最新": fmt(roa_annual, "%"), "QoQ": "-", "YoY": "-", "4Q趨勢": []},
                 {"指標": "營業現金流 (CFO)", "最新": fmt(v_cfo), "QoQ": fmt(cfo_qoq, "%"), "YoY": fmt(cfo_yoy, "%"), "4Q趨勢": t4_cfo},
                 {"指標": "應收帳款 (AR)", "最新": fmt(v_ar), "QoQ": fmt(ar_qoq, "%"), "YoY": fmt(ar_yoy, "%"), "4Q趨勢": t4_ar},
                 {"指標": "存貨 (Inventory)", "最新": fmt(v_inv), "QoQ": fmt(inv_qoq, "%"), "YoY": fmt(inv_yoy, "%"), "4Q趨勢": t4_inv},
@@ -883,6 +942,8 @@ class FinancialAuditStrategy:
                 "watch_list": watch_list,
                 
                 # For Batch Mode fallback compatibility
+                "ROE年化(%)": roe_annual,
+                "ROA年化(%)": roa_annual,
                 "營收成長(%)": rev_qoq,
                 "毛利率": gm_latest,
                 "營益率": om_latest,
@@ -1873,7 +1934,7 @@ with tab2:
                 st.success("✅ **傳送成功！已自動載入標的。** 請手動點擊上方的 **【📑 財報三表地雷掃描／財報體質與風險分析】** 分頁查看綜合評分（系統將自動從最佳到最差排序）。")
 
 # ----------------------------------------------------
-# 頁籤 3：財報三表地雷掃描／財報體質與風險分析 (V6 成長防誤判升級版)
+# 頁籤 3：財報三表地雷掃描／財報體質與風險分析 (V7 獲利品質與金融豁免升級版)
 # ----------------------------------------------------
 def render_trend_sparkline(trend_list):
     """將趨勢陣列轉換為簡單的視覺化文字"""
@@ -2014,6 +2075,8 @@ with tab3:
                             "體質分數": res["體質分數"],
                             "風險分數": res["風險分數"],
                             "合約負債判定": res["cl_status"].split(" ")[0] if " " in res["cl_status"] else res["cl_status"],
+                            "ROE年化(%)": f"{res['ROE年化(%)']:.2f}%" if pd.notna(res.get('ROE年化(%)')) else "-",
+                            "ROA年化(%)": f"{res['ROA年化(%)']:.2f}%" if pd.notna(res.get('ROA年化(%)')) else "-",
                             "營收YoY(%)": f"{res['營收成長(%)']:.2f}%" if pd.notna(res['營收成長(%)']) else "-",
                             "毛利率(%)": f"{res['毛利率']:.2f}%" if pd.notna(res['毛利率']) else "-",
                             "營益率(%)": f"{res['營益率']:.2f}%" if pd.notna(res['營益率']) else "-",
