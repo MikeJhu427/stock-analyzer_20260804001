@@ -626,101 +626,142 @@ class FinancialAuditStrategy:
                 inv_days = np.nan
 
             # ==========================================
-            # 交叉診斷與風險共振分析引擎
+            # 交叉診斷與風險共振分析引擎 (V6重構)
             # ==========================================
             cross_analysis = []
             risk_resonance = []
             positives = []
             watch_list = []
             
+            quality_score = 50
+            risk_score = 20
+            
             has_cl = not contract_liab.empty and not pd.isna(v_cl)
             
-            # --- 1. 合約負債判定邏輯 (Contract Liabilities Logic) ---
+            # --- 1. 虧損逃逸漏洞封殺 (Deficit / Loss Logic) ---
+            if pd.notna(v_ni) and v_ni < 0:
+                quality_score -= 15
+                risk_score += 15
+            if pd.notna(v_op) and v_op < 0:
+                quality_score -= 10
+                risk_score += 10
+                
+            # 致命警訊：本業造血枯竭
+            if ((pd.notna(v_op) and v_op < 0) or (pd.notna(v_ni) and v_ni < 0)) and (pd.notna(v_cfo) and v_cfo < 0):
+                risk_score += 25
+                quality_score -= 15
+                risk_resonance.append("🚨【本業造血枯竭】本業營運虧損且營運現金流持續淨流出，面臨實質流動性考驗。")
+
+            # 連續虧損累進懲罰
+            loss_count = sum([1 for val in t4_ni if pd.notna(val) and val < 0])
+            if loss_count >= 2:
+                risk_score += 15
+                quality_score -= 10
+                risk_resonance.append("🚨【長期營運虧損】近四季多次出現虧損，獲利動能嚴重匱乏。")
+
+            # --- 2. 合約負債精細化三態判定 (Contract Liabilities Logic) ---
             cl_status = "無資料"
+            cl_state = "None"
+            
             if has_cl:
-                cl_4q_trend = sum([1 for i in range(1, len(t4_cl)) if pd.notna(t4_cl[i]) and pd.notna(t4_cl[i-1]) and t4_cl[i] > t4_cl[i-1]])
-                if pd.notna(cl_yoy) and cl_yoy > 10 and pd.notna(rev_yoy) and rev_yoy > 5 and pd.notna(v_cfo) and v_cfo > 0:
-                    cl_status = "🟢 收割期 (驗收放量)"
-                    cross_analysis.append("【合約負債 → 營收/現金】合約負債年增且帶動營收與 CFO 成長，顯示訂單能見度高且確實收到現金。")
-                elif (pd.notna(cl_yoy) and cl_yoy > 10) or (pd.notna(cl_qoq) and cl_qoq > 10):
-                    cl_status = "🚀 正向擴張 (接單積極)"
-                    cross_analysis.append("【合約負債】客戶預付款與遞延收入高增長，具備強烈未來營收認列潛力。")
-                elif pd.notna(cl_yoy) and cl_yoy > 5:
-                    if pd.notna(rev_yoy) and rev_yoy <= 0:
-                        cl_status = "🟡 觀察 (負債增加但營收尚未發酵)"
-                        cross_analysis.append("【合約負債 → 營收】合約負債增加，但後續營收尚未明顯增長，需觀察下季遞延收入認列狀況。")
-                    else:
-                        cl_status = "🟢 正向 (訂單/預付款穩健增加)"
-                        cross_analysis.append("【合約負債】客戶預付款穩健增加。")
-                elif pd.notna(cl_yoy) and cl_yoy < -15 and pd.notna(rev_yoy) and rev_yoy < 0:
-                    cl_status = "🔴 可能異常 (訂單動能衰退)"
-                    cross_analysis.append("【合約負債 → 營收】合約負債與營收同步衰退，可能代表整體市場需求與客戶下單動能減弱。")
+                cl_qoq_val = cl_qoq if pd.notna(cl_qoq) else 0
+                cl_yoy_val = cl_yoy if pd.notna(cl_yoy) else 0
+                rev_qoq_val = rev_qoq if pd.notna(rev_qoq) else 0
+                rev_yoy_val = rev_yoy if pd.notna(rev_yoy) else 0
+                inv_inc = (pd.notna(inv_qoq) and inv_qoq > 0) or (pd.notna(inv_yoy) and inv_yoy > 0)
+
+                # 狀態 A: 大單蓄水 / 擴張期
+                if (cl_yoy_val > 10 or cl_qoq_val > 10) and inv_inc:
+                    cl_state = "A"
+                    cl_status = "🚀 正向擴張 (接單強勁，營運資金積極備料)"
+                    cross_analysis.append("【合約負債】客戶預付款與遞延收入高增長伴隨存貨增加，具備強烈未來營收認列潛力。")
+                # 狀態 B: 正常履約 / 營收轉化期
+                elif (cl_qoq_val < 0 or cl_yoy_val < -5) and (rev_qoq_val > 0 or rev_yoy_val > 0):
+                    cl_state = "B"
+                    cl_status = "🟢 履約轉化 (前期訂單陸續驗收並轉列營收，屬健康循環)"
+                    cross_analysis.append("【合約負債 → 營收】合約負債減少，但當期營收維持成長，顯示前期訂單順利驗收轉列營收。")
+                # 狀態 C: 訂單衰退 / 需求萎縮
+                elif cl_yoy_val < -15 and rev_yoy_val <= 0:
+                    cl_state = "C"
+                    cl_status = "🔴 可能異常 (訂單動能萎縮)"
+                    cross_analysis.append("【合約負債 → 營收】合約負債大幅衰退且營收零成長或衰退，整體市場需求與下單動能萎縮。")
+                    risk_resonance.append("🚨【訂單動能衰退】合約負債大幅減少且營收熄火，未來業績恐缺乏支撐。")
+                elif cl_yoy_val > 5:
+                    cl_status = "🟢 正向 (訂單/預付款穩健增加)"
+                    cross_analysis.append("【合約負債】客戶預付款穩健增加。")
                 else:
                     cl_status = "⚪ 中性波動"
             else:
                 cl_status = "⚪ 合約負債資料不足，未納入此項評分"
 
-            # --- 2. 存貨動態風險防護機制 (Inventory Surge Logic) ---
-            inv_surge = (pd.notna(inv_qoq) and inv_qoq > 15) or (pd.notna(inv_yoy) and inv_yoy > 15)
-            has_cl_support = has_cl and ((pd.notna(cl_qoq) and cl_qoq > 10) or (pd.notna(cl_yoy) and cl_yoy > 10))
+            # --- 3. 存貨動態風險防護與滯銷重擊 (Inventory Surge Logic) ---
+            inv_surge = (pd.notna(inv_qoq) and inv_qoq > 15) or (pd.notna(inv_yoy) and inv_yoy > 20)
             has_rev_support = (pd.notna(rev_qoq) and rev_qoq > 10) or (pd.notna(rev_yoy) and rev_yoy > 10)
+            rev_declining = (pd.notna(rev_qoq) and rev_qoq < 0) or (pd.notna(rev_yoy) and rev_yoy < 0)
 
             if inv_surge:
-                if has_cl_support or has_rev_support:
+                if cl_state == "A" or has_rev_support:
+                    quality_score += 10
+                    risk_score -= 10
                     cross_analysis.append("【存貨 ↔ 營收/訂單共振】營運規模擴張之積極備料，大幅抵銷存貨跌價與滯銷風險。")
-                    positives.append("存貨大幅增加具備「合約負債」或「營收高成長」作為實質支撐，無庫存去化隱憂。")
-                elif pd.notna(rev_qoq) and rev_qoq < 0 and not has_cl_support:
+                    positives.append("存貨大幅增加具備「合約負債支持」或「營收高成長」作為實質支撐，判定為健康備料。")
+                elif cl_state == "C" or (rev_declining and pd.notna(v_cfo) and v_cfo < 0):
+                    risk_score += 25
                     cross_analysis.append("【存貨 ↔ 營收/CFO】營收衰退且無合約負債支撐，存貨卻大幅上升，營運資金遭嚴重積壓。")
-                    risk_resonance.append("【存貨去化危機】營收轉弱且缺乏訂單支撐，但存貨持續堆積，具備庫存跌價與資金斷鏈風險。")
+                    risk_resonance.append("🚨【存貨去化危機】營收轉弱且缺乏訂單支撐，但存貨持續堆積，具備極高庫存跌價與資金斷鏈風險。")
                     watch_list.append("密切追蹤存貨週轉天數是否持續攀升、是否有打呆帳風險。")
                 else:
                     cross_analysis.append("【存貨 ↔ 營收】存貨急升但缺乏相應幅度的訂單或營收支撐，需謹慎觀察去化能力。")
                     watch_list.append("存貨去化速度與後續營收是否跟上。")
 
-            # --- 3. 獲利 ↔ 現金流深度判定 (Black Bankruptcy vs. Growth Expansion) ---
+            # 存貨天數 (DIO)
+            if pd.notna(inv_days):
+                rev_not_declining = (pd.notna(rev_qoq) and rev_qoq >= 0) or (pd.notna(rev_yoy) and rev_yoy >= 0)
+                rev_negative_growth = (pd.notna(rev_qoq) and rev_qoq < 0) and (pd.notna(rev_yoy) and rev_yoy < 0)
+                
+                if inv_days > 150 and pd.notna(gm_latest) and gm_latest >= 22 and rev_not_declining and cl_state != "C":
+                    watch_list.append("存貨天數較長，但符合高毛利與營收未衰退要件，視為長製造週期產業特性，不扣分。")
+                elif inv_days > 250 and rev_negative_growth:
+                    risk_score += 15
+                    quality_score -= 10
+                    risk_resonance.append("🚨【滯銷風險】存貨週轉天數極長且營收呈現負成長，庫存去化困難。")
+                elif inv_days > 150:
+                    risk_score += 10
+                    quality_score -= 5
+
+            # --- 4. 黑字倒閉 vs 成長擴張型失血 防誤判機制 ---
             is_growth_expansion = False
             is_black_bankruptcy = False
 
             if pd.notna(v_ni) and v_ni > 0 and pd.notna(v_cfo) and v_cfo < 0:
-                cfo_neg_count = sum([1 for val in t4_cfo if pd.notna(val) and val < 0])
-                rev_high_growth = (pd.notna(rev_qoq) and rev_qoq > 10) or (pd.notna(rev_yoy) and rev_yoy > 10)
-                wc_increased = (pd.notna(inv_qoq) and inv_qoq > 0) or (pd.notna(ar_qoq) and ar_qoq > 0) or (pd.notna(inv_yoy) and inv_yoy > 0) or (pd.notna(ar_yoy) and ar_yoy > 0)
+                rev_stalled = (pd.notna(rev_qoq) and rev_qoq <= 5) and (pd.notna(rev_yoy) and rev_yoy <= 0)
                 
-                # 判斷是否為良性備料擴張
-                if rev_high_growth and wc_increased:
-                    is_growth_expansion = True
-                    positives.append("🟢 成長型營運資金擴張 (大單出貨前夕之營運資金墊高，非經營危機)。")
-                    cross_analysis.append("【獲利 ↔ CFO】獲利良好且營收高增長，CFO為負純屬存貨/應收備料墊高營運資金，屬良性擴張。")
-                else:
-                    # 嚴格判斷真黑字倒閉
-                    rev_stalled = (pd.notna(rev_qoq) and rev_qoq <= 5) and (pd.notna(rev_yoy) and rev_yoy <= 0)
-                    debt_crisis = pd.notna(v_debt) and pd.notna(v_cash) and v_cash > 0 and (v_debt > v_cash * 2.5)
-                    
-                    if cfo_neg_count >= 2 and (rev_stalled or debt_crisis):
+                if rev_stalled and cl_state != "A" and not inv_surge:
+                    cfo_neg_count = sum([1 for val in t4_cfo if pd.notna(val) and val < 0])
+                    if cfo_neg_count >= 2:
                         is_black_bankruptcy = True
-                        cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負且缺乏營收成長動能或面臨債務壓力，獲利品質嚴重堪慮。")
-                        risk_resonance.append("【黑字倒閉風險】長期獲利無法轉化為現金，公司靠吃老本或借款維持營運資金，屬重大財務警訊。")
+                        risk_score += 30
+                        cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負且缺乏營收成長動能，獲利品質嚴重堪慮。")
+                        risk_resonance.append("🚨【黑字倒閉風險】長期獲利無法轉化為現金，且無成長擴張支撐，公司靠吃老本或借款維持，屬重大財務警訊。")
                         watch_list.append("CFO 必須盡快轉正，否則面臨流動性危機。")
-                    elif cfo_neg_count >= 2:
-                        cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正但 CFO 為負，資金持續淨流出，需留意營運資金控管。")
-                        watch_list.append("確認下季 CFO 是否能回穩轉正。")
-                    else:
-                        cross_analysis.append("【獲利 ↔ CFO】本季淨利為正但 CFO 為負，可能因短期營運資金墊高所致。")
-                        watch_list.append("確認下季 CFO 是否能回穩轉正。")
-                        
-            elif pd.notna(v_ni) and v_ni > 0 and pd.notna(v_cfo) and v_cfo > v_ni * 1.2:
-                cross_analysis.append("【獲利 ↔ CFO】CFO 顯著大於稅後淨利，獲利含金量極高。")
-                positives.append("獲利轉現金能力極強，盈餘品質優良。")
+                else:
+                    rev_high_growth = (pd.notna(rev_qoq) and rev_qoq > 10) or (pd.notna(rev_yoy) and rev_yoy > 10)
+                    wc_increased = (pd.notna(inv_qoq) and inv_qoq > 0) or (pd.notna(ar_qoq) and ar_qoq > 0) or (pd.notna(inv_yoy) and inv_yoy > 0) or (pd.notna(ar_yoy) and ar_yoy > 0)
+                    
+                    if cl_state == "A" or (rev_high_growth and wc_increased):
+                        is_growth_expansion = True
+                        quality_score += 15
+                        risk_score -= 10
+                        positives.append("🟢 成長型營運資金擴張 (大單出貨前夕之營運資金墊高，非經營危機)。")
+                        cross_analysis.append("【獲利 ↔ CFO】獲利良好且具備營收或合約負債高增長，CFO為負純屬存貨/應收備料墊高營運資金，屬良性擴張。")
 
-            # --- 4. 應收帳款風險 (AR to Revenue) ---
+            # --- 5. 應收帳款風險 ---
             if pd.notna(ar_qoq) and ar_qoq > 20 and pd.notna(rev_qoq) and rev_qoq < 5:
-                cross_analysis.append("【營收 ↔ 應收帳款】營收成長停滯，但應收帳款卻大幅增加，有塞貨或放寬授信條件的疑慮。")
-                risk_resonance.append("【應收帳款惡化】資金卡在客戶端，可能衍生呆帳風險並吃掉公司現金。")
+                cross_analysis.append("【營收 ↔ 應收帳款】營收成長停滯，但應收帳款大幅增加，有塞貨或放寬授信條件的疑慮。")
+                risk_resonance.append("🚨【應收帳款惡化】資金卡在客戶端，可能衍生呆帳風險並吃掉公司現金。")
                 watch_list.append("應收帳款天數是否失控攀升。")
             
-            # --- 5. 總結評分與等級 ---
-            quality_score = 50
-            risk_score = 20
+            # --- 6. 綜合加分與懲罰調整 ---
             
             # 毛利率平滑階梯加分
             if pd.notna(gm_latest):
@@ -743,45 +784,33 @@ class FinancialAuditStrategy:
             # 特徵加分
             if has_cl and ("🟢" in cl_status or "🚀" in cl_status or "收割期" in cl_status): 
                 quality_score += 15; risk_score -= 10
-            if is_growth_expansion:
-                quality_score += 15; risk_score -= 10
             if pd.notna(cfo_ni_ratio) and cfo_ni_ratio > 1.0: 
                 quality_score += 15; risk_score -= 10
-            
-            # 存貨天數 (DIO) 產業與危機動態判定
-            if pd.notna(inv_days):
-                if inv_days > 150:
-                    if pd.notna(gm_latest) and gm_latest >= 22 and pd.notna(rev_qoq) and rev_qoq > 5:
-                        watch_list.append("存貨天數較長，但符合高毛利與營收成長要件，視為產業備料常態，免除扣分。")
-                    elif inv_days > 270 and pd.notna(rev_qoq) and rev_qoq < 0:
-                        risk_score += 15
-                        quality_score -= 10
-                    else:
-                        # 落在兩者之間的一般扣分
-                        risk_score += 10
-                        quality_score -= 5
+                positives.append("獲利轉現金能力極強，盈餘品質優良。")
             
             # 收現天數
             if pd.notna(dso) and dso > 120: 
                 risk_score += 15; quality_score -= 5
             
-            # CFO 為負之動態懲罰
+            # CFO 為負之動態懲罰 (排除已經判定過的擴張與黑字倒閉)
             if pd.notna(v_cfo) and v_cfo < 0:
                 if is_growth_expansion:
-                    if pd.notna(rev_qoq) and rev_qoq > 20:
-                        pass # 完全免除
-                    else:
-                        risk_score += 5 # 大單備料期，僅微扣 5 分
+                    pass
+                elif is_black_bankruptcy:
+                    pass
+                elif ((pd.notna(v_op) and v_op < 0) or (pd.notna(v_ni) and v_ni < 0)):
+                    pass # 已扣除本業造血枯竭
                 else:
-                    risk_score += 25
+                    risk_score += 15
             
-            # 債務壓力
-            if pd.notna(v_cash) and pd.notna(v_debt) and v_debt > v_cash * 1.5: 
+            # 資本失衡加罰 (致命級別)
+            if pd.notna(v_debt) and pd.notna(v_cash) and v_cash > 0 and (v_debt > v_cash * 2.0) and pd.notna(v_ni) and v_ni < 0:
                 risk_score += 15
-            
-            # Risk Resonance Adjustments (重大警示扣分)
-            if is_black_bankruptcy: risk_score += 30
-            if any("存貨去化危機" in r for r in risk_resonance): risk_score += 20
+                if risk_score < 70: risk_score = 70
+                risk_resonance.append("🚨【資本結構失衡】高額負債伴隨營運虧損，償債能力高度堪慮。")
+            # 一般債務壓力
+            elif pd.notna(v_cash) and pd.notna(v_debt) and v_debt > v_cash * 1.5: 
+                risk_score += 15
 
             # 分數上下界限安全處理
             quality_score = min(100, max(0, int(quality_score)))
@@ -1932,7 +1961,7 @@ with tab3:
                         if "無重大風險" in text:
                             st.success(f"- {text}")
                         else:
-                            st.error(f"- 🚨 {text}")
+                            st.error(f"- {text}")
                             
                     st.markdown("---")
                     st.markdown("### 【六、正向特徵】")
