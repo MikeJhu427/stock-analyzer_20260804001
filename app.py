@@ -608,6 +608,7 @@ class FinancialAuditStrategy:
             
             ar_qoq = FinancialAuditStrategy._growth(v_ar, val_at(ar, q1_ago))
             inv_qoq = FinancialAuditStrategy._growth(v_inv, val_at(inventory, q1_ago))
+            inv_yoy = FinancialAuditStrategy._growth(v_inv, val_at(inventory, q4_ago))
             
             gm_latest = FinancialAuditStrategy._ratio(v_gp, v_rev) * 100
             om_latest = FinancialAuditStrategy._ratio(v_op, v_rev) * 100
@@ -632,15 +633,27 @@ class FinancialAuditStrategy:
             watch_list = []
             
             has_cl = not contract_liab.empty and not pd.isna(v_cl)
+            is_harvesting = False
+            is_accumulating = False
             
             # --- 1. 合約負債判定邏輯 (Contract Liabilities Logic) ---
             cl_status = "無資料"
             if has_cl:
                 cl_4q_trend = sum([1 for i in range(1, len(t4_cl)) if pd.notna(t4_cl[i]) and pd.notna(t4_cl[i-1]) and t4_cl[i] > t4_cl[i-1]])
-                if pd.notna(cl_yoy) and cl_yoy > 10 and pd.notna(rev_yoy) and rev_yoy > 5 and v_cfo > 0:
-                    cl_status = "🟢 正向 (客戶預付增加且轉化為營收與現金)"
-                    cross_analysis.append("【合約負債 → 營收/現金】合約負債年增且帶動營收與 CFO 成長，顯示訂單能見度高且確實收到現金。")
-                    positives.append("客戶預付款/合約負債帶動營運資金正向循環。")
+                
+                cl_surge_accum = (pd.notna(cl_yoy) and cl_yoy > 10) or (pd.notna(cl_qoq) and cl_qoq > 10)
+                inv_surge_accum = (pd.notna(inv_yoy) and inv_yoy > 15) or (pd.notna(inv_qoq) and inv_qoq > 10)
+                
+                if cl_surge_accum and inv_surge_accum:
+                    is_accumulating = True
+                    cl_status = "🚀 正向擴張 (接單強勁，營運資金積極備料)"
+                    cross_analysis.append("【合約負債 ↔ 存貨】合約負債與存貨同步高增長，屬大單出貨前之擴張期，接單強勁且營運資金積極備料。")
+                    positives.append("🚀 蓄水期 (大單備料)：客戶預付款/合約負債帶動營運資金正向循環(積極備料)。")
+                elif pd.notna(cl_yoy) and cl_yoy > 0 and pd.notna(rev_yoy) and rev_yoy > 0 and pd.notna(v_cfo) and v_cfo > 0:
+                    is_harvesting = True
+                    cl_status = "🟢 收割期 (驗收放量)"
+                    cross_analysis.append("【合約負債 → 營收/現金】合約負債年增且帶動營收與 CFO 成長，顯示訂單順利轉化為實際營收與現金。")
+                    positives.append("收割期：客戶預付款/合約負債順利帶動營運資金正向循環。")
                 elif pd.notna(cl_yoy) and cl_yoy > 5:
                     if pd.notna(rev_yoy) and rev_yoy <= 0:
                         cl_status = "🟡 觀察 (負債增加但營收尚未發酵)"
@@ -659,28 +672,39 @@ class FinancialAuditStrategy:
                 cl_status = "⚪ 合約負債資料不足，未納入此項評分"
 
             # --- 2. 存貨與合約負債/營收共振判定 (Inventory Risk Mitigation) ---
-            if pd.notna(inv_qoq) and inv_qoq > 15:
-                if has_cl and pd.notna(cl_qoq) and cl_qoq > 10 and pd.notna(rev_qoq) and rev_qoq > 5:
-                    cross_analysis.append("【存貨 ↔ 合約負債/營收】存貨雖大增，但合約負債與營收同步成長，屬於「強烈需求帶動之健康備貨」，大幅抵銷存貨滯銷風險。")
-                    positives.append("存貨增加具備合約負債與營收成長作為實質支撐。")
-                elif pd.notna(rev_qoq) and rev_qoq < 0 and v_cfo < 0:
-                    cross_analysis.append("【存貨 ↔ 營收/CFO】營收衰退且 CFO 轉負下，存貨卻大幅上升，營運資金遭嚴重積壓。")
-                    risk_resonance.append("【存貨去化危機】營收與現金流轉弱，但存貨持續堆積，具備庫存跌價與資金斷鏈風險。")
+            is_healthy_inv_surge = False
+            if (pd.notna(inv_qoq) and inv_qoq > 15) or (pd.notna(inv_yoy) and inv_yoy > 20):
+                if has_cl and ((pd.notna(cl_qoq) and cl_qoq > 10) or (pd.notna(cl_yoy) and cl_yoy > 10)):
+                    is_healthy_inv_surge = True
+                    cross_analysis.append("【存貨 ↔ 合約負債共振】名花有主之訂單備料，存貨具備客戶訂金實質保障，大幅抵銷庫存跌價與滯銷風險。")
+                    positives.append("存貨增加具備合約負債高增長作為實質支撐，無庫存去化隱憂。")
+                elif pd.notna(rev_qoq) and rev_qoq < 0 and pd.notna(v_cfo) and v_cfo < 0:
+                    cross_analysis.append("【存貨 ↔ 營收/CFO】營收衰退且 CFO 轉負下，存貨卻大幅上升且無合約負債支撐，營運資金遭嚴重積壓。")
+                    risk_resonance.append("【存貨去化危機】營收與現金流轉弱，但存貨持續堆積且無合約負債支撐，具備庫存跌價與資金斷鏈風險。")
                     watch_list.append("密切追蹤存貨週轉天數是否持續攀升、是否有打呆帳風險。")
                 else:
                     cross_analysis.append("【存貨 ↔ 營收】存貨急升但缺乏相應幅度的合約負債或營收支撐，需謹慎觀察去化能力。")
                     watch_list.append("存貨去化速度與後續營收是否跟上。")
 
+            has_benign_expansion = is_accumulating or is_healthy_inv_surge
+
             # --- 3. 獲利轉現金能力 (NI to CFO) ---
             if pd.notna(v_ni) and v_ni > 0 and pd.notna(v_cfo) and v_cfo < 0:
                 cfo_neg_count = sum([1 for val in t4_cfo if pd.notna(val) and val < 0])
                 if cfo_neg_count >= 2:
-                    cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負，獲利品質嚴重堪慮。")
-                    risk_resonance.append("【黑字倒閉風險】長期獲利無法轉化為現金，公司靠吃老本或借款維持營運資金，屬重大財務警訊。")
-                    watch_list.append("CFO 必須盡快轉正，否則面臨流動性風險。")
+                    if has_benign_expansion:
+                        cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正但 CFO 為負，屬【專案擴張型現金流出】。")
+                        positives.append("【專案擴張型現金流出】獲利良好但 CFO 暫時受存貨備料墊高營運資金影響，屬大單出貨前之良性資金失血，需觀察後續交貨轉化。")
+                    else:
+                        cross_analysis.append("【獲利 ↔ CFO】連續多季帳面淨利為正，但營業現金流持續為負，獲利品質嚴重堪慮。")
+                        risk_resonance.append("【黑字倒閉風險】長期獲利無法轉化為現金，公司靠吃老本或借款維持營運資金，屬重大財務警訊。")
+                        watch_list.append("CFO 必須盡快轉正，否則面臨流動性風險。")
                 else:
-                    cross_analysis.append("【獲利 ↔ CFO】本季淨利為正但 CFO 為負，可能因短期營運資金墊高（如應收或存貨增加）所致。")
-                    watch_list.append("確認下季 CFO 是否能回穩轉正。")
+                    if has_benign_expansion:
+                        cross_analysis.append("【獲利 ↔ CFO】本季淨利為正但 CFO 為負，因屬專案大單備料期，為良性營運資金積壓。")
+                    else:
+                        cross_analysis.append("【獲利 ↔ CFO】本季淨利為正但 CFO 為負，可能因短期營運資金墊高（如應收或存貨增加）所致。")
+                        watch_list.append("確認下季 CFO 是否能回穩轉正。")
             elif pd.notna(v_ni) and v_ni > 0 and pd.notna(v_cfo) and v_cfo > v_ni * 1.2:
                 cross_analysis.append("【獲利 ↔ CFO】CFO 顯著大於稅後淨利，獲利含金量極高。")
                 positives.append("獲利轉現金能力極強，盈餘品質優良。")
@@ -698,22 +722,33 @@ class FinancialAuditStrategy:
             # 加分項
             if pd.notna(gm_latest) and gm_latest > 30: quality_score += 10
             if pd.notna(om_latest) and om_latest > 10: quality_score += 15
-            if has_cl and "🟢 正向" in cl_status: quality_score += 15; risk_score -= 10
+            if has_cl and ("🟢 正向" in cl_status or "收割期" in cl_status): 
+                quality_score += 15; risk_score -= 10
+            if has_benign_expansion:
+                quality_score += 15; risk_score -= 10
             if pd.notna(cfo_ni_ratio) and cfo_ni_ratio > 1.0: quality_score += 15; risk_score -= 10
             
             # 扣分項
             if pd.notna(inv_days) and inv_days > 150: risk_score += 20; quality_score -= 10
             if pd.notna(dso) and dso > 120: risk_score += 15; quality_score -= 5
-            if pd.notna(v_cfo) and v_cfo < 0: risk_score += 25
+            if pd.notna(v_cfo) and v_cfo < 0: 
+                if has_benign_expansion:
+                    risk_score += 5  # 良性備料期間減免 CFO 為負的風險扣分(原25分)
+                else:
+                    risk_score += 25
             if pd.notna(v_cash) and pd.notna(v_debt) and v_debt > v_cash * 1.5: risk_score += 15
             
             # Risk Resonance Adjustments
             if any("黑字倒閉風險" in r for r in risk_resonance): risk_score += 30
             if any("存貨去化危機" in r for r in risk_resonance): risk_score += 20
-            if any("抵銷存貨滯銷風險" in r for r in cross_analysis): risk_score = max(10, risk_score - 20)
+            if any("名花有主之訂單備料" in r for r in cross_analysis): risk_score = max(10, risk_score - 20)
 
             quality_score = min(100, max(0, int(quality_score)))
             risk_score = min(100, max(0, int(risk_score)))
+
+            # 防呆強制保護：若具備良性大單備料特徵，強制風險不得落入高度風險
+            if has_benign_expansion and risk_score >= 60:
+                risk_score = 59
 
             if risk_score >= 60:
                 overall_grade = "🔴 高度風險 (地雷特徵明顯)"
@@ -735,7 +770,7 @@ class FinancialAuditStrategy:
                 {"指標": "稅後淨利 (Net Income)", "最新": fmt(v_ni), "QoQ": fmt(ni_qoq, "%"), "YoY": fmt(ni_yoy, "%"), "4Q趨勢": t4_ni},
                 {"指標": "營業現金流 (CFO)", "最新": fmt(v_cfo), "QoQ": fmt(cfo_qoq, "%"), "YoY": fmt(cfo_yoy, "%"), "4Q趨勢": t4_cfo},
                 {"指標": "應收帳款 (AR)", "最新": fmt(v_ar), "QoQ": fmt(ar_qoq, "%"), "YoY": "-", "4Q趨勢": t4_ar},
-                {"指標": "存貨 (Inventory)", "最新": fmt(v_inv), "QoQ": fmt(inv_qoq, "%"), "YoY": "-", "4Q趨勢": t4_inv},
+                {"指標": "存貨 (Inventory)", "最新": fmt(v_inv), "QoQ": fmt(inv_qoq, "%"), "YoY": fmt(inv_yoy, "%"), "4Q趨勢": t4_inv},
                 {"指標": "合約負債 (Contract Liab)", "最新": fmt(v_cl), "QoQ": fmt(cl_qoq, "%"), "YoY": fmt(cl_yoy, "%"), "4Q趨勢": t4_cl},
                 {"指標": "毛利率 (Gross Margin)", "最新": fmt(gm_latest, "%"), "QoQ": "-", "YoY": "-", "4Q趨勢": []},
                 {"指標": "營益率 (Operating Margin)", "最新": fmt(om_latest, "%"), "QoQ": "-", "YoY": "-", "4Q趨勢": []},
