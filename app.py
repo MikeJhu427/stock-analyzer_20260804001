@@ -306,6 +306,60 @@ class VCPStrategy:
         vcp_score[valid_mask] = vol_score[valid_mask] + tight_score[valid_mask]
         return vcp_score
 
+class DivergenceStrategy:
+    @staticmethod
+    def check_bottom_divergence(
+        df, price_col='Low', ind_col='K', cross_col1='K', cross_col2='D',
+        recent_w=5, older_w=20, recent_lows_cnt=0, older_lows_cnt=0,
+        pivot_left=0, pivot_right=0, require_cross_confirm=True, cross_days=3
+    ):
+        if len(df) < recent_w + older_w: 
+            return False
+            
+        if require_cross_confirm:
+            cross = (df[cross_col1] > df[cross_col2]) & (df[cross_col1].shift(1) <= df[cross_col2].shift(1))
+            if not cross.iloc[-cross_days:].any():
+                return False
+
+        recent_start = len(df) - recent_w
+        older_start = recent_start - older_w
+        older_end = recent_start
+        
+        prices = df[price_col].values
+        inds = df[ind_col].values
+        
+        if recent_lows_cnt == 0 and older_lows_cnt == 0 and pivot_left == 0 and pivot_right == 0:
+            r_p_min = np.min(prices[recent_start:])
+            o_p_min = np.min(prices[older_start:older_end])
+            r_i_min = np.min(inds[recent_start:])
+            o_i_min = np.min(inds[older_start:older_end])
+            
+            return (r_p_min <= o_p_min * 1.02) and (r_i_min > o_i_min)
+
+        def get_valid_pivots_iloc(start_loc, end_loc):
+            pivots = []
+            for i_loc in range(start_loc, end_loc):
+                s, e = max(0, i_loc - pivot_left), min(len(prices), i_loc + pivot_right + 1)
+                if prices[i_loc] == np.min(prices[s:e]): pivots.append(i_loc)
+            return pivots
+
+        r_pivots = get_valid_pivots_iloc(recent_start, len(df))
+        o_pivots = get_valid_pivots_iloc(older_start, older_end)
+        
+        if recent_lows_cnt > 0: r_pivots = sorted(r_pivots, key=lambda x: prices[x])[:recent_lows_cnt]
+        if older_lows_cnt > 0: o_pivots = sorted(o_pivots, key=lambda x: prices[x])[:older_lows_cnt]
+        
+        if not r_pivots: r_pivots = [recent_start + np.argmin(prices[recent_start:])]
+        if not o_pivots: o_pivots = [older_start + np.argmin(prices[older_start:older_end])]
+        
+        for r_idx in r_pivots:
+            for o_idx in o_pivots:
+                r_i_val = np.min(inds[max(recent_start, r_idx-2) : min(len(inds), r_idx+3)])
+                o_i_val = np.min(inds[max(older_start, o_idx-2) : min(older_end, o_idx+3)])
+                if prices[r_idx] <= prices[o_idx] * 1.02 and r_i_val > o_i_val:
+                    return True
+        return False
+
 class IndicatorResonanceStrategy:
     @staticmethod
     def evaluate(df, recent_w=5, older_w=20, kd_older_low_th=20, kd_older_high_th=90, kd_recent_low_th=0.0, 
@@ -388,59 +442,45 @@ class IndicatorResonanceStrategy:
         
         return resonance_score
 
-class DivergenceStrategy:
+# ==========================================
+# 量價雙背離 (嚴格量增2.5~5倍且破底指標發動)
+# ==========================================
+class PriceVolDivergenceStrategy:
     @staticmethod
-    def check_bottom_divergence(
-        df, price_col='Low', ind_col='K', cross_col1='K', cross_col2='D',
-        recent_w=5, older_w=20, recent_lows_cnt=0, older_lows_cnt=0,
-        pivot_left=0, pivot_right=0, require_cross_confirm=True, cross_days=3
-    ):
-        if len(df) < recent_w + older_w: 
-            return False
+    def evaluate(df, recent_w=5, older_w=20, rl_cnt=0, ol_cnt=0, p_left=0, p_right=0, req_cross=True, c_days=3, price_col='Low'):
+        res = pd.Series(False, index=df.index)
+        if len(df) < 2: return res
+        
+        # 1. 嚴格價量條件 (第一階段快篩)
+        cond_pct = df['Pct_Change'].between(3.5, 10.0)
+        cond_vol_abs = df['Volume_Lots'] >= 1000
+        prev_vol = df['Volume_Lots'].shift(1)
+        cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.5, 5.0)
+        
+        pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
+        valid_idx = np.where(pv_mask)[0]
+        
+        # 2. 針對有達成價量條件的日期，進行第二階段底背離確認
+        for idx in valid_idx:
+            if idx < recent_w + older_w:
+                continue
+            sub_df = df.iloc[:idx+1]
             
-        if require_cross_confirm:
-            cross = (df[cross_col1] > df[cross_col2]) & (df[cross_col1].shift(1) <= df[cross_col2].shift(1))
-            if not cross.iloc[-cross_days:].any():
-                return False
-
-        recent_start = len(df) - recent_w
-        older_start = recent_start - older_w
-        older_end = recent_start
-        
-        prices = df[price_col].values
-        inds = df[ind_col].values
-        
-        if recent_lows_cnt == 0 and older_lows_cnt == 0 and pivot_left == 0 and pivot_right == 0:
-            r_p_min = np.min(prices[recent_start:])
-            o_p_min = np.min(prices[older_start:older_end])
-            r_i_min = np.min(inds[recent_start:])
-            o_i_min = np.min(inds[older_start:older_end])
+            # KD 底背離
+            kd_div = DivergenceStrategy.check_bottom_divergence(
+                sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+            )
+            if not kd_div: continue
+                
+            # MACD 底背離
+            macd_div = DivergenceStrategy.check_bottom_divergence(
+                sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+            )
             
-            return (r_p_min <= o_p_min * 1.02) and (r_i_min > o_i_min)
-
-        def get_valid_pivots_iloc(start_loc, end_loc):
-            pivots = []
-            for i_loc in range(start_loc, end_loc):
-                s, e = max(0, i_loc - pivot_left), min(len(prices), i_loc + pivot_right + 1)
-                if prices[i_loc] == np.min(prices[s:e]): pivots.append(i_loc)
-            return pivots
-
-        r_pivots = get_valid_pivots_iloc(recent_start, len(df))
-        o_pivots = get_valid_pivots_iloc(older_start, older_end)
-        
-        if recent_lows_cnt > 0: r_pivots = sorted(r_pivots, key=lambda x: prices[x])[:recent_lows_cnt]
-        if older_lows_cnt > 0: o_pivots = sorted(o_pivots, key=lambda x: prices[x])[:older_lows_cnt]
-        
-        if not r_pivots: r_pivots = [recent_start + np.argmin(prices[recent_start:])]
-        if not o_pivots: o_pivots = [older_start + np.argmin(prices[older_start:older_end])]
-        
-        for r_idx in r_pivots:
-            for o_idx in o_pivots:
-                r_i_val = np.min(inds[max(recent_start, r_idx-2) : min(len(inds), r_idx+3)])
-                o_i_val = np.min(inds[max(older_start, o_idx-2) : min(older_end, o_idx+3)])
-                if prices[r_idx] <= prices[o_idx] * 1.02 and r_i_val > o_i_val:
-                    return True
-        return False
+            if kd_div and macd_div:
+                res.iloc[idx] = True
+                
+        return res
 
 # ==========================================
 # 模組 3：三表交叉分析與異常診斷引擎 (V7 獲利品質與金融豁免升級版)
@@ -1279,6 +1319,7 @@ with tab2:
     with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
         st.markdown("""
         **【演算法核心邏輯說明】**
+        *   **量價雙背離 (Price-Vol Divergence)**：要求嚴格的第一階段過濾（單日漲幅 3.5%~10%、量大於千張且為昨日 2.5~5 倍），篩出具備動能標的後，再確認是否有 KD 與 MACD (DIF-MACD) 雙指標底部背離發動。
         *   **底部翻轉 (Bottom Reversal)**：尋找下跌趨勢末端的轉折訊號。邏輯包含：K線下影線長度需大於實體與整體波動的一定比例（如釘子線），或出現低檔帶量長紅K。分數越高代表買盤反撲力道越強。
         *   **VCP收斂 (Volatility Contraction)**：尋找均線多頭排列且進行量縮震盪的標的。邏輯：股價站上月線且大於季線、近期成交量低於月均量（量縮），且布林通道極度壓縮。分數越高代表收斂越緊密。
         *   **指標共振 (Indicator Resonance)**：結合動能與趨勢的雙重確認。邏輯：KD指標在指定天數內發生低檔背離或金叉，同時MACD柱狀體縮腳翻揚或突破零軸金叉。兩者同步發出多頭訊號即判定為共振。
@@ -1342,7 +1383,7 @@ with tab2:
             if scan_target_mode == '指定個股測試':
                 test_ticker_input = st.text_input("輸入測試股票代號", value="2330", placeholder="例如: 2330").strip()
         with col_m3:
-            algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振'], index=0, horizontal=True)
+            algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離'], index=0, horizontal=True)
             
         if algo_mode == '全部' and scan_target_mode == '全市場掃描':
             st.warning("💡 提示：您目前選擇【全部】演算法，標的只要符合「任一」條件即會列出。請務必查看表格中的『演算法建議結果』確認觸發類型！")
@@ -1518,8 +1559,13 @@ with tab2:
                         df['KD_Cross_Recent'] = df['KD_Cross'].rolling(window=st.session_state.reso_cross_days, min_periods=1).max() >= 1
                         df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=st.session_state.reso_cross_days, min_periods=1).max() >= 1
                         
+                        # -------------------------------------------------------------
+                        # 評估四大演算法特徵 (第一階段短線快篩)
+                        # -------------------------------------------------------------
                         df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
                         df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
+                        
+                        price_col_for_div_eval = 'Low' if st.session_state.reso_price_basis == "最低價 (Low)" else 'Close'
                         
                         if algo_mode in ['全部', '指標共振']:
                             df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
@@ -1541,6 +1587,22 @@ with tab2:
                             )
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
+                            
+                        if algo_mode in ['全部', '量價雙背離']:
+                            df['PriceVol_Div_Pass'] = PriceVolDivergenceStrategy.evaluate(
+                                df,
+                                recent_w=st.session_state.div_recent_w,
+                                older_w=st.session_state.div_older_w,
+                                rl_cnt=st.session_state.recent_lows_cnt,
+                                ol_cnt=st.session_state.older_lows_cnt,
+                                p_left=st.session_state.pivot_left,
+                                p_right=st.session_state.pivot_right,
+                                req_cross=st.session_state.require_cross_confirm,
+                                c_days=st.session_state.reso_cross_days,
+                                price_col=price_col_for_div_eval
+                            )
+                        else:
+                            df['PriceVol_Div_Pass'] = pd.Series(False, index=df.index)
                         
                         # 將 expert_res_df 與原資料整合，供個股測試時完整呈現
                         if scan_target_mode == "指定個股測試":
@@ -1553,6 +1615,7 @@ with tab2:
                         
                         best_combined_score = -1
                         best_row, best_offset = None, 0
+                        best_vol_mult = 0.0
                         force_pass = (scan_target_mode == "指定個股測試")
                         
                         for offset in range(st.session_state.lookback_end, st.session_state.lookback_start + 1):
@@ -1560,21 +1623,26 @@ with tab2:
                             t_row = df.iloc[-1 - offset]
                             r_score, v_score, reso_score, vol_ma = t_row['Candle_Score'], t_row['VCP_Score'], t_row['Reso_Score'], t_row['Vol_MA20']
                             
+                            prev_vol = df['Volume_Lots'].iloc[-2 - offset] if len(df) > offset + 1 else np.nan
+                            vol_mult = (t_row['Volume_Lots'] / prev_vol) if pd.notna(prev_vol) and prev_vol > 0 else 0.0
+
                             if vol_ma >= st.session_state.min_vol_ma20 or force_pass:
                                 is_r_pass = (algo_mode in ['全部', '底部翻轉']) and (r_score >= st.session_state.min_score)
                                 is_v_pass = (algo_mode in ['全部', 'VCP']) and (v_score >= st.session_state.min_vcp_score)
                                 is_reso_pass = (algo_mode in ['全部', '指標共振']) and (reso_score >= st.session_state.min_reso_score)
+                                is_pv_div_pass = (algo_mode in ['全部', '量價雙背離']) and t_row['PriceVol_Div_Pass']
                                 
-                                # 若為指定個股測試，則無條件使其通過以便檢視背離/扣抵狀態
-                                if is_r_pass or is_v_pass or is_reso_pass or force_pass:
-                                    combo_score = r_score + v_score + reso_score
+                                # 只要有任一條件過關，或開啟指定測試模式，即加入初步名單並記錄
+                                if is_r_pass or is_v_pass or is_reso_pass or is_pv_div_pass or force_pass:
+                                    combo_score = r_score + v_score + reso_score + (20 if is_pv_div_pass else 0)
                                     if combo_score > best_combined_score or best_row is None:
                                         best_combined_score = combo_score
                                         best_row, best_offset = t_row, offset
+                                        best_vol_mult = vol_mult
                         
                         if best_row is not None:
                             clean_ticker = ticker.split('.')[0]
-                            last_expert = expert_res_df.iloc[-1 - best_offset] # 對應時間點的老手判定
+                            last_expert = expert_res_df.iloc[-1 - best_offset] 
                             
                             # 評估進場位置建議
                             rec_status = "-"
@@ -1590,6 +1658,9 @@ with tab2:
                                 "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
                                 "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                                 "當日收盤": round(float(best_row['Close']), 2),
+                                "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
+                                "當日成交量(張)": int(best_row['Volume_Lots']),
+                                "量增倍數": round(best_vol_mult, 2),
                                 "月均量(張)": int(best_row['Vol_MA20']),
                                 "DIF": round(float(best_row['MACD']), 3),
                                 "KD金叉判定": "✅ 是" if best_row['KD_Cross_Recent'] else "❌ 否",
@@ -1597,6 +1668,7 @@ with tab2:
                                 "反轉分數": round(float(best_row['Candle_Score']), 2),
                                 "VCP分數": round(float(best_row['VCP_Score']), 2),
                                 "共振分數": round(float(best_row['Reso_Score']), 2),
+                                "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass', False) else "❌ 否",
                                 "進場位置建議": rec_status,
                                 "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
@@ -1619,7 +1691,8 @@ with tab2:
         if reversal_list:
             candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
             progress_bar.progress(0)
-            status_text.text(f"[階段二] 正在下載初步標的長天期資料以計算年線/半年線...")
+            # 第二階段：僅針對通過第一階段條件的標的，下載長線資料進行年線與週背離檢測
+            status_text.text(f"[階段二] 正在下載 {len(reversal_list)} 檔初選標的長天期資料以計算年線/週線背離...")
             
             long_dl_kwargs = {"period": "2y"}
             if st.session_state.use_backtest_date:
@@ -1628,7 +1701,7 @@ with tab2:
             
             long_data = yf.download(candidate_tickers, threads=False, progress=False, session=yf_session, **long_dl_kwargs)
             
-            status_text.text(f"[階段二] 正在分析 {len(reversal_list)} 檔入選標的之多級別背離特徵與扣抵判定...")
+            status_text.text(f"[階段二] 正在分析標的之多級別背離特徵與扣抵判定...")
             
             final_results = []
             price_col_for_div = 'Low' if st.session_state.reso_price_basis == "最低價 (Low)" else 'Close'
@@ -1744,6 +1817,7 @@ with tab2:
                         for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
 
                     base_tags = []
+                    if item["量價雙背離"] == "✅ 是": base_tags.append("量價雙背離")
                     if item["反轉分數"] >= st.session_state.min_score: base_tags.append("底部翻轉")
                     if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP收斂")
                     if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
@@ -1762,7 +1836,12 @@ with tab2:
             
             res_df = pd.DataFrame(final_results)
             
-            base_cols = ['股票代號', '股票名稱', '觸發日期', '演算法建議結果', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)']
+            # 定義基礎欄位顯示
+            base_cols = [
+                '股票代號', '股票名稱', '觸發日期', '演算法建議結果', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+                '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', 
+                '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
+            ]
             
             # 動態插入週K判定欄位
             if st.session_state.use_weekly_filter:
@@ -1897,6 +1976,7 @@ with tab2:
                         'BB_Width(%)': '布林寬度(%)',
                         'KD_Cross_Recent': 'KD近期金叉',
                         'MACD_Cross_Recent': 'MACD近期金叉',
+                        'PriceVol_Div_Pass': '量價雙背離',
                         'RSI盤整': 'RSI盤整中',
                         '多空指標數': '多空指標數',
                         '日KD多': '日KD偏多',
