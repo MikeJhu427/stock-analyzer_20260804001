@@ -443,41 +443,53 @@ class IndicatorResonanceStrategy:
         return resonance_score
 
 # ==========================================
-# 量價雙背離 (嚴格量增2.5~5倍且破底指標發動)
+# 量價雙背離 (嚴格量增且破底指標發動 - 已優化發動落後底點問題)
 # ==========================================
 class PriceVolDivergenceStrategy:
     @staticmethod
     def evaluate(df, recent_w=5, older_w=20, rl_cnt=0, ol_cnt=0, p_left=0, p_right=0, req_cross=True, c_days=3, price_col='Low'):
         res = pd.Series(False, index=df.index)
-        if len(df) < 2: return res
+        if len(df) < recent_w + older_w + 5: return res
         
-        # 1. 嚴格價量條件 (第一階段快篩)
+        # 1. 第一階段：短線嚴格價量快篩 (只找當日有發動特徵的 K 棒)
         cond_pct = df['Pct_Change'].between(3.5, 10.0)
         cond_vol_abs = df['Volume_Lots'] >= 1000
         prev_vol = df['Volume_Lots'].shift(1)
-        cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.5, 5.0)
+        
+        # 【優化重點】：為避免遇到超級大紅K(跳空爆量如6倍、8倍)被意外濾除，將容許倍數上限放寬至 15.0。
+        # 您仍可依需求改回 5.0，但建議保留放寬以捕捉超級強勢股。
+        cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.5, 15.0) 
         
         pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
         valid_idx = np.where(pv_mask)[0]
         
-        # 2. 針對有達成價量條件的日期，進行第二階段底背離確認
+        # 2. 第二階段：對有「價量發動」的日子，往前確認背離是否成型
         for idx in valid_idx:
-            if idx < recent_w + older_w:
-                continue
-            sub_df = df.iloc[:idx+1]
+            div_found = False
             
-            # KD 底背離
-            kd_div = DivergenceStrategy.check_bottom_divergence(
-                sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-            )
-            if not kd_div: continue
+            # 【優化重點】：由於最低點(底背離成型點)通常在大紅K發動的數天前，不能要求大紅K當天就是波段最低
+            # 往前推 0~5 天的緩衝期 (buffer)，只要這幾天內曾達成 KD 與 MACD (DIF-MACD) 雙底背離即可
+            for buffer in range(0, 6):
+                check_idx = idx - buffer
+                if check_idx < recent_w + older_w: continue
+                sub_df = df.iloc[:check_idx+1]
                 
-            # MACD 底背離
-            macd_div = DivergenceStrategy.check_bottom_divergence(
-                sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-            )
-            
-            if kd_div and macd_div:
+                # 檢測 KD 底背離
+                kd_div = DivergenceStrategy.check_bottom_divergence(
+                    sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                )
+                if not kd_div: continue
+                    
+                # 檢測 MACD (DIF-MACD柱狀體) 底背離
+                macd_div = DivergenceStrategy.check_bottom_divergence(
+                    sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                )
+                
+                if kd_div and macd_div:
+                    div_found = True
+                    break # 只要找到一次有效的背離組合就判定過關
+                    
+            if div_found:
                 res.iloc[idx] = True
                 
         return res
@@ -1319,7 +1331,7 @@ with tab2:
     with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
         st.markdown("""
         **【演算法核心邏輯說明】**
-        *   **量價雙背離 (Price-Vol Divergence)**：要求嚴格的第一階段過濾（單日漲幅 3.5%~10%、量大於千張且為昨日 2.5~5 倍），篩出具備動能標的後，再確認是否有 KD 與 MACD (DIF-MACD) 雙指標底部背離發動。
+        *   **量價雙背離 (Price-Vol Divergence)**：要求嚴格的第一階段過濾（單日漲幅 3.5%~10%、量大於千張且為昨日 2.5~15 倍），篩出具備動能標的後，再確認近期內是否有 KD 與 MACD (DIF-MACD) 雙指標底部背離發動。
         *   **底部翻轉 (Bottom Reversal)**：尋找下跌趨勢末端的轉折訊號。邏輯包含：K線下影線長度需大於實體與整體波動的一定比例（如釘子線），或出現低檔帶量長紅K。分數越高代表買盤反撲力道越強。
         *   **VCP收斂 (Volatility Contraction)**：尋找均線多頭排列且進行量縮震盪的標的。邏輯：股價站上月線且大於季線、近期成交量低於月均量（量縮），且布林通道極度壓縮。分數越高代表收斂越緊密。
         *   **指標共振 (Indicator Resonance)**：結合動能與趨勢的雙重確認。邏輯：KD指標在指定天數內發生低檔背離或金叉，同時MACD柱狀體縮腳翻揚或突破零軸金叉。兩者同步發出多頭訊號即判定為共振。
@@ -1381,7 +1393,7 @@ with tab2:
         with col_m2:
             test_ticker_input = ""
             if scan_target_mode == '指定個股測試':
-                test_ticker_input = st.text_input("輸入測試股票代號", value="2330", placeholder="例如: 2330").strip()
+                test_ticker_input = st.text_input("輸入測試股票代號", value="6147", placeholder="例如: 2330").strip()
         with col_m3:
             algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離'], index=0, horizontal=True)
             
@@ -1588,6 +1600,7 @@ with tab2:
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
                             
+                        # === 量價雙背離模組在此介入 ===
                         if algo_mode in ['全部', '量價雙背離']:
                             df['PriceVol_Div_Pass'] = PriceVolDivergenceStrategy.evaluate(
                                 df,
