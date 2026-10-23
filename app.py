@@ -70,7 +70,7 @@ DEFAULT_PARAMS = {
     "cross_position_threshold": 70.0,
     "use_weekly_filter": True, 
     "enable_30d_backtest": True, 
-    "auto_upload_gdrive": False, 
+    "auto_upload_gdrive": True, 
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
