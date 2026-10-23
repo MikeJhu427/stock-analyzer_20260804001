@@ -443,7 +443,7 @@ class IndicatorResonanceStrategy:
         return resonance_score
 
 # ==========================================
-# 量價雙背離 (嚴格量增且破底指標發動 - 已優化發動落後底點問題)
+# 量價雙背離 (嚴格量增且破底指標發動 - 完美解決發動落差問題)
 # ==========================================
 class PriceVolDivergenceStrategy:
     @staticmethod
@@ -456,8 +456,7 @@ class PriceVolDivergenceStrategy:
         cond_vol_abs = df['Volume_Lots'] >= 1000
         prev_vol = df['Volume_Lots'].shift(1)
         
-        # 【優化重點】：為避免遇到超級大紅K(跳空爆量如6倍、8倍)被意外濾除，將容許倍數上限放寬至 15.0。
-        # 您仍可依需求改回 5.0，但建議保留放寬以捕捉超級強勢股。
+        # 容許倍數上限放寬至 15.0，確保跳空超級大紅K不會因為爆量而被意外濾除
         cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.5, 15.0) 
         
         pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
@@ -467,27 +466,25 @@ class PriceVolDivergenceStrategy:
         for idx in valid_idx:
             div_found = False
             
-            # 【優化重點】：由於最低點(底背離成型點)通常在大紅K發動的數天前，不能要求大紅K當天就是波段最低
-            # 往前推 0~5 天的緩衝期 (buffer)，只要這幾天內曾達成 KD 與 MACD (DIF-MACD) 雙底背離即可
-            for buffer in range(0, 6):
+            # 【修復核心】：由於最低點(底背離成型點)通常在大紅K發動的數天前
+            # 往前推 0~25 天的緩衝期，只要這段醞釀期內曾達成 KD 與 MACD 雙底背離即可
+            for buffer in range(0, 25):
                 check_idx = idx - buffer
                 if check_idx < recent_w + older_w: continue
                 sub_df = df.iloc[:check_idx+1]
                 
-                # 檢測 KD 底背離
                 kd_div = DivergenceStrategy.check_bottom_divergence(
                     sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
                 )
                 if not kd_div: continue
                     
-                # 檢測 MACD (DIF-MACD柱狀體) 底背離
                 macd_div = DivergenceStrategy.check_bottom_divergence(
                     sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
                 )
                 
                 if kd_div and macd_div:
                     div_found = True
-                    break # 只要找到一次有效的背離組合就判定過關
+                    break 
                     
             if div_found:
                 res.iloc[idx] = True
@@ -1783,6 +1780,9 @@ with tab2:
                     # ==========================
                     
                     if not daily_df.empty:
+                        if specific_offset > 0:
+                            daily_df = daily_df.iloc[:-specific_offset]
+                            
                         for n in kou_di_periods:
                             if len(daily_df) >= n:
                                 curr_p = daily_df['Close'].iloc[-1]
@@ -1791,16 +1791,28 @@ with tab2:
                             else:
                                 item[f"扣抵狀態({n}MA)"] = "無資料"
                         
+                        has_daily_div = False
                         for r_w, o_w in div_pairs:
-                            d_kd = DivergenceStrategy.check_bottom_divergence(
-                                daily_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                            )
-                            d_macd = DivergenceStrategy.check_bottom_divergence(
-                                daily_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                            )
-                            res = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
-                            item[f"日K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
-                            if res: has_daily_div = True
+                            d_kd = False
+                            d_macd = False
+                            # 【修復核心】：Phase 2 同樣需要往前追溯 25 天，才能正確把標籤印到 UI 上
+                            for b in range(0, 25):
+                                if len(daily_df) <= b + r_w + o_w: break
+                                temp_df = daily_df.iloc[:len(daily_df)-b] if b > 0 else daily_df
+                                
+                                if not d_kd:
+                                    d_kd = DivergenceStrategy.check_bottom_divergence(
+                                        temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                                    )
+                                if not d_macd:
+                                    d_macd = DivergenceStrategy.check_bottom_divergence(
+                                        temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                                    )
+                                if d_kd and d_macd: break
+                            
+                            res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
+                            item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
+                            if res_tags: has_daily_div = True
                     else:
                         for r_w, o_w in div_pairs: item[f"日K背離({r_w},{o_w})"] = "無資料"
                         for n in kou_di_periods: item[f"扣抵狀態({n}MA)"] = "無資料"
@@ -1814,16 +1826,27 @@ with tab2:
                             
                         if not m60_df.empty:
                             m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
+                            has_m60_div = False
                             for r_w, o_w in div_pairs:
-                                m_kd = DivergenceStrategy.check_bottom_divergence(
-                                    m60_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                                )
-                                m_macd = DivergenceStrategy.check_bottom_divergence(
-                                    m60_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                                )
-                                res = [x for x, b in zip(["KD", "MACD"], [m_kd, m_macd]) if b]
-                                item[f"60分K背離({r_w},{o_w})"] = "+".join(res) if res else "無"
-                                if res: has_m60_div = True
+                                d_kd = False
+                                d_macd = False
+                                for b in range(0, 20):
+                                    if len(m60_df) <= b + r_w + o_w: break
+                                    temp_df = m60_df.iloc[:len(m60_df)-b] if b > 0 else m60_df
+                                    
+                                    if not d_kd:
+                                        d_kd = DivergenceStrategy.check_bottom_divergence(
+                                            temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                                        )
+                                    if not d_macd:
+                                        d_macd = DivergenceStrategy.check_bottom_divergence(
+                                            temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                                        )
+                                    if d_kd and d_macd: break
+                                    
+                                res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
+                                item[f"60分K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
+                                if res_tags: has_m60_div = True
                         else:
                             for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
                     else:
