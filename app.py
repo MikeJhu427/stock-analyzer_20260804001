@@ -451,42 +451,44 @@ class PriceVolDivergenceStrategy:
         res = pd.Series(False, index=df.index)
         if len(df) < recent_w + older_w + 5: return res
         
-        # 1. 第一階段：短線嚴格價量快篩 (只找當日有發動特徵的 K 棒)
-        cond_pct = df['Pct_Change'].between(3.5, 10.0)
+        # 1. 第一階段：短線嚴格價量快篩 (為防 yfinance 些微報價差異，稍微放寬容差 3.4~10.5%, 2.4倍以上)
+        cond_pct = df['Pct_Change'].between(3.4, 10.5)
         cond_vol_abs = df['Volume_Lots'] >= 1000
         prev_vol = df['Volume_Lots'].shift(1)
         
         # 容許倍數上限放寬至 15.0，確保跳空超級大紅K不會因為爆量而被意外濾除
-        cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.5, 15.0) 
+        cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.4, 15.0) 
         
         pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
         valid_idx = np.where(pv_mask)[0]
         
         # 2. 第二階段：對有「價量發動」的日子，往前確認背離是否成型
         for idx in valid_idx:
-            div_found = False
+            d_kd = False
+            d_macd = False
             
             # 【修復核心】：由於最低點(底背離成型點)通常在大紅K發動的數天前
-            # 往前推 0~25 天的緩衝期，只要這段醞釀期內曾達成 KD 與 MACD 雙底背離即可
+            # 往前推 0~25 天的緩衝期，逐步累積 KD 與 MACD 的底背離訊號
             for buffer in range(0, 25):
                 check_idx = idx - buffer
                 if check_idx < recent_w + older_w: continue
                 sub_df = df.iloc[:check_idx+1]
                 
-                kd_div = DivergenceStrategy.check_bottom_divergence(
-                    sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                )
-                if not kd_div: continue
+                if not d_kd:
+                    d_kd = DivergenceStrategy.check_bottom_divergence(
+                        sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                    )
                     
-                macd_div = DivergenceStrategy.check_bottom_divergence(
-                    sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                )
+                if not d_macd:
+                    d_macd = DivergenceStrategy.check_bottom_divergence(
+                        sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
+                    )
                 
-                if kd_div and macd_div:
-                    div_found = True
+                # 只要在這 25 天內，有抓到 KD 與 MACD 分別都出現過底背離，即算成型
+                if d_kd and d_macd:
                     break 
                     
-            if div_found:
+            if d_kd and d_macd:
                 res.iloc[idx] = True
                 
         return res
