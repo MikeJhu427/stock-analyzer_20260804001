@@ -5,6 +5,7 @@ import logging
 import requests
 import datetime
 import time
+import base64
 import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -67,8 +68,10 @@ DEFAULT_PARAMS = {
     "require_cross_confirm": True,
     "use_cross_position_filter": True,
     "cross_position_threshold": 70.0,
-    "use_weekly_filter": True, # 週K共振與背離判定預設開啟
-    "enable_30d_backtest": True, # 預設開啟 30天回測統計
+    "use_weekly_filter": True, 
+    "enable_30d_backtest": True, 
+    "auto_upload_gdrive": False, 
+    "gas_webhook_url": "https://script.google.com/macros/s/AKfycbzbLVm3d-e8rH7Lq-dEzIIlXFt8DMpP7EUdkwVBjSCn6p2ikbpaT41l9P4HpojqhDL0/exec", # 新增：存放 Google Apps Script 網址
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -92,6 +95,38 @@ def save_config(config):
             json.dump(config, f, ensure_ascii=False, indent=4)
     except Exception as e:
         logging.error(f"儲存設定檔失敗: {e}")
+
+# ==========================================
+# Google Apps Script Webhook 安全上傳模組 (免金鑰)
+# ==========================================
+class GoogleDriveUploader:
+    @staticmethod
+    def upload(file_path, file_name, webhook_url):
+        if not webhook_url or not webhook_url.startswith("https://script.google.com/"):
+            return False, "無效的 Google Apps Script Webhook 網址"
+        
+        try:
+            # 讀取 CSV 檔案並轉換為 Base64 字串
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+            encoded_data = base64.b64encode(file_data).decode('utf-8')
+            
+            # 透過 POST 請求發送給 Google Apps Script
+            payload = {
+                "fileName": file_name,
+                "fileData": encoded_data
+            }
+            
+            response = requests.post(webhook_url, data=payload)
+            result = response.json()
+            
+            if result.get("status") == "success":
+                return True, result.get("fileUrl")
+            else:
+                return False, result.get("message", "未知錯誤")
+                
+        except Exception as e:
+            return False, str(e)
 
 # ==========================================
 # 模組 1：技術指標計算
@@ -143,23 +178,18 @@ class ExpertTradingStrategy:
             res['週KD多'] = False
             return res
 
-        # 1. 盤整判定 (RSI 45-55連續5天)
         is_consolidation = df['RSI'].between(45, 55).rolling(5).sum() == 5
-        
-        # 2. 部位管理指標 (KD, MACD, RSI)
         kd_bull = df['K'] > df['D']
         macd_bull = df['MACD_Hist'] > 0
         rsi_bull = df['RSI'] > 50
         bull_count = kd_bull.astype(int) + macd_bull.astype(int) + rsi_bull.astype(int)
         
-        # 3. 週KD判定 (降維轉換)
         try:
             w_df = df[['Open', 'High', 'Low', 'Close']].resample('W-FRI').agg({
                 'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
             }).dropna()
             w_df = TechnicalIndicators.add_kd(w_df)
             w_df['W_Bull'] = w_df['K'] > w_df['D']
-            # 將週指標對應回日線 (向前填充)
             w_bull_series = w_df['W_Bull'].reindex(df.index, method='ffill').fillna(False)
         except Exception:
             w_bull_series = pd.Series(False, index=df.index)
@@ -196,7 +226,6 @@ class WeeklyAnalysisStrategy:
             return {"週K共振": "無資料", "週K背離": "無資料"}
         
         try:
-            # 確保時區乾淨以防 resample 報錯
             df = long_df.copy()
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
@@ -452,7 +481,6 @@ class PriceVolDivergenceStrategy:
         res = pd.Series(False, index=df.index)
         if len(df) < recent_w + older_w + 5: return res
         
-        # 1. 第一階段：短線嚴格價量快篩 (為防 yfinance 些微報價差異，稍微放寬容差 3.4~10.5%, 2.4倍以上)
         cond_pct = df['Pct_Change'].between(3.4, 10.5)
         cond_vol_abs = df['Volume_Lots'] >= 1000
         prev_vol = df['Volume_Lots'].shift(1)
@@ -462,12 +490,10 @@ class PriceVolDivergenceStrategy:
         pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
         valid_idx = np.where(pv_mask)[0]
         
-        # 2. 第二階段：對有「價量發動」的日子，往前確認背離是否成型
         for idx in valid_idx:
             d_kd = False
             d_macd = False
             
-            # 往前推 0~25 天的緩衝期，逐步累積 KD 與 MACD 的底背離訊號
             for buffer in range(0, 25):
                 check_idx = idx - buffer
                 if check_idx < recent_w + older_w: continue
@@ -483,7 +509,6 @@ class PriceVolDivergenceStrategy:
                         sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
                     )
                 
-                # 只要在這 25 天內，有抓到 KD 與 MACD 分別都出現過底背離，即算成型
                 if d_kd and d_macd:
                     break 
                     
@@ -493,7 +518,7 @@ class PriceVolDivergenceStrategy:
         return res
 
 # ==========================================
-# 模組 3：三表交叉分析與異常診斷引擎 (V7 獲利品質與金融豁免升級版)
+# 模組 3：三表交叉分析與異常診斷引擎
 # ==========================================
 class FinancialAuditStrategy:
     @staticmethod
@@ -557,8 +582,6 @@ class FinancialAuditStrategy:
     def evaluate(ticker_symbol, session):
         try:
             stock = yf.Ticker(ticker_symbol, session=session)
-            
-            # --- 金融業識別機制 ---
             ticker_base = str(ticker_symbol).split('.')[0]
             is_financial = ticker_base.startswith('28') or ticker_base.startswith('58') or ticker_base.startswith('60')
             try:
@@ -575,7 +598,6 @@ class FinancialAuditStrategy:
             if inc_stmt.empty and bal_sheet.empty and cash_flow.empty:
                 return {"status": "error", "msg": f"無法取得 {ticker_symbol} 財報資料。"}
 
-            # Alias Mapping
             rev_aliases = ["Total Revenue", "Operating Revenue", "Revenue"]
             ni_aliases = ["Net Income", "Net Income Common Stockholders", "Net Income Continuous Operations"]
             op_aliases = ["Operating Income", "Operating Profit"]
@@ -614,7 +636,6 @@ class FinancialAuditStrategy:
             t_liab = FinancialAuditStrategy._get_series(bal_sheet, liab_aliases)
             equity = FinancialAuditStrategy._get_series(bal_sheet, equity_aliases)
 
-            # Get Common Periods (Up to 8 quarters)
             valid_dfs = [df for df in [inc_stmt, bal_sheet, cash_flow] if not df.empty]
             all_periods = set()
             for df in valid_dfs: all_periods.update(df.columns)
@@ -631,7 +652,6 @@ class FinancialAuditStrategy:
             def val_at(s, p): return FinancialAuditStrategy._safe_float(s.loc[p]) if not s.empty and p in s.index else np.nan
             def get_trend(s, periods): return [val_at(s, p) for p in periods]
             
-            # --- Extract Latest Values ---
             v_rev = val_at(revenue, latest)
             v_ni = val_at(net_income, latest)
             v_cfo = val_at(cfo, latest)
@@ -647,7 +667,6 @@ class FinancialAuditStrategy:
             v_assets = val_at(t_assets, latest)
             v_equity = val_at(equity, latest)
             
-            # --- Extract Trends (4Q) ---
             t4_rev = get_trend(revenue, periods_4q)
             t4_ni = get_trend(net_income, periods_4q)
             t4_cfo = get_trend(cfo, periods_4q)
@@ -655,10 +674,8 @@ class FinancialAuditStrategy:
             t4_inv = get_trend(inventory, periods_4q)
             t4_cl = get_trend(contract_liab, periods_4q)
             
-            # --- Extract Trends (8Q) ---
             t8_cl = get_trend(contract_liab, periods_8q)
 
-            # --- Calculate Core Metrics ---
             rev_qoq = FinancialAuditStrategy._growth(v_rev, val_at(revenue, q1_ago))
             rev_yoy = FinancialAuditStrategy._growth(v_rev, val_at(revenue, q4_ago))
             ni_qoq = FinancialAuditStrategy._growth(v_ni, val_at(net_income, q1_ago))
@@ -680,7 +697,6 @@ class FinancialAuditStrategy:
             cfo_ni_ratio = FinancialAuditStrategy._ratio(v_cfo, v_ni)
             cl_rev_ratio = FinancialAuditStrategy._ratio(v_cl, v_rev) * 100
             
-            # ROE & ROA Annualized
             roe_annual = (v_ni / v_equity * 4 * 100) if pd.notna(v_ni) and pd.notna(v_equity) and v_equity > 0 else np.nan
             roa_annual = (v_ni / v_assets * 4 * 100) if pd.notna(v_ni) and pd.notna(v_assets) and v_assets > 0 else np.nan
             equity_multiplier = (v_assets / v_equity) if pd.notna(v_assets) and pd.notna(v_equity) and v_equity > 0 else np.nan
@@ -693,9 +709,6 @@ class FinancialAuditStrategy:
             else:
                 inv_days = np.nan
 
-            # ==========================================
-            # 交叉診斷與風險共振分析引擎 (V7重構)
-            # ==========================================
             cross_analysis = []
             risk_resonance = []
             positives = []
@@ -706,28 +719,20 @@ class FinancialAuditStrategy:
             
             has_cl = not contract_liab.empty and not pd.isna(v_cl)
             
-            # --- 1. 虧損逃逸漏洞封殺 (Deficit / Loss Logic) ---
             if pd.notna(v_ni) and v_ni < 0:
-                quality_score -= 15
-                risk_score += 15
+                quality_score -= 15; risk_score += 15
             if pd.notna(v_op) and v_op < 0:
-                quality_score -= 10
-                risk_score += 10
+                quality_score -= 10; risk_score += 10
                 
-            # 致命警訊：本業造血枯竭
             if ((pd.notna(v_op) and v_op < 0) or (pd.notna(v_ni) and v_ni < 0)) and (pd.notna(v_cfo) and v_cfo < 0):
-                risk_score += 25
-                quality_score -= 15
+                risk_score += 25; quality_score -= 15
                 risk_resonance.append("🚨【本業造血枯竭】本業營運虧損且營運現金流持續淨流出，面臨實質流動性考驗。")
 
-            # 連續虧損累進懲罰
             loss_count = sum([1 for val in t4_ni if pd.notna(val) and val < 0])
             if loss_count >= 2:
-                risk_score += 15
-                quality_score -= 10
+                risk_score += 15; quality_score -= 10
                 risk_resonance.append("🚨【長期營運虧損】近四季多次出現虧損，獲利動能嚴重匱乏。")
 
-            # --- 2. 合約負債精細化三態判定 (Contract Liabilities Logic) ---
             cl_status = "無資料"
             cl_state = "None"
             
@@ -738,17 +743,14 @@ class FinancialAuditStrategy:
                 rev_yoy_val = rev_yoy if pd.notna(rev_yoy) else 0
                 inv_inc = (pd.notna(inv_qoq) and inv_qoq > 0) or (pd.notna(inv_yoy) and inv_yoy > 0)
 
-                # 狀態 A: 大單蓄水 / 擴張期
                 if (cl_yoy_val > 10 or cl_qoq_val > 10) and inv_inc:
                     cl_state = "A"
                     cl_status = "🚀 正向擴張 (接單強勁，營運資金積極備料)"
                     cross_analysis.append("【合約負債】客戶預付款與遞延收入高增長伴隨存貨增加，具備強烈未來營收認列潛力。")
-                # 狀態 B: 正常履約 / 營收轉化期
                 elif (cl_qoq_val < 0 or cl_yoy_val < -5) and (rev_qoq_val > 0 or rev_yoy_val > 0):
                     cl_state = "B"
                     cl_status = "🟢 履約轉化 (前期訂單陸續驗收並轉列營收，屬健康循環)"
                     cross_analysis.append("【合約負債 → 營收】合約負債減少，但當期營收維持成長，顯示前期訂單順利驗收轉列營收。")
-                # 狀態 C: 訂單衰退 / 需求萎縮
                 elif cl_yoy_val < -15 and rev_yoy_val <= 0:
                     cl_state = "C"
                     cl_status = "🔴 可能異常 (訂單動能萎縮)"
@@ -762,15 +764,13 @@ class FinancialAuditStrategy:
             else:
                 cl_status = "⚪ 合約負債資料不足，未納入此項評分"
 
-            # --- 3. 存貨動態風險防護與滯銷重擊 (Inventory Surge Logic) ---
             inv_surge = (pd.notna(inv_qoq) and inv_qoq > 15) or (pd.notna(inv_yoy) and inv_yoy > 20)
             has_rev_support = (pd.notna(rev_qoq) and rev_qoq > 10) or (pd.notna(rev_yoy) and rev_yoy > 10)
             rev_declining = (pd.notna(rev_qoq) and rev_qoq < 0) or (pd.notna(rev_yoy) and rev_yoy < 0)
 
             if inv_surge:
                 if cl_state == "A" or has_rev_support:
-                    quality_score += 10
-                    risk_score -= 10
+                    quality_score += 10; risk_score -= 10
                     cross_analysis.append("【存貨 ↔ 營收/訂單共振】營運規模擴張之積極備料，大幅抵銷存貨跌價與滯銷風險。")
                     positives.append("存貨大幅增加具備「合約負債支持」或「營收高成長」作為實質支撐，判定為健康備料。")
                 elif cl_state == "C" or (rev_declining and pd.notna(v_cfo) and v_cfo < 0):
@@ -782,7 +782,6 @@ class FinancialAuditStrategy:
                     cross_analysis.append("【存貨 ↔ 營收】存貨急升但缺乏相應幅度的訂單或營收支撐，需謹慎觀察去化能力。")
                     watch_list.append("存貨去化速度與後續營收是否跟上。")
 
-            # 存貨天數 (DIO)
             if pd.notna(inv_days):
                 rev_not_declining = (pd.notna(rev_qoq) and rev_qoq >= 0) or (pd.notna(rev_yoy) and rev_yoy >= 0)
                 rev_negative_growth = (pd.notna(rev_qoq) and rev_qoq < 0) and (pd.notna(rev_yoy) and rev_yoy < 0)
@@ -790,14 +789,11 @@ class FinancialAuditStrategy:
                 if inv_days > 150 and pd.notna(gm_latest) and gm_latest >= 22 and rev_not_declining and cl_state != "C":
                     watch_list.append("存貨天數較長，但符合高毛利與營收未衰退要件，視為長製造週期產業特性，不扣分。")
                 elif inv_days > 250 and rev_negative_growth:
-                    risk_score += 15
-                    quality_score -= 10
+                    risk_score += 15; quality_score -= 10
                     risk_resonance.append("🚨【滯銷風險】存貨週轉天數極長且營收呈現負成長，庫存去化困難。")
                 elif inv_days > 150:
-                    risk_score += 10
-                    quality_score -= 5
+                    risk_score += 10; quality_score -= 5
 
-            # --- 4. 黑字倒閉 vs 成長擴張型失血 防誤判機制 ---
             is_growth_expansion = False
             is_black_bankruptcy = False
 
@@ -806,7 +802,6 @@ class FinancialAuditStrategy:
                 
                 if rev_stalled and cl_state != "A" and not inv_surge:
                     cfo_neg_count = sum([1 for val in t4_cfo if pd.notna(val) and val < 0])
-                    # 金融業免除借款壓力判定
                     debt_crisis = False if is_financial else (pd.notna(v_debt) and pd.notna(v_cash) and v_cash > 0 and (v_debt > v_cash * 2.5))
                     
                     if cfo_neg_count >= 2 and (rev_stalled or debt_crisis):
@@ -825,63 +820,42 @@ class FinancialAuditStrategy:
                     
                     if cl_state == "A" or (rev_high_growth and wc_increased):
                         is_growth_expansion = True
-                        quality_score += 15
-                        risk_score -= 10
+                        quality_score += 15; risk_score -= 10
                         positives.append("🟢 成長型營運資金擴張 (大單出貨前夕之營運資金墊高，非經營危機)。")
                         cross_analysis.append("【獲利 ↔ CFO】獲利良好且具備營收或合約負債高增長，CFO為負純屬存貨/應收備料墊高營運資金，屬良性擴張。")
 
-            # --- 5. 應收帳款風險 ---
             if pd.notna(ar_qoq) and ar_qoq > 20 and pd.notna(rev_qoq) and rev_qoq < 5:
                 cross_analysis.append("【營收 ↔ 應收帳款】營收成長停滯，但應收帳款大幅增加，有塞貨或放寬授信條件的疑慮。")
                 risk_resonance.append("🚨【應收帳款惡化】資金卡在客戶端，可能衍生呆帳風險並吃掉公司現金。")
                 watch_list.append("應收帳款天數是否失控攀升。")
             
-            # --- 6. 綜合加分與懲罰調整 ---
-            
-            # 毛利率平滑階梯加分
             if pd.notna(gm_latest):
                 if gm_latest >= 30: quality_score += 15
                 elif gm_latest >= 25: quality_score += 10
                 elif gm_latest >= 15: quality_score += 5
 
-            # 營益率平滑階梯加分
             if pd.notna(om_latest):
                 if om_latest >= 12: quality_score += 15
                 elif om_latest >= 7: quality_score += 10
                 elif om_latest >= 3: quality_score += 5
 
-            # 營收與獲利爆發加分
-            if (pd.notna(rev_qoq) and rev_qoq > 15) or (pd.notna(rev_yoy) and rev_yoy > 15): 
-                quality_score += 10
-            if pd.notna(ni_qoq) and ni_qoq > 20: 
-                quality_score += 10
+            if (pd.notna(rev_qoq) and rev_qoq > 15) or (pd.notna(rev_yoy) and rev_yoy > 15): quality_score += 10
+            if pd.notna(ni_qoq) and ni_qoq > 20: quality_score += 10
 
-            # 特徵加分
             if has_cl and ("🟢" in cl_status or "🚀" in cl_status or "收割期" in cl_status): 
                 quality_score += 15; risk_score -= 10
             if pd.notna(cfo_ni_ratio) and cfo_ni_ratio > 1.0: 
                 quality_score += 15; risk_score -= 10
                 positives.append("獲利轉現金能力極強，盈餘品質優良。")
             
-            # 收現天數
-            if pd.notna(dso) and dso > 120: 
-                risk_score += 15; quality_score -= 5
+            if pd.notna(dso) and dso > 120: risk_score += 15; quality_score -= 5
             
-            # CFO 為負之動態懲罰 (排除已經判定過的擴張與黑字倒閉)
             if pd.notna(v_cfo) and v_cfo < 0:
-                if is_growth_expansion:
-                    pass
-                elif is_black_bankruptcy:
-                    pass
-                elif ((pd.notna(v_op) and v_op < 0) or (pd.notna(v_ni) and v_ni < 0)):
-                    pass # 已扣除本業造血枯竭
-                else:
-                    risk_score += 15
+                if is_growth_expansion or is_black_bankruptcy or ((pd.notna(v_op) and v_op < 0) or (pd.notna(v_ni) and v_ni < 0)): pass
+                else: risk_score += 15
             
-            # 債務與資本結構壓力 (金融業智能豁免)
             if pd.notna(v_cash) and pd.notna(v_debt) and v_debt > v_cash * 1.5:
                 if not is_financial:
-                    # 一般企業資本失衡加罰 (致命級別)
                     if v_debt > v_cash * 2.0 and pd.notna(v_ni) and v_ni < 0:
                         risk_score += 15
                         if risk_score < 70: risk_score = 70
@@ -892,7 +866,6 @@ class FinancialAuditStrategy:
                     if "【金融業特性】負債結構主要為客戶存款與壽險準備金，不適用一般製造業負債比率評估。" not in cross_analysis:
                         cross_analysis.append("【金融業特性】負債結構主要為客戶存款與壽險準備金，不適用一般製造業負債比率評估。")
 
-            # --- 7. ROE / ROA 獲利能力與杜邦槓桿診斷 ---
             if pd.notna(roe_annual):
                 if roe_annual >= 20: quality_score += 15
                 elif roe_annual >= 12: quality_score += 10
@@ -908,7 +881,6 @@ class FinancialAuditStrategy:
                     elif roa_annual >= 0.6: quality_score += 5
                     elif roa_annual < 0: risk_score += 10
 
-            # 杜邦槓桿虛胖與高效率造血診斷
             if not is_financial:
                 if (pd.notna(roe_annual) and roe_annual > 15 and pd.notna(roa_annual) and roa_annual < 3) or (pd.notna(equity_multiplier) and equity_multiplier > 4.5):
                     risk_score += 10
@@ -919,15 +891,11 @@ class FinancialAuditStrategy:
                 if pd.notna(roe_annual) and roe_annual > 15 and pd.notna(roa_annual) and roa_annual >= 1.0:
                     positives.append("💎【高效率造血】資產與股東權益報酬率優異，具備實質競爭優勢與定價權。")
 
-            # 分數上下界限安全處理
             quality_score = min(100, max(0, int(quality_score)))
             risk_score = min(100, max(0, int(risk_score)))
 
-            # 防呆強制保護：若具備擴張成長特徵，強制壓制風險分數不得超標
-            if is_growth_expansion:
-                risk_score = min(risk_score, 35)
+            if is_growth_expansion: risk_score = min(risk_score, 35)
 
-            # 綜合評級區間調整
             if is_growth_expansion and quality_score >= 70 and risk_score <= 35:
                 overall_grade = "🚀 擴張成長 (大單備料期，營運資金墊高)"
             elif risk_score >= 60:
@@ -939,12 +907,8 @@ class FinancialAuditStrategy:
             else:
                 overall_grade = "🟡 穩健平庸 (無重大風險但動能一般)"
 
-            # ==========================================
-            # 建立回傳 Dict (相容 Batch Mode 且支援 Single Mode 顯示)
-            # ==========================================
             def fmt(v, suffix=""): return f"{v:,.2f}{suffix}" if pd.notna(v) else "-"
             
-            # Core Table Generation Data
             core_metrics = [
                 {"指標": "營業收入 (Revenue)", "最新": fmt(v_rev), "QoQ": fmt(rev_qoq, "%"), "YoY": fmt(rev_yoy, "%"), "4Q趨勢": t4_rev},
                 {"指標": "稅後淨利 (Net Income)", "最新": fmt(v_ni), "QoQ": fmt(ni_qoq, "%"), "YoY": fmt(ni_yoy, "%"), "4Q趨勢": t4_ni},
@@ -973,25 +937,17 @@ class FinancialAuditStrategy:
                 "綜合評級": overall_grade,
                 "體質分數": quality_score,
                 "風險分數": risk_score,
-                
-                # Metrics for UI
                 "core_metrics": core_metrics,
-                
-                # CL specific
                 "cl_latest": fmt(v_cl),
                 "cl_qoq": fmt(cl_qoq, "%"),
                 "cl_yoy": fmt(cl_yoy, "%"),
                 "cl_rev_ratio": fmt(cl_rev_ratio, "%"),
                 "cl_status": cl_status,
                 "cl_8q": t8_cl,
-                
-                # Narratives
                 "cross_analysis": cross_analysis,
                 "risk_resonance": risk_resonance,
                 "positives": positives,
                 "watch_list": watch_list,
-                
-                # For Batch Mode fallback compatibility
                 "ROE年化(%)": roe_annual,
                 "ROA年化(%)": roa_annual,
                 "營收成長(%)": rev_qoq,
@@ -1092,7 +1048,6 @@ def resolve_ticker(symbol, stock_dict):
 # ==========================================
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
-# 初始化跨分頁連動狀態
 if "audit_mode" not in st.session_state: st.session_state.audit_mode = "單檔查詢"
 if "batch_input_area" not in st.session_state: st.session_state.batch_input_area = "2330, 2454, 3231, 6147, 1909"
 if "run_batch_audit" not in st.session_state: st.session_state.run_batch_audit = False
@@ -1334,21 +1289,6 @@ with tab2:
         *   **VCP收斂 (Volatility Contraction)**：尋找均線多頭排列且進行量縮震盪的標的。邏輯：股價站上月線且大於季線、近期成交量低於月均量（量縮），且布林通道極度壓縮。分數越高代表收斂越緊密。
         *   **指標共振 (Indicator Resonance)**：結合動能與趨勢的雙重確認。邏輯：KD指標在指定天數內發生低檔背離或金叉，同時MACD柱狀體縮腳翻揚或突破零軸金叉。兩者同步發出多頭訊號即判定為共振。
         *   **老手實戰濾網 (Expert Filter)**：包含盤整過濾（RSI 45-55糾結）、部位建議（綜合KD、MACD、RSI偏多數量）、多週期KD（結合週KD與日KD判斷大方向與小轉折）。
-        
-        ---
-        
-        **【詳細參數設定對照表】**
-        | 參數名稱 | 模組分類 | 定義與邏輯說明 |
-        | :--- | :--- | :--- |
-        | **回測基準日** | 基礎過濾 | 啟用後，系統下載的歷史資料將自動截斷至該日期。讓您能精準回到過去任意一天執行策略回測。 |
-        | **底部翻轉最低分數** | 基礎過濾 | 判定低檔長紅或下影線強度的核心數值。預設 8.0 分，分數越高代表買盤力道越強、型態越完美。 |
-        | **VCP收斂最低分數** | 基礎過濾 | 判定右側多頭收斂的強度。預設 10.0 分，滿分 20 分。分數越高代表成交量越萎縮、布林帶越壓縮。 |
-        | **指標共振最低分數** | 基礎過濾 | 判定 KD 與 MACD 的共振強度。滿分 15 分，滿足基礎條件即給 10 分，動能越強加分越多。 |
-        | **月均量最低門檻** | 基礎過濾 | 剔除流動性差的殭屍股。預設 1000 張，確保標的具備足夠的市場參與度與進出空間。 |
-        | **近波/前波範圍** | 背離/共振 | 定義尋找「第一低點(近波)」與「第二低點(前波)」的 K 棒區間長度。共振模組亦連動此參數。 |
-        | **左X根/右Y根不破** | 背離判定 | 嚴格轉折點定義：該低點必須是往左 X 根、往右 Y 根範圍內的「絕對最低價」，避免抓到半山腰的雜訊。 |
-        | **KD/MACD共振門檻** | 指標共振 | 內建 MACD 底底高核心邏輯。支援設定 KD 前波高低點、近波低點限制，以及 MACD 絕對數值濾網。並要求在指定天數內發生金叉。 |
-        | **均線扣抵判斷(5/10/20/60)**| 動能濾網 | 判斷觸發日的收盤價是否大於 N 天前的收盤價。若大於(扣低)，代表均線準備上揚，具備支撐動能；若小於(扣高)，代表均線有下彎壓力。 |
         """)
 
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
@@ -1398,11 +1338,15 @@ with tab2:
         if algo_mode == '全部' and scan_target_mode == '全市場掃描':
             st.warning("💡 提示：您目前選擇【全部】演算法，標的只要符合「任一」條件即會列出。請務必查看表格中的『演算法建議結果』確認觸發類型！")
 
-        st.markdown("**2. 基礎掃描參數與時光機回測設定**")
-        col_b1, col_b2, col_b3 = st.columns([1, 1, 2])
+        st.markdown("**2. 基礎掃描參數、時光機回測與雲端備份設定**")
+        col_b1, col_b2, col_b3, col_b4 = st.columns([1, 1.2, 1, 1.2])
         with col_b1: st.checkbox("啟用指定日期回測", key="use_backtest_date")
         with col_b2: st.date_input("選擇回測基準日", key="backtest_date_obj", disabled=not st.session_state.use_backtest_date)
-        with col_b3: st.checkbox("啟用 30 天內觸發次數統計", key="enable_30d_backtest", help="針對入選標的，自動往前回溯 30 天，統計該演算法共發動過幾次。")
+        with col_b3: st.checkbox("近 30日觸發統計", key="enable_30d_backtest", help="針對入選標的，自動往前回溯 30 天統計該演算法發動過幾次。")
+        with col_b4: st.checkbox("自動上傳 Google Drive", key="auto_upload_gdrive", help="需在下方填寫 Google Apps Script 部署網址才能生效。")
+            
+        if st.session_state.auto_upload_gdrive:
+            st.text_input("🔗 Google Apps Script 部署網址 (Webhook URL)", key="gas_webhook_url", placeholder="https://script.google.com/macros/s/.../exec")
             
         col_a, col_b, col_c, col_d, col_e = st.columns(5)
         with col_a:
@@ -1935,6 +1879,29 @@ with tab2:
             st.session_state.scan_target_mode_saved = scan_target_mode
             st.session_state.market_info = market_info
             
+            # --- 執行自動備份至 Google Drive (透過 Webhook) ---
+            if st.session_state.get('auto_upload_gdrive', False) and not res_df.empty:
+                webhook_url = st.session_state.get('gas_webhook_url', "").strip()
+                if not webhook_url:
+                    st.session_state.upload_success = False
+                    st.session_state.upload_msg = "請在上方設定 Google Apps Script Webhook 網址"
+                else:
+                    csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
+                    date_str = datetime.date.today().strftime('%Y-%m-%d')
+                    temp_filename = f"stock_scan_{algo_mode}_{date_str}.csv"
+                    
+                    with open(temp_filename, "wb") as f:
+                        f.write(csv_bytes)
+                    
+                    upload_success, upload_msg = GoogleDriveUploader.upload(temp_filename, temp_filename, webhook_url)
+                    st.session_state.upload_success = upload_success
+                    st.session_state.upload_msg = upload_msg
+                    
+                    try:
+                        os.remove(temp_filename)
+                    except Exception:
+                        pass
+            
             date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
             if scan_target_mode == "指定個股測試":
                 st.session_state.scan_msg = f"🎉 測試完成！已為您匯出個股 {date_str} 的計算結果與下方詳細參數表。"
@@ -1956,6 +1923,12 @@ with tab2:
         # 重新渲染大盤結果與提示訊息
         if not st.session_state.scan_res_df.empty:
             st.success(st.session_state.scan_msg)
+            # 顯示 Google Drive 上傳狀態
+            if st.session_state.get('auto_upload_gdrive', False):
+                if st.session_state.get('upload_success', False):
+                    st.success(f"☁️ 掃描結果已成功自動上傳至 Google Drive！")
+                else:
+                    st.error(f"☁️ Google Drive 上傳失敗：{st.session_state.get('upload_msg', '')}")
         else:
             st.info(st.session_state.scan_msg)
             
