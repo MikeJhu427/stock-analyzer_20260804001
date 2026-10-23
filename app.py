@@ -68,6 +68,7 @@ DEFAULT_PARAMS = {
     "use_cross_position_filter": True,
     "cross_position_threshold": 70.0,
     "use_weekly_filter": True, # 週K共振與背離判定預設開啟
+    "enable_30d_backtest": True, # 預設開啟 30天回測統計
     "use_backtest_date": False,
     "backtest_date": str(datetime.date.today())
 }
@@ -443,7 +444,7 @@ class IndicatorResonanceStrategy:
         return resonance_score
 
 # ==========================================
-# 量價雙背離 (嚴格量增且破底指標發動 - 完美解決發動落差問題)
+# 量價雙背離 (嚴格量增且破底指標發動)
 # ==========================================
 class PriceVolDivergenceStrategy:
     @staticmethod
@@ -456,7 +457,6 @@ class PriceVolDivergenceStrategy:
         cond_vol_abs = df['Volume_Lots'] >= 1000
         prev_vol = df['Volume_Lots'].shift(1)
         
-        # 容許倍數上限放寬至 15.0，確保跳空超級大紅K不會因為爆量而被意外濾除
         cond_vol_mult = (df['Volume_Lots'] / (prev_vol + 1e-8)).between(2.4, 15.0) 
         
         pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
@@ -467,7 +467,6 @@ class PriceVolDivergenceStrategy:
             d_kd = False
             d_macd = False
             
-            # 【修復核心】：由於最低點(底背離成型點)通常在大紅K發動的數天前
             # 往前推 0~25 天的緩衝期，逐步累積 KD 與 MACD 的底背離訊號
             for buffer in range(0, 25):
                 check_idx = idx - buffer
@@ -1330,7 +1329,7 @@ with tab2:
     with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
         st.markdown("""
         **【演算法核心邏輯說明】**
-        *   **量價雙背離 (Price-Vol Divergence)**：要求嚴格的第一階段過濾（單日漲幅 3.5%~10%、量大於千張且為昨日 2.5~15 倍），篩出具備動能標的後，再確認近期內是否有 KD 與 MACD (DIF-MACD) 雙指標底部背離發動。
+        *   **量價雙背離 (Price-Vol Divergence)**：要求嚴格的第一階段過濾（單日漲幅 3.4%~10.5%、量大於千張且為昨日 2.4~15 倍），篩出具備動能標的後，再確認近期內是否有 KD 與 MACD (DIF-MACD) 雙指標底部背離發動。
         *   **底部翻轉 (Bottom Reversal)**：尋找下跌趨勢末端的轉折訊號。邏輯包含：K線下影線長度需大於實體與整體波動的一定比例（如釘子線），或出現低檔帶量長紅K。分數越高代表買盤反撲力道越強。
         *   **VCP收斂 (Volatility Contraction)**：尋找均線多頭排列且進行量縮震盪的標的。邏輯：股價站上月線且大於季線、近期成交量低於月均量（量縮），且布林通道極度壓縮。分數越高代表收斂越緊密。
         *   **指標共振 (Indicator Resonance)**：結合動能與趨勢的雙重確認。邏輯：KD指標在指定天數內發生低檔背離或金叉，同時MACD柱狀體縮腳翻揚或突破零軸金叉。兩者同步發出多頭訊號即判定為共振。
@@ -1403,6 +1402,7 @@ with tab2:
         col_b1, col_b2, col_b3 = st.columns([1, 1, 2])
         with col_b1: st.checkbox("啟用指定日期回測", key="use_backtest_date")
         with col_b2: st.date_input("選擇回測基準日", key="backtest_date_obj", disabled=not st.session_state.use_backtest_date)
+        with col_b3: st.checkbox("啟用 30 天內觸發次數統計", key="enable_30d_backtest", help="針對入選標的，自動往前回溯 30 天，統計該演算法共發動過幾次。")
             
         col_a, col_b, col_c, col_d, col_e = st.columns(5)
         with col_a:
@@ -1487,7 +1487,10 @@ with tab2:
             
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
-        total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70
+        
+        # 預留 30 天的回測統計緩衝
+        extra_buffer_days = 30 if st.session_state.enable_30d_backtest else 0
+        total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70 + extra_buffer_days
         
         dl_kwargs = {}
         dl_60m_kwargs = {}
@@ -1599,7 +1602,7 @@ with tab2:
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
                             
-                        # === 量價雙背離模組在此介入 ===
+                        # === 量價雙背離模組 ===
                         if algo_mode in ['全部', '量價雙背離']:
                             df['PriceVol_Div_Pass'] = PriceVolDivergenceStrategy.evaluate(
                                 df,
@@ -1652,6 +1655,26 @@ with tab2:
                                         best_row, best_offset = t_row, offset
                                         best_vol_mult = vol_mult
                         
+                        # --- 30天回測統計引擎 ---
+                        count_30d = 0
+                        if st.session_state.enable_30d_backtest and best_row is not None:
+                            # 針對觸發日(best_offset)，往回看 30 個交易日
+                            for b_offset in range(best_offset + 1, best_offset + 31):
+                                if len(df) <= b_offset + 1: continue
+                                c_row = df.iloc[-1 - b_offset]
+                                c_vol_ma = c_row['Vol_MA20']
+                                if pd.isna(c_vol_ma): continue
+                                
+                                # 若滿足月均量條件（或強制測試），則檢驗該日是否符合演算法
+                                if c_vol_ma >= st.session_state.min_vol_ma20 or force_pass:
+                                    c_r_pass = (algo_mode in ['全部', '底部翻轉']) and (c_row['Candle_Score'] >= st.session_state.min_score)
+                                    c_v_pass = (algo_mode in ['全部', 'VCP']) and (c_row['VCP_Score'] >= st.session_state.min_vcp_score)
+                                    c_reso_pass = (algo_mode in ['全部', '指標共振']) and (c_row['Reso_Score'] >= st.session_state.min_reso_score)
+                                    c_pv_pass = (algo_mode in ['全部', '量價雙背離']) and c_row.get('PriceVol_Div_Pass', False)
+                                    
+                                    if c_r_pass or c_v_pass or c_reso_pass or c_pv_pass:
+                                        count_30d += 1
+                        
                         if best_row is not None:
                             clean_ticker = ticker.split('.')[0]
                             last_expert = expert_res_df.iloc[-1 - best_offset] 
@@ -1669,6 +1692,7 @@ with tab2:
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                 "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
                                 "觸發日期": best_row.name.strftime('%Y-%m-%d'),
+                                "近30日觸發次數": count_30d if st.session_state.enable_30d_backtest else "-",
                                 "當日收盤": round(float(best_row['Close']), 2),
                                 "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
                                 "當日成交量(張)": int(best_row['Volume_Lots']),
@@ -1797,7 +1821,7 @@ with tab2:
                         for r_w, o_w in div_pairs:
                             d_kd = False
                             d_macd = False
-                            # 【修復核心】：Phase 2 同樣需要往前追溯 25 天，才能正確把標籤印到 UI 上
+                            # Phase 2 同樣需要往前追溯 25 天，確保顯示狀態一致
                             for b in range(0, 25):
                                 if len(daily_df) <= b + r_w + o_w: break
                                 temp_df = daily_df.iloc[:len(daily_df)-b] if b > 0 else daily_df
@@ -1874,12 +1898,16 @@ with tab2:
             
             res_df = pd.DataFrame(final_results)
             
-            # 定義基礎欄位顯示
-            base_cols = [
-                '股票代號', '股票名稱', '觸發日期', '演算法建議結果', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+            # 建立核心欄位架構，將「近30日觸發次數」動態插入第 4 欄
+            base_cols = ['股票代號', '股票名稱', '觸發日期']
+            if st.session_state.enable_30d_backtest:
+                base_cols.append('近30日觸發次數')
+                
+            base_cols.extend([
+                '演算法建議結果', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
                 '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', 
                 '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
-            ]
+            ])
             
             # 動態插入週K判定欄位
             if st.session_state.use_weekly_filter:
