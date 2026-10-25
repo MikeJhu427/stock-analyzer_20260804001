@@ -516,7 +516,7 @@ class PriceVolDivergenceStrategy:
         return res
 
 # ==========================================
-# 長長下引突破 (優化版：量能與絕對振幅確認、放寬追溯天數)
+# 長長下引突破 (進階容錯優化版：適應真實資料源微小差異)
 # ==========================================
 class LongLowerShadowBreakoutStrategy:
     @staticmethod
@@ -543,24 +543,24 @@ class LongLowerShadowBreakoutStrategy:
             std20 = df['Close'].rolling(20).std()
             df['BB_Lower'] = df['MA20'] - 2 * std20
 
-        # 1. 當日條件：紅K、漲幅>=3.5%、上影線放寬至 < 30%，且「今日量 > 昨日量」
+        # 1. 當日條件：紅K、漲幅>=3.0%(微調)、上影線放寬至 < 40%，且「今日量 > 昨日量」
         cond_today = (
             (df['Close'] > df['Open']) & 
-            (df['Pct_Change'] >= 3.5) & 
-            (df['Upper_Shadow_Ratio'] < 0.30) & 
+            (df['Pct_Change'] >= 3.0) & 
+            (df['Upper_Shadow_Ratio'] < 0.40) & 
             (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
         )
         
-        # 2. 關鍵K線條件：下影線佔>40%、最低價破前低、振幅>=2.5%、跌破布林下軌、收盤在月線下
+        # 2. 關鍵K線條件：下影線佔>=30%、最低價破前低、振幅>=1.5%、跌破布林下軌(給1.5%緩衝)、收盤在月線下
         target_k_mask = (
-            (df['Lower_Shadow_Ratio'] > 0.40) & 
+            (df['Lower_Shadow_Ratio'] >= 0.30) & 
             (df['Low'] < df['Low'].shift(1)) &     
-            (df['K_Amplitude'] >= 2.5) & 
-            (df['Low'] < df['BB_Lower']) &
+            (df['K_Amplitude'] >= 1.5) & 
+            (df['Low'] <= df['BB_Lower'] * 1.015) & 
             (df['Close'] < df['MA20']) 
         )
         
-        # 3. 尋找前 10 日內是否符合並突破 (修正原先只找 5 天被濾掉的問題)
+        # 3. 尋找前 10 日內是否符合並突破
         for i in range(1, 11):
             is_target_k_past = target_k_mask.shift(i)
             target_k_high = df['High'].shift(i)
@@ -625,7 +625,7 @@ class FinancialAuditStrategy:
         
     @staticmethod
     def _growth(current, previous):
-        if pd.isna(current) or pd.isna(previous) or abs(previous) < 1e-9: return np.nan
+        if pd.isna(current) or pd.isna(current) or pd.isna(previous) or abs(previous) < 1e-9: return np.nan
         return (current - previous) / abs(previous) * 100
 
     @staticmethod
