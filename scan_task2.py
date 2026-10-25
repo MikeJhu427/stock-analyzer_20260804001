@@ -629,7 +629,7 @@ def run_full_scan():
                             "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
                             "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                             "近30日觸發次數": count_30d if CONFIG["enable_30d_backtest"] else "-",
-                            "當日收收盤": round(float(best_row['Close']), 2),
+                            "當日收盤": round(float(best_row['Close']), 2),
                             "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
                             "當日成交量(張)": int(best_row['Volume_Lots']),
                             "量增倍數": round(best_vol_mult, 2),
