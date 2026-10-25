@@ -382,12 +382,12 @@ class PriceVolDivergenceStrategy:
                 res.iloc[idx] = True
         return res
 
-# --- 新增模組：長長下引突破 (包含濾網優化 1~3) ---
+# --- 新增模組：長長下引突破 (進階容錯優化版：適應真實資料源微小差異) ---
 class LongLowerShadowBreakoutStrategy:
     @staticmethod
     def evaluate(df):
         res = pd.Series(False, index=df.index)
-        if len(df) < 20: return res  # 確保有足夠天數計算均線與均量
+        if len(df) < 20: return res  
         df = df.copy()
         
         range_hl = (df['High'] - df['Low']).replace(0, 1e-8) 
@@ -396,7 +396,7 @@ class LongLowerShadowBreakoutStrategy:
         
         df['Upper_Shadow_Ratio'] = (df['High'] - max_oc) / range_hl
         df['Lower_Shadow_Ratio'] = (min_oc - df['Low']) / range_hl
-        df['K_Amplitude'] = range_hl / df['Low'] * 100  # 絕對振幅(%)
+        df['K_Amplitude'] = range_hl / df['Low'] * 100  
         
         if 'Pct_Change' not in df.columns:
             df['Pct_Change'] = (df['Close'] / df['Close'].shift(1) - 1) * 100
@@ -408,30 +408,28 @@ class LongLowerShadowBreakoutStrategy:
             std20 = df['Close'].rolling(20).std()
             df['BB_Lower'] = df['MA20'] - 2 * std20
 
-        # 1. 當日條件：紅K、漲幅>=3.5%、無長上影線，且「今日量 > 昨日量」 (移除當日收盤需在月線下)
+        # 1. 當日條件：紅K、漲幅>=3.0%(微調)、上影線放寬至 < 40%，且「今日量 > 昨日量」
         cond_today = (
             (df['Close'] > df['Open']) & 
-            (df['Pct_Change'] >= 3.5) & 
-            (df['Upper_Shadow_Ratio'] < 0.15) & 
+            (df['Pct_Change'] >= 3.0) & 
+            (df['Upper_Shadow_Ratio'] < 0.40) & 
             (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
         )
         
-        # 2. 關鍵K線條件：下影線佔半、破前低、振幅>=3.0%(建議2)、爆出大於均量(建議1)、跌破布林下軌(建議3)、收盤在月線下(新增至此)
+        # 2. 關鍵K線條件：下影線佔>=30%、最低價破前低、振幅>=1.5%、跌破布林下軌(給1.5%緩衝)、收盤在月線下
         target_k_mask = (
-            (df['Lower_Shadow_Ratio'] > 0.50) & 
-            (df['Open'] < df['Low'].shift(1)) &
-            (df['K_Amplitude'] >= 3.0) & 
-            (df['Volume_Lots'] > df['Vol_MA20']) &
-            (df['Low'] < df['BB_Lower']) &
+            (df['Lower_Shadow_Ratio'] >= 0.30) & 
+            (df['Low'] < df['Low'].shift(1)) &     
+            (df['K_Amplitude'] >= 1.5) & 
+            (df['Low'] <= df['BB_Lower'] * 1.015) & 
             (df['Close'] < df['MA20']) 
         )
         
-        # 3. 尋找前 5 日內是否符合並突破
-        for i in range(1, 6):
+        # 3. 尋找前 10 日內是否符合並突破
+        for i in range(1, 11):
             is_target_k_past = target_k_mask.shift(i)
             target_k_high = df['High'].shift(i)
             
-            # 純突破，不加入停損距離控管 (捨棄建議4)
             cond_breakout = df['Close'] > target_k_high
             
             valid = cond_today & is_target_k_past & cond_breakout
@@ -631,7 +629,7 @@ def run_full_scan():
                             "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
                             "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                             "近30日觸發次數": count_30d if CONFIG["enable_30d_backtest"] else "-",
-                            "當日收盤": round(float(best_row['Close']), 2),
+                            "當日收收盤": round(float(best_row['Close']), 2),
                             "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
                             "當日成交量(張)": int(best_row['Volume_Lots']),
                             "量增倍數": round(best_vol_mult, 2),
