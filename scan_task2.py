@@ -19,13 +19,13 @@ warnings.filterwarnings("ignore")
 # 核心參數設定 (100% 比照 app.py 預設值)
 # ==========================================
 CONFIG = {
-    "algo_mode": "全部",               # 啟用全部演算法 (底部翻轉 / VCP / 指標共振 / 量價雙背離)
+    "algo_mode": "全部",               
     "lookback_end": 0,
     "lookback_start": 0,
-    "min_score": 8.0,                  # 底部翻轉最低分
-    "min_vcp_score": 10.0,             # VCP 最低分
-    "min_reso_score": 10.0,            # 指標共振最低分
-    "min_vol_ma20": 1000,              # 月均量門檻 (張)
+    "min_score": 8.0,                  
+    "min_vcp_score": 10.0,             
+    "min_reso_score": 10.0,            
+    "min_vol_ma20": 1000,              
     "use_single_div": False,
     "div_recent_w": 5,
     "div_older_w": 20,
@@ -51,11 +51,11 @@ CONFIG = {
     "require_cross_confirm": True,
     "use_cross_position_filter": True,
     "cross_position_threshold": 70.0,
-    "use_weekly_filter": True,          # 週K共振與背離
-    "enable_30d_backtest": True,        # 30天觸發次數統計
-    "show_ma120_240_bear_align": True,  # 年線/半年線空排
-    "show_ma240_slope": True,           # 年線斜率
-    "show_ma120_slope": True            # 半年線斜率
+    "use_weekly_filter": True,          
+    "enable_30d_backtest": True,        
+    "show_ma120_240_bear_align": True,  
+    "show_ma240_slope": True,           
+    "show_ma120_slope": True            
 }
 
 # ==========================================
@@ -382,20 +382,14 @@ class PriceVolDivergenceStrategy:
                 res.iloc[idx] = True
         return res
 
-# ==========================================
-# 新增模組：長長下引突破 (獨立邏輯)
-# ==========================================
+# --- 新增模組：長長下引突破 ---
 class LongLowerShadowBreakoutStrategy:
     @staticmethod
     def evaluate(df):
         res = pd.Series(False, index=df.index)
-        if len(df) < 10:
-            return res
-            
+        if len(df) < 10: return res
         df = df.copy()
         
-        # 依照需求定義計算欄位
-        # 避免最高與最低相等導致除以零
         range_hl = (df['High'] - df['Low']).replace(0, 1e-8) 
         max_oc = df[['Open', 'Close']].max(axis=1)
         min_oc = df[['Open', 'Close']].min(axis=1)
@@ -405,37 +399,18 @@ class LongLowerShadowBreakoutStrategy:
         
         if 'Pct_Change' not in df.columns:
             df['Pct_Change'] = (df['Close'] / df['Close'].shift(1) - 1) * 100
-            
         if 'MA20' not in df.columns:
             df['MA20'] = df['Close'].rolling(window=20).mean()
 
-        # 1.1 當日條件判斷
-        # 紅k(收盤>開盤)、漲幅+3.5%、上引佔比<15%、收盤價格<20均線
-        cond_today = (
-            (df['Close'] > df['Open']) & 
-            (df['Pct_Change'] >= 3.5) & 
-            (df['Upper_Shadow_Ratio'] < 0.15) & 
-            (df['Close'] < df['MA20'])
-        )
-        
-        # 1.2 前n天關鍵K線條件
-        # 下引佔比>50% 且 開盤 < 前一日最低點
+        cond_today = (df['Close'] > df['Open']) & (df['Pct_Change'] >= 3.5) & (df['Upper_Shadow_Ratio'] < 0.15) & (df['Close'] < df['MA20'])
         target_k_mask = (df['Lower_Shadow_Ratio'] > 0.50) & (df['Open'] < df['Low'].shift(1))
         
-        # 1.3 尋找前5日(不含當日)是否出現關鍵K線，且今日收盤 > 該K線最高價
         for i in range(1, 6):
-            # i天前是否為關鍵K線
             is_target_k_past = target_k_mask.shift(i)
-            # 該關鍵K線的最高價
             target_k_high = df['High'].shift(i)
-            
-            # 當日收盤突破關鍵K線最高價
             cond_breakout = df['Close'] > target_k_high
-            
-            # 綜合條件：當日滿足 cond_today 且 i天前為關鍵K線 且 當日發生突破
             valid = cond_today & is_target_k_past & cond_breakout
             res = res | valid.fillna(False)
-            
         return res
 
 # ==========================================
@@ -506,88 +481,336 @@ def run_full_scan():
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i+chunk_size]
         try:
-            # 依據需求，設定 auto_adjust=True 讓回傳的皆為還原股價
-            data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=yf_session, auto_adjust=True)
+            data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=yf_session)
             for ticker in chunk:
                 try:
-                    # 處理 yfinance 多重索引欄位格式
                     if isinstance(data.columns, pd.MultiIndex):
-                        df = data.xs(ticker, axis=1, level=1).dropna(how='all')
+                        if ticker in data.columns.get_level_values(0):
+                            df = data.xs(ticker, axis=1, level=0).dropna(how='all')
+                        elif ticker in data.columns.get_level_values(1):
+                            df = data.xs(ticker, axis=1, level=1).dropna(how='all')
+                        else: df = pd.DataFrame()
                     else:
-                        # 只有一檔股票時的回傳處理
-                        df = data.dropna(how='all')
+                        df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
 
-                    if len(df) < 60:
-                        continue
-                        
-                    # 建立基礎技術欄位以利各策略模組順暢運作
-                    df['Volume_Lots'] = df['Volume'] / 1000
-                    df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
-                    df['MA20'] = df['Close'].rolling(20).mean()
-                    df['MA60'] = df['Close'].rolling(60).mean()
-                    df['BB_Center'] = df['MA20']
-                    df['BB_Std'] = df['Close'].rolling(20).std()
-                    df['BB_Upper'] = df['BB_Center'] + 2 * df['BB_Std']
-                    df['BB_Lower'] = df['BB_Center'] - 2 * df['BB_Std']
-                    df['BIAS20'] = (df['Close'] - df['MA20']) / df['MA20'] * 100
-                    df['Pct_Change'] = (df['Close'] / df['Close'].shift(1) - 1) * 100
-                    
-                    # 加入共用技術指標
+                    if df.empty or len(df) <= CONFIG["lookback_start"] + 20: continue
+
                     df = TechnicalIndicators.add_kd(df)
                     df = TechnicalIndicators.add_macd(df)
                     df = TechnicalIndicators.add_rsi(df)
-                    
-                    # 執行原有策略檢測
-                    bottom_score = BottomReversalStrategy.evaluate(df)
-                    vcp_score = VCPStrategy.evaluate(df)
-                    reso_score = IndicatorResonanceStrategy.evaluate(df, 
-                        recent_w=CONFIG['div_recent_w'], 
-                        older_w=CONFIG['div_older_w']
+                    expert_res_df = ExpertTradingStrategy.evaluate(df)
+
+                    df['Pct_Change'] = df['Close'].pct_change() * 100
+                    df['Volume_Lots'] = df['Volume'] / 1000
+                    df['MA20'] = df['Close'].rolling(20).mean()
+                    df['MA60'] = df['Close'].rolling(60).mean()
+                    df['BIAS20'] = (df['Close'] - df['MA20']) / (df['MA20'] + 1e-8) * 100
+                    df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
+
+                    std20 = df['Close'].rolling(20).std()
+                    df['BB_Upper'] = df['MA20'] + 2 * std20
+                    df['BB_Lower'] = df['MA20'] - 2 * std20
+
+                    df['KD_Cross'] = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
+                    if CONFIG["reso_macd_cross_zero"]:
+                        df['MACD_Cross'] = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
+                    else:
+                        macd_turn_up = (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) & (df['MACD_Hist'].shift(1) <= df['MACD_Hist'].shift(2))
+                        df['MACD_Cross'] = macd_turn_up | ((df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0))
+
+                    df['KD_Cross_Recent'] = df['KD_Cross'].rolling(window=CONFIG["reso_cross_days"], min_periods=1).max() >= 1
+                    df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=CONFIG["reso_cross_days"], min_periods=1).max() >= 1
+
+                    # 五大演算法打分 (加入長下引突破)
+                    df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
+                    df['VCP_Score'] = VCPStrategy.evaluate(df)
+                    price_col_for_div_eval = 'Low' if CONFIG["reso_price_basis"] == "最低價 (Low)" else 'Close'
+
+                    df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
+                        df, recent_w=CONFIG["div_recent_w"], older_w=CONFIG["div_older_w"],
+                        kd_older_low_th=CONFIG["reso_kd_older_low"], kd_older_high_th=CONFIG["reso_kd_older_high"],
+                        kd_recent_low_th=CONFIG["reso_kd_recent_low"], use_macd_abs=CONFIG["use_macd_abs"],
+                        macd_older_low_th=CONFIG["reso_macd_older_low"], macd_recent_low_th=CONFIG["reso_macd_recent_low"],
+                        cross_days=CONFIG["reso_cross_days"], require_price_higher_low=CONFIG["reso_price_higher_low"],
+                        require_macd_cross_zero=CONFIG["reso_macd_cross_zero"], reso_price_basis=CONFIG["reso_price_basis"],
+                        use_macd_wave_logic=CONFIG["reso_macd_wave_logic"], require_cross_confirm=CONFIG["require_cross_confirm"]
                     )
-                    
-                    # 執行新增獨立策略：長長下引突破
-                    breakout_signal = LongLowerShadowBreakoutStrategy.evaluate(df)
-                    
-                    # 取得當日(或指定回溯日)的運算結果
-                    last_idx = -1 - CONFIG['lookback_start']
-                    latest = df.iloc[last_idx]
-                    
-                    # 判斷是否觸發各策略
-                    is_bottom = bottom_score.iloc[last_idx] >= CONFIG['min_score']
-                    is_vcp = vcp_score.iloc[last_idx] >= CONFIG['min_vcp_score']
-                    is_reso = reso_score.iloc[last_idx] >= CONFIG['min_reso_score']
-                    is_breakout = breakout_signal.iloc[last_idx]
-                    
-                    # 新邏輯獨立於其他邏輯，只要符合任何一項（包含新邏輯）即列為候選
-                    if is_bottom or is_vcp or is_reso or is_breakout:
+
+                    df['PriceVol_Div_Pass'] = PriceVolDivergenceStrategy.evaluate(
+                        df, recent_w=CONFIG["div_recent_w"], older_w=CONFIG["div_older_w"],
+                        rl_cnt=CONFIG["recent_lows_cnt"], ol_cnt=CONFIG["older_lows_cnt"],
+                        p_left=CONFIG["pivot_left"], p_right=CONFIG["pivot_right"],
+                        req_cross=CONFIG["require_cross_confirm"], c_days=CONFIG["reso_cross_days"],
+                        price_col=price_col_for_div_eval
+                    )
+
+                    # 新增：長長下引突破訊號運算
+                    df['Breakout_Signal'] = LongLowerShadowBreakoutStrategy.evaluate(df)
+
+                    best_combined_score = -1
+                    best_row, best_offset = None, 0
+                    best_vol_mult = 0.0
+
+                    for offset in range(CONFIG["lookback_end"], CONFIG["lookback_start"] + 1):
+                        if len(df) <= offset + 1: continue
+                        t_row = df.iloc[-1 - offset]
+                        r_score, v_score, reso_score, vol_ma = t_row['Candle_Score'], t_row['VCP_Score'], t_row['Reso_Score'], t_row['Vol_MA20']
+
+                        prev_vol = df['Volume_Lots'].iloc[-2 - offset] if len(df) > offset + 1 else np.nan
+                        vol_mult = (t_row['Volume_Lots'] / prev_vol) if pd.notna(prev_vol) and prev_vol > 0 else 0.0
+
+                        if vol_ma >= CONFIG["min_vol_ma20"]:
+                            is_r_pass = r_score >= CONFIG["min_score"]
+                            is_v_pass = v_score >= CONFIG["min_vcp_score"]
+                            is_reso_pass = reso_score >= CONFIG["min_reso_score"]
+                            is_pv_div_pass = t_row.get('PriceVol_Div_Pass', False)
+                            is_breakout_pass = t_row.get('Breakout_Signal', False)  # 取得當下突破訊號
+
+                            # 只要符合任何一項邏輯(包含新邏輯)即列為候選
+                            if is_r_pass or is_v_pass or is_reso_pass or is_pv_div_pass or is_breakout_pass:
+                                combo_score = r_score + v_score + reso_score + (20 if is_pv_div_pass else 0) + (10 if is_breakout_pass else 0)
+                                if combo_score > best_combined_score or best_row is None:
+                                    best_combined_score = combo_score
+                                    best_row, best_offset = t_row, offset
+                                    best_vol_mult = vol_mult
+
+                    # 30天回測統計
+                    count_30d = 0
+                    if CONFIG["enable_30d_backtest"] and best_row is not None:
+                        for b_offset in range(best_offset + 1, best_offset + 31):
+                            if len(df) <= b_offset + 1: continue
+                            c_row = df.iloc[-1 - b_offset]
+                            c_vol_ma = c_row['Vol_MA20']
+                            if pd.isna(c_vol_ma): continue
+
+                            if c_vol_ma >= CONFIG["min_vol_ma20"]:
+                                c_r = c_row['Candle_Score'] >= CONFIG["min_score"]
+                                c_v = c_row['VCP_Score'] >= CONFIG["min_vcp_score"]
+                                c_reso = c_row['Reso_Score'] >= CONFIG["min_reso_score"]
+                                c_pv = c_row.get('PriceVol_Div_Pass', False)
+                                c_brk = c_row.get('Breakout_Signal', False) # 統計也加入新邏輯
+                                if c_r or c_v or c_reso or c_pv or c_brk: count_30d += 1
+
+                    if best_row is not None:
+                        clean_ticker = ticker.split('.')[0]
+                        last_expert = expert_res_df.iloc[-1 - best_offset]
+                        rec_status = "-"
+                        if CONFIG["use_cross_position_filter"]:
+                            k_val = float(best_row['K'])
+                            rec_status = "✅ 建議參考" if k_val < CONFIG["cross_position_threshold"] else "⚠️ 位置偏高"
+
+                        # 將新邏輯結果正確寫入候選名單，傳遞給 Phase 2
                         reversal_candidates[ticker] = {
-                            "代號": ticker,
-                            "名稱": stock_dict.get(ticker, ""),
-                            "收盤價": round(latest['Close'], 2),
-                            "漲跌幅(%)": round(latest['Pct_Change'], 2),
-                            "成交量(張)": round(latest['Volume_Lots'], 0),
-                            "底部翻轉": "✅" if is_bottom else "-",
-                            "VCP收斂": "✅" if is_vcp else "-",
-                            "指標共振": "✅" if is_reso else "-",
-                            "長下引突破": "🔥觸發" if is_breakout else "-"
+                            "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
+                            "股票代號": clean_ticker, "股票名稱": stock_dict[ticker],
+                            "觸發日期": best_row.name.strftime('%Y-%m-%d'),
+                            "近30日觸發次數": count_30d if CONFIG["enable_30d_backtest"] else "-",
+                            "當日收盤": round(float(best_row['Close']), 2),
+                            "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
+                            "當日成交量(張)": int(best_row['Volume_Lots']),
+                            "量增倍數": round(best_vol_mult, 2),
+                            "月均量(張)": int(best_row['Vol_MA20']),
+                            "DIF": round(float(best_row['MACD']), 3),
+                            "KD金叉判定": "✅ 是" if best_row['KD_Cross_Recent'] else "❌ 否",
+                            "MACD金叉判定": "✅ 是" if best_row['MACD_Cross_Recent'] else "❌ 否",
+                            "反轉分數": round(float(best_row['Candle_Score']), 2),
+                            "VCP分數": round(float(best_row['VCP_Score']), 2),
+                            "共振分數": round(float(best_row['Reso_Score']), 2),
+                            "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass', False) else "❌ 否",
+                            "長下引突破": "✅ 是" if best_row.get('Breakout_Signal', False) else "❌ 否",  # 新增欄位
+                            "進場位置建議": rec_status,
+                            "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
+                            "建議水位": ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
+                            "多週期KD": ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
                         }
+                except Exception: continue
+        except Exception: pass
+        time.sleep(1.0)
 
-                except Exception as e:
-                    # 忽略單一個股錯誤，確保流程繼續
-                    pass
-        except Exception as e:
-            # 忽略批次下載錯誤
-            pass
+    reversal_list = list(reversal_candidates.values())
+    print(f"🎯 第一階段篩選完畢，共入選 {len(reversal_list)} 檔標的。")
 
-    # 彙整與輸出結果
-    df_result = pd.DataFrame.from_dict(reversal_candidates, orient='index')
-    if not df_result.empty:
-        print(f"\n🎉 掃描完成！共發現 {len(df_result)} 檔符合條件的標的：")
-        print(df_result.to_string(index=False))
+    if not reversal_list:
+        print("💡 今日全市場無符合條件標的，任務結束。")
+        return
+
+    # --- Phase 2: 長天期下載與第二階段深度指標運算 ---
+    print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、年線與背離...")
+    candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
+    long_data = yf.download(candidate_tickers, period="2y", threads=False, progress=False, session=yf_session)
+
+    final_results = []
+    price_col_for_div = 'Low' if CONFIG["reso_price_basis"] == "最低價 (Low)" else 'Close'
+
+    for item in reversal_list:
+        try:
+            ticker = item.pop("_Full_Ticker")
+            specific_offset = item.pop("_Offset")
+            daily_df = item.pop("_Daily_DF")
+            has_daily_div, has_m60_div = False, False
+
+            item['年線/半年線空排'] = "無資料"
+            item['半年線斜率(%)'] = "無資料"
+            item['年線斜率(%)'] = "無資料"
+
+            try:
+                if isinstance(long_data.columns, pd.MultiIndex):
+                    if ticker in long_data.columns.get_level_values(0):
+                        long_df = long_data.xs(ticker, axis=1, level=0).dropna(how='all')
+                    elif ticker in long_data.columns.get_level_values(1):
+                        long_df = long_data.xs(ticker, axis=1, level=1).dropna(how='all')
+                    else: long_df = pd.DataFrame()
+                else:
+                    long_df = long_data.dropna(how='all') if len(candidate_tickers) == 1 else pd.DataFrame()
+
+                if not long_df.empty:
+                    if specific_offset > 0:
+                        long_df = long_df.iloc[:-specific_offset]
+
+                    if len(long_df) >= 120:
+                        ma120 = long_df['Close'].rolling(120).mean()
+                        item['半年線斜率(%)'] = round((ma120.iloc[-1] - ma120.iloc[-2]) / ma120.iloc[-2] * 100, 3)
+
+                    if len(long_df) >= 240:
+                        ma240 = long_df['Close'].rolling(240).mean()
+                        item['年線斜率(%)'] = round((ma240.iloc[-1] - ma240.iloc[-2]) / ma240.iloc[-2] * 100, 3)
+                        item['年線/半年線空排'] = "✅ 是" if ma120.iloc[-1] < ma240.iloc[-1] else "❌ 否"
+
+                    if CONFIG["use_weekly_filter"]:
+                        wk_res = WeeklyAnalysisStrategy.evaluate(
+                            long_df, div_pairs, CONFIG["recent_lows_cnt"], CONFIG["older_lows_cnt"],
+                            CONFIG["pivot_left"], CONFIG["pivot_right"], CONFIG["require_cross_confirm"],
+                            CONFIG["reso_cross_days"], price_col_for_div
+                        )
+                        item["週K共振"] = wk_res["週K共振"]
+                        item["週K背離"] = wk_res["週K背離"]
+            except Exception:
+                if CONFIG["use_weekly_filter"]:
+                    item["週K共振"] = "錯誤"
+                    item["週K背離"] = "錯誤"
+
+            if not daily_df.empty:
+                if specific_offset > 0:
+                    daily_df = daily_df.iloc[:-specific_offset]
+
+                for r_w, o_w in div_pairs:
+                    d_kd, d_macd = False, False
+                    for b in range(0, 25):
+                        if len(daily_df) <= b + r_w + o_w: break
+                        temp_df = daily_df.iloc[:len(daily_df)-b] if b > 0 else daily_df
+                        if not d_kd:
+                            d_kd = DivergenceStrategy.check_bottom_divergence(
+                                temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, CONFIG["recent_lows_cnt"],
+                                CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"],
+                                CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"]
+                            )
+                        if not d_macd:
+                            d_macd = DivergenceStrategy.check_bottom_divergence(
+                                temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, CONFIG["recent_lows_cnt"],
+                                CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"],
+                                CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"]
+                            )
+                        if d_kd and d_macd: break
+                    
+                    res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
+                    item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
+                    if res_tags: has_daily_div = True
+
+            try:
+                time.sleep(0.5)
+                m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", period="730d")
+                if specific_offset > 0 and not daily_df.empty:
+                    target_date = daily_df.index[-1].date()
+                    m60_df = m60_df[[d.date() <= target_date for d in m60_df.index]]
+
+                if not m60_df.empty:
+                    m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
+                    for r_w, o_w in div_pairs:
+                        d_kd, d_macd = False, False
+                        for b in range(0, 20):
+                            if len(m60_df) <= b + r_w + o_w: break
+                            temp_df = m60_df.iloc[:len(m60_df)-b] if b > 0 else m60_df
+                            if not d_kd:
+                                d_kd = DivergenceStrategy.check_bottom_divergence(
+                                    temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, CONFIG["recent_lows_cnt"],
+                                    CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"],
+                                    CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"]
+                                )
+                            if not d_macd:
+                                d_macd = DivergenceStrategy.check_bottom_divergence(
+                                    temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, CONFIG["recent_lows_cnt"],
+                                    CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"],
+                                    CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"]
+                                )
+                            if d_kd and d_macd: break
+                        res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
+                        item[f"60分K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
+                        if res_tags: has_m60_div = True
+                else:
+                    for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
+            except Exception:
+                for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
+
+            base_tags = []
+            if item.get("量價雙背離") == "✅ 是": base_tags.append("量價雙背離")
+            if item.get("長下引突破") == "✅ 是": base_tags.append("長下引突破") # 將新邏輯加入演算法建議結果
+            if item["反轉分數"] >= CONFIG["min_score"]: base_tags.append("底部翻轉")
+            if item["VCP分數"] >= CONFIG["min_vcp_score"]: base_tags.append("VCP收斂")
+            if item["共振分數"] >= CONFIG["min_reso_score"]: base_tags.append("指標共振")
+
+            div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
+            item["演算法建議結果"] = " & ".join(base_tags) + div_tag
+
+            final_results.append(item)
+        except Exception: continue
+
+    res_df = pd.DataFrame(final_results)
+
+    # 確保 `長下引突破` 被加入 CSV 輸出的 base_cols 中
+    base_cols = ['股票代號', '股票名稱', '觸發日期']
+    if CONFIG["enable_30d_backtest"]:
+        base_cols.append('近30日觸發次數')
+
+    base_cols.extend([
+        '演算法建議結果', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+        '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', 
+        '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
+    ])
+
+    if CONFIG["use_weekly_filter"]:
+        insert_idx = base_cols.index('盤整過濾') + 1
+        base_cols.insert(insert_idx, '週K共振')
+        base_cols.insert(insert_idx + 1, '週K背離')
+
+    if CONFIG["show_ma120_240_bear_align"]:
+        base_cols.append('年線/半年線空排')
+    if CONFIG["show_ma240_slope"]:
+        base_cols.append('年線斜率(%)')
+    if CONFIG["show_ma120_slope"]:
+        base_cols.append('半年線斜率(%)')
+
+    div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
+    cols = base_cols + div_cols
+    res_df = res_df[cols].sort_values(by=["共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False]).reset_index(drop=True)
+    res_df.index = res_df.index + 1
+
+    print("📊 掃描完成！最終報表標的預覽：")
+    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '當日收盤', '量增倍數']].to_string())
+
+    # --- 上傳 Google Drive ---
+    webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
+    token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
+
+    if webhook_url and token:
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        file_name = f"auto_scan_all_{today_str}.csv"
+        csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
+
+        print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
+        res = upload_to_gdrive(csv_bytes, file_name, webhook_url, token)
+        print(f"✅ 上傳結果: {res}")
     else:
-        print("\n🥺 本次掃描無符合條件的標的。")
-        
-    return df_result
+        print("⚠️ 未檢測到完整的 GAS_WEBHOOK_URL 或 GAS_SECRET_TOKEN 環境變數，略過上傳。")
 
 if __name__ == "__main__":
     run_full_scan()
