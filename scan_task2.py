@@ -382,12 +382,12 @@ class PriceVolDivergenceStrategy:
                 res.iloc[idx] = True
         return res
 
-# --- 新增模組：長長下引突破 ---
+# --- 新增模組：長長下引突破 (包含濾網優化 1~3) ---
 class LongLowerShadowBreakoutStrategy:
     @staticmethod
     def evaluate(df):
         res = pd.Series(False, index=df.index)
-        if len(df) < 10: return res
+        if len(df) < 20: return res  # 確保有足夠天數計算均線與均量
         df = df.copy()
         
         range_hl = (df['High'] - df['Low']).replace(0, 1e-8) 
@@ -396,21 +396,47 @@ class LongLowerShadowBreakoutStrategy:
         
         df['Upper_Shadow_Ratio'] = (df['High'] - max_oc) / range_hl
         df['Lower_Shadow_Ratio'] = (min_oc - df['Low']) / range_hl
+        df['K_Amplitude'] = range_hl / df['Low'] * 100  # 絕對振幅(%)
         
         if 'Pct_Change' not in df.columns:
             df['Pct_Change'] = (df['Close'] / df['Close'].shift(1) - 1) * 100
         if 'MA20' not in df.columns:
             df['MA20'] = df['Close'].rolling(window=20).mean()
+        if 'Vol_MA20' not in df.columns:
+            df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
+        if 'BB_Lower' not in df.columns:
+            std20 = df['Close'].rolling(20).std()
+            df['BB_Lower'] = df['MA20'] - 2 * std20
 
-        cond_today = (df['Close'] > df['Open']) & (df['Pct_Change'] >= 3.5) & (df['Upper_Shadow_Ratio'] < 0.15) & (df['Close'] < df['MA20'])
-        target_k_mask = (df['Lower_Shadow_Ratio'] > 0.50) & (df['Open'] < df['Low'].shift(1))
+        # 1. 當日條件：紅K、漲幅>=3.5%、無長上影線、收盤在月線下，且「今日量 > 昨日量」 (建議1)
+        cond_today = (
+            (df['Close'] > df['Open']) & 
+            (df['Pct_Change'] >= 3.5) & 
+            (df['Upper_Shadow_Ratio'] < 0.15) & 
+            (df['Close'] < df['MA20']) &
+            (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
+        )
         
+        # 2. 關鍵K線條件：下影線佔半、破前低、振幅>=3.0%(建議2)、爆出大於均量(建議1)、跌破布林下軌(建議3)
+        target_k_mask = (
+            (df['Lower_Shadow_Ratio'] > 0.50) & 
+            (df['Open'] < df['Low'].shift(1)) &
+            (df['K_Amplitude'] >= 3.0) & 
+            (df['Volume_Lots'] > df['Vol_MA20']) &
+            (df['Low'] < df['BB_Lower'])
+        )
+        
+        # 3. 尋找前 5 日內是否符合並突破
         for i in range(1, 6):
             is_target_k_past = target_k_mask.shift(i)
             target_k_high = df['High'].shift(i)
+            
+            # 純突破，不加入停損距離控管 (捨棄建議4)
             cond_breakout = df['Close'] > target_k_high
+            
             valid = cond_today & is_target_k_past & cond_breakout
             res = res | valid.fillna(False)
+            
         return res
 
 # ==========================================
