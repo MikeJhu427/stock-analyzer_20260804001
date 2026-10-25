@@ -516,7 +516,7 @@ class PriceVolDivergenceStrategy:
         return res
 
 # ==========================================
-# 長長下引突破 (優化版：量能與絕對振幅確認)
+# 長長下引突破 (優化版：量能與絕對振幅確認、放寬追溯天數)
 # ==========================================
 class LongLowerShadowBreakoutStrategy:
     @staticmethod
@@ -543,26 +543,25 @@ class LongLowerShadowBreakoutStrategy:
             std20 = df['Close'].rolling(20).std()
             df['BB_Lower'] = df['MA20'] - 2 * std20
 
-        # 1. 當日條件：紅K、漲幅>=3.5%、上影線放寬至 < 25%，且「今日量 > 昨日量」
+        # 1. 當日條件：紅K、漲幅>=3.5%、上影線放寬至 < 30%，且「今日量 > 昨日量」
         cond_today = (
             (df['Close'] > df['Open']) & 
             (df['Pct_Change'] >= 3.5) & 
-            (df['Upper_Shadow_Ratio'] < 0.25) &  # 優化1：放寬上影線容忍度
+            (df['Upper_Shadow_Ratio'] < 0.30) & 
             (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
         )
         
-        # 2. 關鍵K線條件：下影線佔半、最低價破前低、振幅>=3.0%、跌破布林下軌、收盤在月線下
+        # 2. 關鍵K線條件：下影線佔>40%、最低價破前低、振幅>=2.5%、跌破布林下軌、收盤在月線下
         target_k_mask = (
-            (df['Lower_Shadow_Ratio'] > 0.50) & 
-            (df['Low'] < df['Low'].shift(1)) &     # 優化2：修正破前低邏輯為最低價比較 (非跳空開低)
-            (df['K_Amplitude'] >= 3.0) & 
-            # (df['Volume_Lots'] > df['Vol_MA20']) & # 優化3：洗盤打底通常為量縮，移除強制大於月均量的限制
+            (df['Lower_Shadow_Ratio'] > 0.40) & 
+            (df['Low'] < df['Low'].shift(1)) &     
+            (df['K_Amplitude'] >= 2.5) & 
             (df['Low'] < df['BB_Lower']) &
             (df['Close'] < df['MA20']) 
         )
         
-        # 3. 尋找前 5 日內是否符合並突破
-        for i in range(1, 6):
+        # 3. 尋找前 10 日內是否符合並突破 (修正原先只找 5 天被濾掉的問題)
+        for i in range(1, 11):
             is_target_k_past = target_k_mask.shift(i)
             target_k_high = df['High'].shift(i)
             
