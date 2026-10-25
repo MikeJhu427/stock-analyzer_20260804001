@@ -543,22 +543,22 @@ class LongLowerShadowBreakoutStrategy:
             std20 = df['Close'].rolling(20).std()
             df['BB_Lower'] = df['MA20'] - 2 * std20
 
-        # 1. 當日條件：紅K、漲幅>=3.5%、無長上影線、收盤在月線下，且「今日量 > 昨日量」 
+        # 1. 當日條件：紅K、漲幅>=3.5%、無長上影線，且「今日量 > 昨日量」 (移除當日收盤需在月線下)
         cond_today = (
             (df['Close'] > df['Open']) & 
             (df['Pct_Change'] >= 3.5) & 
             (df['Upper_Shadow_Ratio'] < 0.15) & 
-            (df['Close'] < df['MA20']) &
             (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
         )
         
-        # 2. 關鍵K線條件：下影線佔半、破前低、振幅>=3.0%、爆出大於均量、跌破布林下軌
+        # 2. 關鍵K線條件：下影線佔半、破前低、振幅>=3.0%、爆出大於均量、跌破布林下軌、收盤在月線下(新增至此)
         target_k_mask = (
             (df['Lower_Shadow_Ratio'] > 0.50) & 
             (df['Open'] < df['Low'].shift(1)) &
             (df['K_Amplitude'] >= 3.0) & 
             (df['Volume_Lots'] > df['Vol_MA20']) &
-            (df['Low'] < df['BB_Lower'])
+            (df['Low'] < df['BB_Lower']) &
+            (df['Close'] < df['MA20']) 
         )
         
         # 3. 尋找前 5 日內是否符合並突破
