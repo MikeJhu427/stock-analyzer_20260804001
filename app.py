@@ -471,7 +471,7 @@ class IndicatorResonanceStrategy:
         return resonance_score
 
 # ==========================================
-# 量價雙背離 (嚴格量增且破底指標發動 - 完美解決發動落差問題)
+# 量價雙背離 (嚴格量增且破底指標發動)
 # ==========================================
 class PriceVolDivergenceStrategy:
     @staticmethod
@@ -479,7 +479,6 @@ class PriceVolDivergenceStrategy:
         res = pd.Series(False, index=df.index)
         if len(df) < recent_w + older_w + 5: return res
         
-        # 1. 第一階段：短線嚴格價量快篩 (放寬容差至 3.4~10.5%, 2.4~15.0倍)
         cond_pct = df['Pct_Change'].between(3.4, 10.5)
         cond_vol_abs = df['Volume_Lots'] >= 1000
         prev_vol = df['Volume_Lots'].shift(1)
@@ -489,7 +488,6 @@ class PriceVolDivergenceStrategy:
         pv_mask = cond_pct & cond_vol_abs & cond_vol_mult
         valid_idx = np.where(pv_mask)[0]
         
-        # 2. 第二階段：對有「價量發動」的日子，往前回溯確認底背離
         for idx in valid_idx:
             d_kd = False
             d_macd = False
@@ -515,6 +513,64 @@ class PriceVolDivergenceStrategy:
             if d_kd and d_macd:
                 res.iloc[idx] = True
                 
+        return res
+
+# ==========================================
+# 長長下引突破 (優化版：量能與絕對振幅確認)
+# ==========================================
+class LongLowerShadowBreakoutStrategy:
+    @staticmethod
+    def evaluate(df):
+        res = pd.Series(False, index=df.index)
+        if len(df) < 20: return res  
+        df = df.copy()
+        
+        range_hl = (df['High'] - df['Low']).replace(0, 1e-8) 
+        max_oc = df[['Open', 'Close']].max(axis=1)
+        min_oc = df[['Open', 'Close']].min(axis=1)
+        
+        df['Upper_Shadow_Ratio'] = (df['High'] - max_oc) / range_hl
+        df['Lower_Shadow_Ratio'] = (min_oc - df['Low']) / range_hl
+        df['K_Amplitude'] = range_hl / df['Low'] * 100  # 絕對振幅(%)
+        
+        if 'Pct_Change' not in df.columns:
+            df['Pct_Change'] = (df['Close'] / df['Close'].shift(1) - 1) * 100
+        if 'MA20' not in df.columns:
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+        if 'Vol_MA20' not in df.columns:
+            df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
+        if 'BB_Lower' not in df.columns:
+            std20 = df['Close'].rolling(20).std()
+            df['BB_Lower'] = df['MA20'] - 2 * std20
+
+        # 1. 當日條件：紅K、漲幅>=3.5%、無長上影線、收盤在月線下，且「今日量 > 昨日量」 
+        cond_today = (
+            (df['Close'] > df['Open']) & 
+            (df['Pct_Change'] >= 3.5) & 
+            (df['Upper_Shadow_Ratio'] < 0.15) & 
+            (df['Close'] < df['MA20']) &
+            (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
+        )
+        
+        # 2. 關鍵K線條件：下影線佔半、破前低、振幅>=3.0%、爆出大於均量、跌破布林下軌
+        target_k_mask = (
+            (df['Lower_Shadow_Ratio'] > 0.50) & 
+            (df['Open'] < df['Low'].shift(1)) &
+            (df['K_Amplitude'] >= 3.0) & 
+            (df['Volume_Lots'] > df['Vol_MA20']) &
+            (df['Low'] < df['BB_Lower'])
+        )
+        
+        # 3. 尋找前 5 日內是否符合並突破
+        for i in range(1, 6):
+            is_target_k_past = target_k_mask.shift(i)
+            target_k_high = df['High'].shift(i)
+            
+            cond_breakout = df['Close'] > target_k_high
+            
+            valid = cond_today & is_target_k_past & cond_breakout
+            res = res | valid.fillna(False)
+            
         return res
 
 # ==========================================
@@ -1286,6 +1342,7 @@ with tab2:
         st.markdown("""
         **【演算法核心邏輯說明】**
         *   **量價雙背離 (Price-Vol Divergence)**：要求嚴格的第一階段過濾（單日漲幅 3.4%~10.5%、量大於千張且為昨日 2.4~15 倍），篩出具備動能標的後，再確認近期內是否有 KD 與 MACD (DIF-MACD) 雙指標底部背離發動。
+        *   **長下引突破 (Lower Shadow Breakout)**：找出近期曾出現帶量重挫但留長下影線（洗盤）之標的，若今日帶量紅K成功突破該洗盤K線高點，即為翻多發動訊號。
         *   **底部翻轉 (Bottom Reversal)**：尋找下跌趨勢末端的轉折訊號。邏輯包含：K線下影線長度需大於實體與整體波動的一定比例（如釘子線），或出現低檔帶量長紅K。分數越高代表買盤反撲力道越強。
         *   **VCP收斂 (Volatility Contraction)**：尋找均線多頭排列且進行量縮震盪的標的。邏輯：股價站上月線且大於季線、近期成交量低於月均量（量縮），且布林通道極度壓縮。分數越高代表收斂越緊密。
         *   **指標共振 (Indicator Resonance)**：結合動能與趨勢的雙重確認。邏輯：KD指標在指定天數內發生低檔背離或金叉，同時MACD柱狀體縮腳翻揚或突破零軸金叉。兩者同步發出多頭訊號即判定為共振。
@@ -1334,7 +1391,7 @@ with tab2:
             if scan_target_mode == '指定個股測試':
                 test_ticker_input = st.text_input("輸入測試股票代號", value="6147", placeholder="例如: 2330").strip()
         with col_m3:
-            algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離'], index=0, horizontal=True)
+            algo_mode = st.radio("請選擇欲執行的掃描演算法", ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破'], index=0, horizontal=True)
             
         if algo_mode == '全部' and scan_target_mode == '全市場掃描':
             st.warning("💡 提示：您目前選擇【全部】演算法，標的只要符合「任一」條件即會列出。請務必查看表格中的『演算法建議結果』確認觸發類型！")
@@ -1566,6 +1623,12 @@ with tab2:
                             )
                         else:
                             df['PriceVol_Div_Pass'] = pd.Series(False, index=df.index)
+
+                        # === 長下引突破模組 ===
+                        if algo_mode in ['全部', '長下引突破']:
+                            df['Breakout_Signal'] = LongLowerShadowBreakoutStrategy.evaluate(df)
+                        else:
+                            df['Breakout_Signal'] = pd.Series(False, index=df.index)
                         
                         # 將 expert_res_df 與原資料整合，供個股測試時完整呈現
                         if scan_target_mode == "指定個股測試":
@@ -1593,11 +1656,12 @@ with tab2:
                                 is_r_pass = (algo_mode in ['全部', '底部翻轉']) and (r_score >= st.session_state.min_score)
                                 is_v_pass = (algo_mode in ['全部', 'VCP']) and (v_score >= st.session_state.min_vcp_score)
                                 is_reso_pass = (algo_mode in ['全部', '指標共振']) and (reso_score >= st.session_state.min_reso_score)
-                                is_pv_div_pass = (algo_mode in ['全部', '量價雙背離']) and t_row['PriceVol_Div_Pass']
+                                is_pv_div_pass = (algo_mode in ['全部', '量價雙背離']) and t_row.get('PriceVol_Div_Pass', False)
+                                is_breakout_pass = (algo_mode in ['全部', '長下引突破']) and t_row.get('Breakout_Signal', False)
                                 
                                 # 只要有任一條件過關，或開啟指定測試模式，即加入初步名單並記錄
-                                if is_r_pass or is_v_pass or is_reso_pass or is_pv_div_pass or force_pass:
-                                    combo_score = r_score + v_score + reso_score + (20 if is_pv_div_pass else 0)
+                                if is_r_pass or is_v_pass or is_reso_pass or is_pv_div_pass or is_breakout_pass or force_pass:
+                                    combo_score = r_score + v_score + reso_score + (20 if is_pv_div_pass else 0) + (10 if is_breakout_pass else 0)
                                     if combo_score > best_combined_score or best_row is None:
                                         best_combined_score = combo_score
                                         best_row, best_offset = t_row, offset
@@ -1619,8 +1683,9 @@ with tab2:
                                     c_v_pass = (algo_mode in ['全部', 'VCP']) and (c_row['VCP_Score'] >= st.session_state.min_vcp_score)
                                     c_reso_pass = (algo_mode in ['全部', '指標共振']) and (c_row['Reso_Score'] >= st.session_state.min_reso_score)
                                     c_pv_pass = (algo_mode in ['全部', '量價雙背離']) and c_row.get('PriceVol_Div_Pass', False)
+                                    c_brk = (algo_mode in ['全部', '長下引突破']) and c_row.get('Breakout_Signal', False)
                                     
-                                    if c_r_pass or c_v_pass or c_reso_pass or c_pv_pass:
+                                    if c_r_pass or c_v_pass or c_reso_pass or c_pv_pass or c_brk:
                                         count_30d += 1
                         
                         if best_row is not None:
@@ -1653,6 +1718,7 @@ with tab2:
                                 "VCP分數": round(float(best_row['VCP_Score']), 2),
                                 "共振分數": round(float(best_row['Reso_Score']), 2),
                                 "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass', False) else "❌ 否",
+                                "長下引突破": "✅ 是" if best_row.get('Breakout_Signal', False) else "❌ 否",
                                 "進場位置建議": rec_status,
                                 "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
@@ -1827,7 +1893,8 @@ with tab2:
                         for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
 
                     base_tags = []
-                    if item["量價雙背離"] == "✅ 是": base_tags.append("量價雙背離")
+                    if item.get("量價雙背離") == "✅ 是": base_tags.append("量價雙背離")
+                    if item.get("長下引突破") == "✅ 是": base_tags.append("長下引突破")
                     if item["反轉分數"] >= st.session_state.min_score: base_tags.append("底部翻轉")
                     if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP收斂")
                     if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
@@ -1852,7 +1919,7 @@ with tab2:
                 base_cols.append('近30日觸發次數')
                 
             base_cols.extend([
-                '演算法建議結果', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+                '演算法建議結果', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
                 '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', 
                 '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
             ])
@@ -2022,6 +2089,7 @@ with tab2:
                         'KD_Cross_Recent': 'KD近期金叉',
                         'MACD_Cross_Recent': 'MACD近期金叉',
                         'PriceVol_Div_Pass': '量價雙背離',
+                        'Breakout_Signal': '長下引突破',
                         'RSI盤整': 'RSI盤整中',
                         '多空指標數': '多空指標數',
                         '日KD多': '日KD偏多',
