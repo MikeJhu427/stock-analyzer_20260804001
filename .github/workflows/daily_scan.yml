@@ -1,10 +1,10 @@
 name: 台股每日盤後量價雙背離自動掃描
 
 on:
-  schedule:
-    # 台灣時間週一至週五 17:37 執行 (UTC 時間為 09:37，避開 35 分高峰以減少延遲)
-    - cron: '37 9 * * 1-5'
-  workflow_dispatch: # 保留手動按鈕隨時測試
+  # schedule:
+  #   # 台灣時間週一至週五 17:37 執行 (UTC 時間為 09:37，避開 35 分高峰以減少延遲)
+  #   - cron: '37 9 * * 1-5'
+  workflow_dispatch: # 保留手動按鈕與 API (GAS) 觸發
 
 jobs:
   run-scanner:
@@ -20,7 +20,7 @@ jobs:
 
       - name: 安裝依賴套件
         run: |
-          pip install yfinance pandas requests beautifulsoup4
+          pip install yfinance pandas requests
 
       - name: 執行全市場掃描並上傳至 Google Drive
         env:
