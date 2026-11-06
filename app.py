@@ -1253,7 +1253,6 @@ class QuantPatternEngine:
 
                 if neck_price <= max(t1.price, t2.price): continue
 
-                # 【修正】：位階濾網檢驗時，確保抓取真正的區間低點與高點，並且扣除當下 pivot 本身造成「永遠是0%」的盲點
                 lookback_start = max(0, t1.idx - 60)
                 if t1.idx > lookback_start:
                     hist_low = float(low_series.iloc[lookback_start : t1.idx].min())
@@ -1288,7 +1287,6 @@ class QuantPatternEngine:
                 price_diff = abs(p1.price - p2.price) / min(p1.price, p2.price)
                 if price_diff > cfg.price_sim_threshold: continue
 
-                # 排除明顯「頭頭高」上升波段被誤判為 M 頭
                 if cfg.enable_regime_filter and (p2.price - p1.price) / p1.price > 0.025:
                     continue
 
@@ -1304,7 +1302,6 @@ class QuantPatternEngine:
 
                 if neck_price >= min(p1.price, p2.price): continue
 
-                # 【修正】：位階濾網檢驗防盲點
                 lookback_start = max(0, p1.idx - 60)
                 if p1.idx > lookback_start:
                     hist_low = float(low_series.iloc[lookback_start : p1.idx].min())
@@ -1331,10 +1328,8 @@ class QuantPatternEngine:
 
         return patterns
 
-    # 【修正】：全新 evaluate_state_machine (修正量能覆寫、保留觸發日、修補死胡同狀態與起算點)
     def evaluate_state_machine(self, df: pd.DataFrame, pat: GeometricPattern) -> GeometricPattern:
         cfg = self.cfg
-        # 從右腳次日開始追蹤，避免漏算極值確認期內的快速突破
         eval_start_idx = pat.swing2.idx + 1
         if eval_start_idx >= len(df):
             pat.state = PatternState.FORMING
@@ -1364,7 +1359,6 @@ class QuantPatternEngine:
                             temp_break_date = cur_date
                             temp_vol_conf = (vol_ratio >= cfg.vol_multiplier)
                         else:
-                            # 期間內任一天達標量能即算有效放量
                             temp_vol_conf = temp_vol_conf or (vol_ratio >= cfg.vol_multiplier)
 
                         if consecutive_break_days >= cfg.breakout_days:
@@ -1486,7 +1480,6 @@ class QuantPatternEngine:
         else:
             c_type = "橫向區間箱型通道 (Horizontal Box Channel)"
 
-        # 處理極端收斂至交錯導致壓力與支撐互換之情境
         if proj_upper < proj_lower:
             c_type += " (⚠️ 趨勢線已收斂交叉失效)"
 
@@ -1501,14 +1494,12 @@ class QuantPatternEngine:
         break_date = None
         vol_conf = False
 
-        # 【修正】：動態軌道狀態檢查 - 正確重置拉回軌道內的狀態、正確保留首次跌破日期與量能
         for i in range(start_eval, len(df)):
             cur_c = df['Close'].iloc[i]
             cur_vol_r = df['Vol_Ratio'].iloc[i]
             u_val = h2.price + upper_slope * (i - h2.idx)
             l_val = l2.price + lower_slope * (i - l2.idx)
             
-            # 若軌道已交叉，則不再進行有效突破判定
             if u_val < l_val:
                 state = "CHANNEL_INVALID (⚠️ 軌道已交叉失效)"
                 break_date = None
@@ -1554,13 +1545,12 @@ class QuantPatternEngine:
         eval_w = [self.evaluate_state_machine(df, p) for p in raw_w]
         eval_m = [self.evaluate_state_machine(df, p) for p in raw_m]
 
-        # 【修正】：過濾掉距離當前超過 120 天未發動且不活躍的老舊型態殘留
         active_w = [p for p in eval_w if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
         active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
 
         return {
-            'W': active_w[-1] if active_w else (eval_w[-1] if eval_w else None),
-            'M': active_m[-1] if active_m else (eval_m[-1] if eval_m else None)
+            'W': active_w[-1] if active_w else None,
+            'M': active_m[-1] if active_m else None
         }
 
 # ==========================================
@@ -2800,7 +2790,7 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
 
     col_q1, col_q2, col_q3 = st.columns([2.5, 1.5, 1])
     with col_q1:
-        q_input = st.text_input("輸入股票代號", value="2609", key="quant_engine_input", placeholder="例如：2609、2330").strip()
+        q_input = st.text_input("輸入股票代號", value="", key="quant_engine_input", placeholder="請填寫欲檢測之股票代號 (如: 2495)").strip()
     with col_q2:
         intraday_p = st.number_input("盤中即時價模擬 (0為不啟用)", min_value=0.0, value=0.0, step=0.1, help="若盤中出現急殺(如57.1)但Yahoo日K尚未更新，可輸入即時價立即查看破線狀態")
     with col_q3:
@@ -2826,17 +2816,14 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     engine = QuantPatternEngine(custom_cfg)
                     df = engine.clean_and_validate_data(df)
 
-                    # 【修正】：盤中即時價模擬邏輯 - 判斷最後一筆日期是否已為今日，避免重複產生K棒，並將虛擬量能調降為 1.0 倍中性平量
                     if intraday_p > 0:
                         last_dt = df.index[-1]
                         today_date = pd.Timestamp.now().date()
                         if last_dt.date() == today_date:
-                            # 盤中已存在今日 K 棒，直接更新最新一筆，不新增列
                             df.iloc[-1, df.columns.get_loc('High')] = max(float(df['High'].iloc[-1]), intraday_p)
                             df.iloc[-1, df.columns.get_loc('Low')] = min(float(df['Low'].iloc[-1]), intraday_p)
                             df.iloc[-1, df.columns.get_loc('Close')] = float(intraday_p)
                         else:
-                            # 收盤後或跨日模擬，量能預設採 20MA 的 1.0 倍（中性平量），避免強制觸發帶量確認
                             sim_dt = last_dt + pd.Timedelta(days=1)
                             prev_c = float(df['Close'].iloc[-1])
                             sim_row = pd.DataFrame({
@@ -2850,11 +2837,9 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
 
                     df = engine.compute_indicators(df)
                     
-                    # 1. 水平頸線 W底/M頭 雙模型分析
                     close_patterns = engine.analyze_pipeline(df=df, high_series=df['Close'], low_series=df['Close'])
                     shadow_patterns = engine.analyze_pipeline(df=df, high_series=df['High'], low_series=df['Low'])
                     
-                    # 2. 斜向趨勢線與收斂楔形/通道分析
                     diag_close = engine.identify_diagonal_channel(df=df, high_series=df['Close'], low_series=df['Close'])
                     diag_shadow = engine.identify_diagonal_channel(df=df, high_series=df['High'], low_series=df['Low'])
 
@@ -2937,7 +2922,6 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                         st.write(f"- **結構失效防線**：`{p.invalidation_level:.2f}` 元")
                         
                         if p.state in [PatternState.BREAKOUT_CONFIRMED, PatternState.RETEST, PatternState.DAY1_BREAK_WARNING]:
-                            # 【修正】：風報比分母改為以「頸線假突破容錯區」為實際停損防線，取代原本過深的失效防線
                             practical_sl = p.neckline.price * (1 - 0.01) if p.p_type == 'W' else p.neckline.price * (1 + 0.01)
                             risk = abs(l_price - practical_sl)
                             reward_1to1 = abs(p.target_1to1 - l_price)
