@@ -7,6 +7,8 @@ import datetime
 import time
 import base64
 import re
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
@@ -97,7 +99,7 @@ def save_config(config):
         logging.error(f"儲存設定檔失敗: {e}")
 
 # ==========================================
-# Google Apps Script Webhook 安全上傳模組 (搭配 Streamlit Secrets)
+# Google Apps Script Webhook 安全上傳模組
 # ==========================================
 class GoogleDriveUploader:
     @staticmethod
@@ -517,7 +519,7 @@ class PriceVolDivergenceStrategy:
         return res
 
 # ==========================================
-# 長長下引突破 (進階容錯優化版：適應真實資料源微小差異)
+# 長長下引突破 (進階容錯優化版)
 # ==========================================
 class LongLowerShadowBreakoutStrategy:
     @staticmethod
@@ -544,7 +546,6 @@ class LongLowerShadowBreakoutStrategy:
             std20 = df['Close'].rolling(20).std()
             df['BB_Lower'] = df['MA20'] - 2 * std20
 
-        # 1. 當日條件：紅K、漲幅>=3.0%(微調)、上影線放寬至 < 40%，且「今日量 > 昨日量」
         cond_today = (
             (df['Close'] > df['Open']) & 
             (df['Pct_Change'] >= 3.0) & 
@@ -552,7 +553,6 @@ class LongLowerShadowBreakoutStrategy:
             (df['Volume_Lots'] > df['Volume_Lots'].shift(1)) 
         )
         
-        # 2. 關鍵K線條件：下影線佔>=30%、最低價破前低、振幅>=1.5%、跌破布林下軌(給1.5%緩衝)、收盤在月線下
         target_k_mask = (
             (df['Lower_Shadow_Ratio'] >= 0.30) & 
             (df['Low'] < df['Low'].shift(1)) &     
@@ -561,7 +561,6 @@ class LongLowerShadowBreakoutStrategy:
             (df['Close'] < df['MA20']) 
         )
         
-        # 3. 尋找前 10 日內是否符合並突破
         for i in range(1, 11):
             is_target_k_past = target_k_mask.shift(i)
             target_k_high = df['High'].shift(i)
@@ -1027,9 +1026,6 @@ class FinancialAuditStrategy:
 class GeometricPatternStrategy:
     @staticmethod
     def calculate_geometric_patterns(df, high_col, low_col, window_order=5):
-        """
-        傳入 df 以及需要計算的極值基準欄位 (實體K為 Close/Close, 影線極值為 High/Low)
-        """
         high_idx = argrelextrema(df[high_col].values, np.greater, order=window_order)[0]
         low_idx = argrelextrema(df[low_col].values, np.less, order=window_order)[0]
         
@@ -1074,6 +1070,282 @@ class GeometricPatternStrategy:
             }
             
         return result
+
+# ==============================================================================
+# 程式A: 量化狀態機與資料結構定義 (匯入新增)
+# ==============================================================================
+@dataclass
+class QuantConfig:
+    window_order: int = 5           
+    price_sim_threshold: float = 0.05 
+    min_time_gap: int = 8           
+    max_time_gap: int = 60          
+    breakout_margin: float = 0.01   
+    breakout_days: int = 2          
+    vol_multiplier: float = 1.2     
+    risk_margin: float = 0.02       
+
+class PatternState:
+    FORMING = "FORMING (潛在型態形成中)"
+    NECKLINE_TEST = "NECKLINE_TEST (價格接近頸線測試)"
+    BREAKOUT_CONFIRMED = "BREAKOUT_CONFIRMED (有效突破/跌破頸線)"
+    RETEST = "RETEST (突破後回測頸線)"
+    BREAKOUT_FAILED = "BREAKOUT_FAILED (突破跌回頸線/假突破失敗)"
+    INVALIDATED = "INVALIDATED (價格破壞原始極值/型態結構失效)"
+    NONE = "NONE (尚未形成有效型態)"
+
+@dataclass
+class SwingPoint:
+    idx: int
+    date: pd.Timestamp
+    price: float
+    conf_date: pd.Timestamp        
+
+@dataclass
+class GeometricPattern:
+    p_type: str                     
+    swing1: SwingPoint
+    swing2: SwingPoint
+    neckline: SwingPoint
+    height: float
+    target_1to1: float
+    target_1618: float
+    invalidation_level: float       
+    state: str = PatternState.FORMING
+    breakout_date: Optional[pd.Timestamp] = None
+    vol_confirmed: bool = False
+
+class QuantPatternEngine:
+    def __init__(self, config: QuantConfig = QuantConfig()):
+        self.cfg = config
+
+    def clean_and_validate_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        if isinstance(df.columns, pd.MultiIndex):
+            if 'Price' in df.columns.names:
+                df.columns = df.columns.get_level_values('Price')
+            else:
+                df.columns = df.columns.get_level_values(0)
+
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"資料欄位缺失: {missing}")
+
+        df = df.copy()
+        valid_mask = (
+            (df['High'] >= df['Low']) &
+            (df['High'] >= df['Open']) &
+            (df['High'] >= df['Close']) &
+            (df['Low'] <= df['Open']) &
+            (df['Low'] <= df['Close']) &
+            (df['Volume'] >= 0) &
+            (df['Close'] > 0)
+        )
+        invalid_count = len(df) - valid_mask.sum()
+        if invalid_count > 0:
+            st.toast(f"提示：已過濾 {invalid_count} 筆邏輯矛盾之異常 OHLCV 數據。")
+            df = df[valid_mask]
+
+        df = df[~df.index.duplicated(keep='first')].sort_index()
+        return df
+
+    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df['20MA'] = df['Close'].rolling(window=20).mean()
+        df['60MA'] = df['Close'].rolling(window=60).mean()
+        df['120MA'] = df['Close'].rolling(window=120).mean()
+
+        rolling_std = df['Close'].rolling(window=20).std()
+        df['STD20'] = rolling_std
+        
+        df['BB_UCL'] = df['20MA'] + (2 * rolling_std)
+        df['BB_LCL'] = df['20MA'] - (2 * rolling_std)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z = (df['Close'] - df['20MA']) / rolling_std
+            z = np.where(rolling_std > 0, z, 0.0)
+            df['Z_Score'] = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+
+        df['Vol_20MA'] = df['Volume'].rolling(window=20).mean()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vol_ratio = df['Volume'] / df['Vol_20MA']
+            df['Vol_Ratio'] = np.where(df['Vol_20MA'] > 0, vol_ratio, 1.0)
+            df['Vol_Ratio'] = np.nan_to_num(df['Vol_Ratio'], nan=1.0)
+
+        return df
+
+    def find_swings(self, df: pd.DataFrame, series: pd.Series, is_high: bool) -> List[SwingPoint]:
+        swings = []
+        vals = series.values
+        dates = df.index
+        n = len(vals)
+        w = self.cfg.window_order
+
+        for i in range(w, n - w):
+            window = vals[i - w : i + w + 1]
+            center = vals[i]
+            
+            if is_high:
+                if center == np.max(window) and center > np.max(vals[i - w : i]):
+                    conf_idx = i + w
+                    swings.append(SwingPoint(i, dates[i], float(center), dates[conf_idx]))
+            else:
+                if center == np.min(window) and center < np.min(vals[i - w : i]):
+                    conf_idx = i + w
+                    swings.append(SwingPoint(i, dates[i], float(center), dates[conf_idx]))
+
+        return swings
+
+    def identify_patterns(self, df: pd.DataFrame, highs: List[SwingPoint], lows: List[SwingPoint], 
+                          p_type: str, high_series: pd.Series, low_series: pd.Series) -> List[GeometricPattern]:
+        patterns = []
+        cfg = self.cfg
+
+        if p_type == 'W':
+            if len(lows) < 2: return []
+            for i in range(len(lows) - 1):
+                t1, t2 = lows[i], lows[i + 1]
+                time_gap = t2.idx - t1.idx
+                if not (cfg.min_time_gap <= time_gap <= cfg.max_time_gap): continue
+                
+                price_diff = abs(t1.price - t2.price) / min(t1.price, t2.price)
+                if price_diff > cfg.price_sim_threshold: continue
+
+                if t2.idx - t1.idx <= 1: continue
+                mid_slice = high_series.iloc[t1.idx + 1 : t2.idx]
+                if mid_slice.empty: continue
+                
+                neck_price = float(mid_slice.max())
+                neck_rel_idx = mid_slice.values.argmax()
+                neck_abs_idx = t1.idx + 1 + neck_rel_idx
+                neck_date = df.index[neck_abs_idx]
+                neckline = SwingPoint(neck_abs_idx, neck_date, neck_price, neck_date)
+
+                if neck_price <= max(t1.price, t2.price): continue
+
+                h = neck_price - min(t1.price, t2.price)
+                pat = GeometricPattern(
+                    p_type='W', swing1=t1, swing2=t2, neckline=neckline,
+                    height=h, target_1to1=neck_price + h, target_1618=neck_price + (h * 1.618),
+                    invalidation_level=min(t1.price, t2.price) * (1 - cfg.risk_margin)
+                )
+                patterns.append(pat)
+
+        elif p_type == 'M':
+            if len(highs) < 2: return []
+            for i in range(len(highs) - 1):
+                p1, p2 = highs[i], highs[i + 1]
+                time_gap = p2.idx - p1.idx
+                if not (cfg.min_time_gap <= time_gap <= cfg.max_time_gap): continue
+                
+                price_diff = abs(p1.price - p2.price) / min(p1.price, p2.price)
+                if price_diff > cfg.price_sim_threshold: continue
+
+                if p2.idx - p1.idx <= 1: continue
+                mid_slice = low_series.iloc[p1.idx + 1 : p2.idx]
+                if mid_slice.empty: continue
+                
+                neck_price = float(mid_slice.min())
+                neck_rel_idx = mid_slice.values.argmin()
+                neck_abs_idx = p1.idx + 1 + neck_rel_idx
+                neck_date = df.index[neck_abs_idx]
+                neckline = SwingPoint(neck_abs_idx, neck_date, neck_price, neck_date)
+
+                if neck_price >= min(p1.price, p2.price): continue
+
+                h = max(p1.price, p2.price) - neck_price
+                pat = GeometricPattern(
+                    p_type='M', swing1=p1, swing2=p2, neckline=neckline,
+                    height=h, target_1to1=neck_price - h, target_1618=neck_price - (h * 1.618),
+                    invalidation_level=max(p1.price, p2.price) * (1 + cfg.risk_margin)
+                )
+                patterns.append(pat)
+
+        return patterns
+
+    def evaluate_state_machine(self, df: pd.DataFrame, pat: GeometricPattern) -> GeometricPattern:
+        cfg = self.cfg
+        eval_start_idx = pat.swing2.idx + cfg.window_order
+        if eval_start_idx >= len(df):
+            pat.state = PatternState.FORMING
+            return pat
+
+        consecutive_break_days = 0
+        current_state = PatternState.FORMING
+
+        for i in range(eval_start_idx, len(df)):
+            close_p = df['Close'].iloc[i]
+            vol_ratio = df['Vol_Ratio'].iloc[i]
+            cur_date = df.index[i]
+
+            if pat.p_type == 'W':
+                if close_p < pat.invalidation_level:
+                    current_state = PatternState.INVALIDATED
+                    break
+
+                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST]:
+                    if close_p >= pat.neckline.price * (1 + cfg.breakout_margin):
+                        consecutive_break_days += 1
+                        if consecutive_break_days >= cfg.breakout_days:
+                            current_state = PatternState.BREAKOUT_CONFIRMED
+                            pat.breakout_date = cur_date
+                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
+                    else:
+                        consecutive_break_days = 0
+                        if close_p >= pat.neckline.price * 0.98: current_state = PatternState.NECKLINE_TEST
+                        else: current_state = PatternState.FORMING
+                elif current_state == PatternState.BREAKOUT_CONFIRMED:
+                    if close_p < pat.neckline.price * (1 - cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
+                    elif close_p <= pat.neckline.price * (1 + cfg.breakout_margin): current_state = PatternState.RETEST
+                elif current_state == PatternState.RETEST:
+                    if close_p < pat.neckline.price * (1 - cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
+                    elif close_p > pat.neckline.price * (1 + cfg.breakout_margin * 2): current_state = PatternState.BREAKOUT_CONFIRMED
+
+            elif pat.p_type == 'M':
+                if close_p > pat.invalidation_level:
+                    current_state = PatternState.INVALIDATED
+                    break
+
+                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST]:
+                    if close_p <= pat.neckline.price * (1 - cfg.breakout_margin):
+                        consecutive_break_days += 1
+                        if consecutive_break_days >= cfg.breakout_days:
+                            current_state = PatternState.BREAKOUT_CONFIRMED
+                            pat.breakout_date = cur_date
+                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
+                    else:
+                        consecutive_break_days = 0
+                        if close_p <= pat.neckline.price * 1.02: current_state = PatternState.NECKLINE_TEST
+                        else: current_state = PatternState.FORMING
+                elif current_state == PatternState.BREAKOUT_CONFIRMED:
+                    if close_p > pat.neckline.price * (1 + cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
+                    elif close_p >= pat.neckline.price * (1 - cfg.breakout_margin): current_state = PatternState.RETEST
+                elif current_state == PatternState.RETEST:
+                    if close_p > pat.neckline.price * (1 + cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
+                    elif close_p < pat.neckline.price * (1 - cfg.breakout_margin * 2): current_state = PatternState.BREAKOUT_CONFIRMED
+
+        pat.state = current_state
+        return pat
+
+    def analyze_pipeline(self, df: pd.DataFrame, high_series: pd.Series, low_series: pd.Series) -> Dict[str, Optional[GeometricPattern]]:
+        highs = self.find_swings(df, high_series, is_high=True)
+        lows = self.find_swings(df, low_series, is_high=False)
+
+        raw_w = self.identify_patterns(df, highs, lows, 'W', high_series, low_series)
+        raw_m = self.identify_patterns(df, highs, lows, 'M', high_series, low_series)
+
+        eval_w = [self.evaluate_state_machine(df, p) for p in raw_w]
+        eval_m = [self.evaluate_state_machine(df, p) for p in raw_m]
+
+        active_w = [p for p in eval_w if p.state != PatternState.INVALIDATED]
+        active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED]
+
+        return {
+            'W': active_w[-1] if active_w else (eval_w[-1] if eval_w else None),
+            'M': active_m[-1] if active_m else (eval_m[-1] if eval_m else None)
+        }
 
 # ==========================================
 # 網路請求與全域快取
@@ -1183,13 +1455,31 @@ if missing_keys or "backtest_date_obj" not in st.session_state:
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
-# 依需求新增第 4 個分頁
-tab1, tab2, tab3, tab4 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)", "📑 財報三表地雷掃描／財報體質與風險分析", "📐 幾何型態滿足點測距"])
+# ----------------------------------------------------
+# 取代原有的 st.tabs，改用橫向單選紐 (st.radio) 作為快速切換分頁導航
+# ----------------------------------------------------
+page_options = [
+    "📊 單檔深度解析", 
+    "🚀 全市場智慧掃描", 
+    "📑 財報三表地雷掃描", 
+    "📐 幾何型態滿足點測距", 
+    "🤖 量化型態狀態機 (程式A)"
+]
+
+# 套用樣式，確保按鈕排版美觀
+st.markdown("""
+    <style>
+    div.row-widget.stRadio > div{flex-direction:row;flex-wrap:wrap;}
+    div.row-widget.stRadio > div > label{background-color: #f0f2f6; padding: 10px 15px; border-radius: 8px; margin-right: 10px; margin-bottom: 10px; cursor: pointer;}
+    </style>
+""", unsafe_allow_html=True)
+
+selected_page = st.radio("📌 快速切換功能分頁：", page_options, horizontal=True)
 
 # ----------------------------------------------------
 # 頁籤 1：單檔深度解析
 # ----------------------------------------------------
-with tab1:
+if selected_page == "📊 單檔深度解析":
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
 
     col1, col2 = st.columns([4, 1])
@@ -1390,7 +1680,7 @@ with tab1:
 # ----------------------------------------------------
 # 頁籤 2：全市場智慧掃描
 # ----------------------------------------------------
-with tab2:
+elif selected_page == "🚀 全市場智慧掃描":
     st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」或「雙指標共振」的標的，並針對入選標的進行多級別背離與均線扣抵判定。")
     
     with st.expander("📖 掃描參數與背離/扣抵判定定義說明", expanded=False):
@@ -1502,25 +1792,25 @@ with tab2:
         with col_r3:
             st.checkbox("啟用 MACD絕對數值濾網", key="use_macd_abs")
             st.number_input("MACD前波低 <", step=0.1, key="reso_macd_older_low", disabled=not st.session_state.use_macd_abs)
-            st.number_input("MACD近波低 >", step=0.1, key="reso_macd_recent_low", help="若要抓水下翻紅，請設為負數或 0.0", disabled=not st.session_state.use_macd_abs)
+            st.number_input("MACD近波低 >", step=0.1, key="reso_macd_recent_low", disabled=not st.session_state.use_macd_abs)
         with col_r4:
-            st.checkbox("嚴格要求股價底底高", key="reso_price_higher_low", help="不勾選則允許股價破底但指標背離 (典型底背離)")
-            st.checkbox("嚴格要求MACD金叉(>0)", key="reso_macd_cross_zero", help="不勾選則只要求柱狀圖谷底翻揚即可")
+            st.checkbox("嚴格要求股價底底高", key="reso_price_higher_low")
+            st.checkbox("嚴格要求MACD金叉(>0)", key="reso_macd_cross_zero")
         with col_r5:
             st.radio("價格比較基準", ["最低價 (Low)", "收盤價 (Close)"], key="reso_price_basis")
-            st.checkbox("MACD零軸動能波段判定", key="reso_macd_wave_logic", help="開啟後，MACD自動以0軸分界波段，無懼靜態天數限制精確比對。")
+            st.checkbox("MACD零軸動能波段判定", key="reso_macd_wave_logic")
             
         st.markdown("**6. 金叉確認與進場位置建議過濾**")
         col_x1, col_x2, col_x3 = st.columns(3)
         with col_x1:
-            st.checkbox("嚴格要求金叉確認背離與共振", key="require_cross_confirm", help="啟用後，發生背離且在設定天數內發生指標金叉，才判定為有效。")
+            st.checkbox("嚴格要求金叉確認背離與共振", key="require_cross_confirm")
         with col_x2:
-            st.checkbox("啟用進場位置建議 (K值過高提示)", key="use_cross_position_filter", help="依據觸發時的 K 值給予參考建議。")
+            st.checkbox("啟用進場位置建議 (K值過高提示)", key="use_cross_position_filter")
         with col_x3:
             st.number_input("建議參考的 K值上限 <", step=1.0, key="cross_position_threshold", disabled=not st.session_state.use_cross_position_filter)
 
         st.markdown("**7. 進階輔助濾網 (長天期驗證)**")
-        st.checkbox("啟用週K線共振與底背離判定 (預設開啟)", key="use_weekly_filter", help="在第二階段自動下載長天期資料並還原為週K線作大格局的背離與共振判斷。")
+        st.checkbox("啟用週K線共振與底背離判定 (預設開啟)", key="use_weekly_filter")
 
     st.markdown("---")
     
@@ -1535,7 +1825,6 @@ with tab2:
             status_text.empty(); progress_bar.empty(); st.error("❌ 無法取得台股清單，請檢查網路連線。")
             st.stop()
             
-        # 決定掃描標的
         if scan_target_mode == "指定個股測試":
             if not test_ticker_input:
                 status_text.empty(); progress_bar.empty(); st.error("❌ 請輸入測試股票代號！")
@@ -1548,7 +1837,6 @@ with tab2:
         div_pairs = [(st.session_state.div_recent_w, st.session_state.div_older_w)] if st.session_state.use_single_div else [(5, 20), (5, 60), (20, 60)]
         max_older_w = max(pair[1] for pair in div_pairs)
         
-        # 預留 30 天的回測統計緩衝
         extra_buffer_days = 30 if st.session_state.enable_30d_backtest else 0
         total_needed_days = st.session_state.lookback_start + max_older_w + st.session_state.pivot_left + 70 + extra_buffer_days
         
@@ -1622,7 +1910,6 @@ with tab2:
                         df['BB_Upper'] = df['MA20'] + 2 * std20
                         df['BB_Lower'] = df['MA20'] - 2 * std20
                         
-                        # 計算近期金叉判定狀態 (供輸出呈現)
                         df['KD_Cross'] = (df['K'] > df['D']) & (df['K'].shift(1) <= df['D'].shift(1))
                         if st.session_state.reso_macd_cross_zero:
                             df['MACD_Cross'] = (df['MACD_Hist'] > 0) & (df['MACD_Hist'].shift(1) <= 0)
@@ -1633,9 +1920,6 @@ with tab2:
                         df['KD_Cross_Recent'] = df['KD_Cross'].rolling(window=st.session_state.reso_cross_days, min_periods=1).max() >= 1
                         df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=st.session_state.reso_cross_days, min_periods=1).max() >= 1
                         
-                        # -------------------------------------------------------------
-                        # 評估四大演算法特徵 (第一階段短線快篩)
-                        # -------------------------------------------------------------
                         df['Candle_Score'] = BottomReversalStrategy.evaluate(df) if algo_mode in ['全部', '底部翻轉'] else pd.Series(0.0, index=df.index)
                         df['VCP_Score'] = VCPStrategy.evaluate(df) if algo_mode in ['全部', 'VCP'] else pd.Series(0.0, index=df.index)
                         
@@ -1644,14 +1928,11 @@ with tab2:
                         if algo_mode in ['全部', '指標共振']:
                             df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
                                 df,
-                                recent_w=st.session_state.div_recent_w,
-                                older_w=st.session_state.div_older_w,
-                                kd_older_low_th=st.session_state.reso_kd_older_low,
-                                kd_older_high_th=st.session_state.reso_kd_older_high,
+                                recent_w=st.session_state.div_recent_w, older_w=st.session_state.div_older_w,
+                                kd_older_low_th=st.session_state.reso_kd_older_low, kd_older_high_th=st.session_state.reso_kd_older_high,
                                 kd_recent_low_th=st.session_state.reso_kd_recent_low,
                                 use_macd_abs=st.session_state.use_macd_abs,
-                                macd_older_low_th=st.session_state.reso_macd_older_low,
-                                macd_recent_low_th=st.session_state.reso_macd_recent_low,
+                                macd_older_low_th=st.session_state.reso_macd_older_low, macd_recent_low_th=st.session_state.reso_macd_recent_low,
                                 cross_days=st.session_state.reso_cross_days,
                                 require_price_higher_low=st.session_state.reso_price_higher_low,
                                 require_macd_cross_zero=st.session_state.reso_macd_cross_zero,
@@ -1662,30 +1943,23 @@ with tab2:
                         else:
                             df['Reso_Score'] = pd.Series(0.0, index=df.index)
                             
-                        # === 量價雙背離模組 ===
                         if algo_mode in ['全部', '量價雙背離']:
                             df['PriceVol_Div_Pass'] = PriceVolDivergenceStrategy.evaluate(
                                 df,
-                                recent_w=st.session_state.div_recent_w,
-                                older_w=st.session_state.div_older_w,
-                                rl_cnt=st.session_state.recent_lows_cnt,
-                                ol_cnt=st.session_state.older_lows_cnt,
-                                p_left=st.session_state.pivot_left,
-                                p_right=st.session_state.pivot_right,
-                                req_cross=st.session_state.require_cross_confirm,
-                                c_days=st.session_state.reso_cross_days,
+                                recent_w=st.session_state.div_recent_w, older_w=st.session_state.div_older_w,
+                                rl_cnt=st.session_state.recent_lows_cnt, ol_cnt=st.session_state.older_lows_cnt,
+                                p_left=st.session_state.pivot_left, p_right=st.session_state.pivot_right,
+                                req_cross=st.session_state.require_cross_confirm, c_days=st.session_state.reso_cross_days,
                                 price_col=price_col_for_div_eval
                             )
                         else:
                             df['PriceVol_Div_Pass'] = pd.Series(False, index=df.index)
 
-                        # === 長下引突破模組 ===
                         if algo_mode in ['全部', '長下引突破']:
                             df['Breakout_Signal'] = LongLowerShadowBreakoutStrategy.evaluate(df)
                         else:
                             df['Breakout_Signal'] = pd.Series(False, index=df.index)
                         
-                        # 將 expert_res_df 與原資料整合，供個股測試時完整呈現
                         if scan_target_mode == "指定個股測試":
                             combined_debug = df.copy()
                             for c in expert_res_df.columns:
@@ -1714,7 +1988,6 @@ with tab2:
                                 is_pv_div_pass = (algo_mode in ['全部', '量價雙背離']) and t_row.get('PriceVol_Div_Pass', False)
                                 is_breakout_pass = (algo_mode in ['全部', '長下引突破']) and t_row.get('Breakout_Signal', False)
                                 
-                                # 只要有任一條件過關，或開啟指定測試模式，即加入初步名單並記錄
                                 if is_r_pass or is_v_pass or is_reso_pass or is_pv_div_pass or is_breakout_pass or force_pass:
                                     combo_score = r_score + v_score + reso_score + (20 if is_pv_div_pass else 0) + (10 if is_breakout_pass else 0)
                                     if combo_score > best_combined_score or best_row is None:
@@ -1722,17 +1995,14 @@ with tab2:
                                         best_row, best_offset = t_row, offset
                                         best_vol_mult = vol_mult
                         
-                        # --- 30天回測統計引擎 ---
                         count_30d = 0
                         if st.session_state.enable_30d_backtest and best_row is not None:
-                            # 針對觸發日(best_offset)，往回看 30 個交易日
                             for b_offset in range(best_offset + 1, best_offset + 31):
                                 if len(df) <= b_offset + 1: continue
                                 c_row = df.iloc[-1 - b_offset]
                                 c_vol_ma = c_row['Vol_MA20']
                                 if pd.isna(c_vol_ma): continue
                                 
-                                # 若滿足月均量條件（或強制測試），則檢驗該日是否符合演算法
                                 if c_vol_ma >= st.session_state.min_vol_ma20 or force_pass:
                                     c_r_pass = (algo_mode in ['全部', '底部翻轉']) and (c_row['Candle_Score'] >= st.session_state.min_score)
                                     c_v_pass = (algo_mode in ['全部', 'VCP']) and (c_row['VCP_Score'] >= st.session_state.min_vcp_score)
@@ -1740,21 +2010,17 @@ with tab2:
                                     c_pv_pass = (algo_mode in ['全部', '量價雙背離']) and c_row.get('PriceVol_Div_Pass', False)
                                     c_brk = (algo_mode in ['全部', '長下引突破']) and c_row.get('Breakout_Signal', False)
                                     
-                                    if c_r_pass or c_v_pass or c_reso_pass or c_pv_pass or c_brk:
-                                        count_30d += 1
+                                    if c_r_pass or c_v_pass or c_reso_pass or c_pv_pass or c_brk: count_30d += 1
                         
                         if best_row is not None:
                             clean_ticker = ticker.split('.')[0]
                             last_expert = expert_res_df.iloc[-1 - best_offset] 
                             
-                            # 評估進場位置建議
                             rec_status = "-"
                             if st.session_state.use_cross_position_filter:
                                 k_val = float(best_row['K'])
-                                if k_val < st.session_state.cross_position_threshold:
-                                    rec_status = "✅ 建議參考"
-                                else:
-                                    rec_status = "⚠️ 位置偏高"
+                                if k_val < st.session_state.cross_position_threshold: rec_status = "✅ 建議參考"
+                                else: rec_status = "⚠️ 位置偏高"
 
                             reversal_candidates[ticker] = {
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
@@ -1796,16 +2062,14 @@ with tab2:
         if reversal_list:
             candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
             progress_bar.progress(0)
-            # 第二階段：僅針對通過第一階段條件的標的，下載長線資料進行年線與週背離檢測
             status_text.text(f"[階段二] 正在下載 {len(reversal_list)} 檔初選標的長天期資料以計算年線/週線背離...")
             
             long_dl_kwargs = {"period": "2y"}
             if st.session_state.use_backtest_date:
-                start_long = end_dt - datetime.timedelta(days=1000) # 確保有超過240天
+                start_long = end_dt - datetime.timedelta(days=1000) 
                 long_dl_kwargs = {"start": start_long.strftime('%Y-%m-%d'), "end": end_dt.strftime('%Y-%m-%d')}
             
             long_data = yf.download(candidate_tickers, threads=False, progress=False, session=yf_session, **long_dl_kwargs)
-            
             status_text.text(f"[階段二] 正在分析標的之多級別背離特徵與扣抵判定...")
             
             final_results = []
@@ -1822,7 +2086,6 @@ with tab2:
                     rl_cnt, ol_cnt = st.session_state.recent_lows_cnt, st.session_state.older_lows_cnt
                     p_left, p_right = st.session_state.pivot_left, st.session_state.pivot_right
                     
-                    # === 年線與半年線計算 ===
                     item['年線/半年線空排'] = "無資料"
                     item['半年線斜率(%)'] = "無資料"
                     item['年線斜率(%)'] = "無資料"
@@ -1843,66 +2106,48 @@ with tab2:
                                 target_dt = pd.to_datetime(st.session_state.backtest_date_obj)
                                 long_df = long_df[long_df.index.tz_localize(None).normalize() <= target_dt]
                                 
-                            if specific_offset > 0:
-                                long_df = long_df.iloc[:-specific_offset]
+                            if specific_offset > 0: long_df = long_df.iloc[:-specific_offset]
                                 
                             if len(long_df) >= 120:
                                 ma120 = long_df['Close'].rolling(120).mean()
-                                c_ma120 = ma120.iloc[-1]
-                                p_ma120 = ma120.iloc[-2]
+                                c_ma120, p_ma120 = ma120.iloc[-1], ma120.iloc[-2]
                                 item['半年線斜率(%)'] = round((c_ma120 - p_ma120) / p_ma120 * 100, 3)
                                 
                             if len(long_df) >= 240:
                                 ma240 = long_df['Close'].rolling(240).mean()
-                                c_ma240 = ma240.iloc[-1]
-                                p_ma240 = ma240.iloc[-2]
+                                c_ma240, p_ma240 = ma240.iloc[-1], ma240.iloc[-2]
                                 item['年線斜率(%)'] = round((c_ma240 - p_ma240) / p_ma240 * 100, 3)
-                                
                                 is_bear = c_ma120 < c_ma240
                                 item['年線/半年線空排'] = "✅ 是" if is_bear else "❌ 否"
                                 
-                            # 週K共振與背離 (傳入長天期數據)
                             if st.session_state.use_weekly_filter:
                                 wk_res = WeeklyAnalysisStrategy.evaluate(
                                     long_df, div_pairs, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, price_col_for_div
                                 )
-                                item["週K共振"] = wk_res["週K共振"]
-                                item["週K背離"] = wk_res["週K背離"]
-                    except Exception as e:
+                                item["週K共振"], item["週K背離"] = wk_res["週K共振"], wk_res["週K背離"]
+                    except Exception:
                         if st.session_state.use_weekly_filter:
-                            item["週K共振"] = "錯誤"
-                            item["週K背離"] = "錯誤"
-                    # ==========================
+                            item["週K共振"], item["週K背離"] = "錯誤", "錯誤"
                     
                     if not daily_df.empty:
-                        if specific_offset > 0:
-                            daily_df = daily_df.iloc[:-specific_offset]
+                        if specific_offset > 0: daily_df = daily_df.iloc[:-specific_offset]
                             
                         for n in kou_di_periods:
                             if len(daily_df) >= n:
-                                curr_p = daily_df['Close'].iloc[-1]
-                                drop_p = daily_df['Close'].iloc[-n]
+                                curr_p, drop_p = daily_df['Close'].iloc[-1], daily_df['Close'].iloc[-n]
                                 item[f"扣抵狀態({n}MA)"] = "✅ 扣低" if curr_p > drop_p else "❌ 扣高"
                             else:
                                 item[f"扣抵狀態({n}MA)"] = "無資料"
                         
                         has_daily_div = False
                         for r_w, o_w in div_pairs:
-                            d_kd = False
-                            d_macd = False
-                            # Phase 2 同樣需要往前追溯 25 天，確保顯示狀態一致
+                            d_kd, d_macd = False, False
                             for b in range(0, 25):
                                 if len(daily_df) <= b + r_w + o_w: break
                                 temp_df = daily_df.iloc[:len(daily_df)-b] if b > 0 else daily_df
                                 
-                                if not d_kd:
-                                    d_kd = DivergenceStrategy.check_bottom_divergence(
-                                        temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                                    )
-                                if not d_macd:
-                                    d_macd = DivergenceStrategy.check_bottom_divergence(
-                                        temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                                    )
+                                if not d_kd: d_kd = DivergenceStrategy.check_bottom_divergence(temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days)
+                                if not d_macd: d_macd = DivergenceStrategy.check_bottom_divergence(temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days)
                                 if d_kd and d_macd: break
                             
                             res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
@@ -1923,20 +2168,13 @@ with tab2:
                             m60_df = TechnicalIndicators.add_macd(TechnicalIndicators.add_kd(m60_df))
                             has_m60_div = False
                             for r_w, o_w in div_pairs:
-                                d_kd = False
-                                d_macd = False
+                                d_kd, d_macd = False, False
                                 for b in range(0, 20):
                                     if len(m60_df) <= b + r_w + o_w: break
                                     temp_df = m60_df.iloc[:len(m60_df)-b] if b > 0 else m60_df
                                     
-                                    if not d_kd:
-                                        d_kd = DivergenceStrategy.check_bottom_divergence(
-                                            temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                                        )
-                                    if not d_macd:
-                                        d_macd = DivergenceStrategy.check_bottom_divergence(
-                                            temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days
-                                        )
+                                    if not d_kd: d_kd = DivergenceStrategy.check_bottom_divergence(temp_df, price_col_for_div, 'K', 'K', 'D', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days)
+                                    if not d_macd: d_macd = DivergenceStrategy.check_bottom_divergence(temp_df, price_col_for_div, 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days)
                                     if d_kd and d_macd: break
                                     
                                 res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
@@ -1954,8 +2192,7 @@ with tab2:
                     if item["VCP分數"] >= st.session_state.min_vcp_score: base_tags.append("VCP收斂")
                     if item["共振分數"] >= st.session_state.min_reso_score: base_tags.append("指標共振")
                     
-                    if not base_tags and scan_target_mode == "指定個股測試":
-                        base_tags.append("未達標(測試)")
+                    if not base_tags and scan_target_mode == "指定個股測試": base_tags.append("未達標(測試)")
                         
                     div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
                     item["演算法建議結果"] = " & ".join(base_tags) + div_tag
@@ -1965,13 +2202,10 @@ with tab2:
                 progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
             status_text.empty(); progress_bar.empty()
-            
             res_df = pd.DataFrame(final_results)
             
-            # 建立核心欄位架構，將「近30日觸發次數」動態插入第 4 欄
             base_cols = ['股票代號', '股票名稱', '觸發日期']
-            if st.session_state.enable_30d_backtest:
-                base_cols.append('近30日觸發次數')
+            if st.session_state.enable_30d_backtest: base_cols.append('近30日觸發次數')
                 
             base_cols.extend([
                 '演算法建議結果', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
@@ -1979,19 +2213,14 @@ with tab2:
                 '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
             ])
             
-            # 動態插入週K判定欄位
             if st.session_state.use_weekly_filter:
                 insert_idx = base_cols.index('盤整過濾') + 1
                 base_cols.insert(insert_idx, '週K共振')
                 base_cols.insert(insert_idx + 1, '週K背離')
             
-            # 動態加入新增的 MA 欄位
-            if OUTPUT_COLUMN_CONFIG.get("show_ma120_240_bear_align", True):
-                base_cols.append('年線/半年線空排')
-            if OUTPUT_COLUMN_CONFIG.get("show_ma240_slope", True):
-                base_cols.append('年線斜率(%)')
-            if OUTPUT_COLUMN_CONFIG.get("show_ma120_slope", True):
-                base_cols.append('半年線斜率(%)')
+            if OUTPUT_COLUMN_CONFIG.get("show_ma120_240_bear_align", True): base_cols.append('年線/半年線空排')
+            if OUTPUT_COLUMN_CONFIG.get("show_ma240_slope", True): base_cols.append('年線斜率(%)')
+            if OUTPUT_COLUMN_CONFIG.get("show_ma120_slope", True): base_cols.append('半年線斜率(%)')
                 
             div_cols = [c for c in res_df.columns if '背離' in c and c not in base_cols]
             kou_cols = [c for c in res_df.columns if '扣抵狀態' in c]
@@ -2005,7 +2234,6 @@ with tab2:
             st.session_state.scan_target_mode_saved = scan_target_mode
             st.session_state.market_info = market_info
             
-            # --- 執行自動備份至 Google Drive (透過 Webhook + Streamlit Secrets) ---
             if st.session_state.get('auto_upload_gdrive', False) and not res_df.empty:
                 webhook_url = st.secrets.get("GAS_WEBHOOK_URL", "")
                 secret_token = st.secrets.get("GAS_SECRET_TOKEN", "")
@@ -2017,46 +2245,31 @@ with tab2:
                     csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
                     date_str = datetime.date.today().strftime('%Y-%m-%d')
                     temp_filename = f"stock_scan_{algo_mode}_{date_str}.csv"
-                    
-                    with open(temp_filename, "wb") as f:
-                        f.write(csv_bytes)
-                    
+                    with open(temp_filename, "wb") as f: f.write(csv_bytes)
                     upload_success, upload_msg = GoogleDriveUploader.upload(temp_filename, temp_filename, webhook_url, secret_token)
                     st.session_state.upload_success = upload_success
                     st.session_state.upload_msg = upload_msg
-                    
-                    try:
-                        os.remove(temp_filename)
-                    except Exception:
-                        pass
+                    try: os.remove(temp_filename)
+                    except Exception: pass
             
             date_str = f"({st.session_state.backtest_date_obj})" if st.session_state.use_backtest_date else ""
-            if scan_target_mode == "指定個股測試":
-                st.session_state.scan_msg = f"🎉 測試完成！已為您匯出個股 {date_str} 的計算結果與下方詳細參數表。"
-            else:
-                st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔符合條件的標的 {date_str}。"
+            if scan_target_mode == "指定個股測試": st.session_state.scan_msg = f"🎉 測試完成！已為您匯出個股 {date_str} 的計算結果與下方詳細參數表。"
+            else: st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔符合條件的標的 {date_str}。"
         else:
             status_text.empty(); progress_bar.empty()
             st.session_state.scan_res_df = pd.DataFrame()
             st.session_state.scan_algo_mode = algo_mode
             st.session_state.scan_target_mode_saved = scan_target_mode
             st.session_state.market_info = market_info
-            if scan_target_mode == "指定個股測試":
-                st.session_state.scan_msg = f"無法取得測試標的資料，請確認代號是否正確。"
-            else:
-                st.session_state.scan_msg = f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。"
+            if scan_target_mode == "指定個股測試": st.session_state.scan_msg = f"無法取得測試標的資料，請確認代號是否正確。"
+            else: st.session_state.scan_msg = f"掃描完成！在指定的區間與條件下，全市場無任何符合「{algo_mode}」的標的。"
 
-    # 確保掃描結果在點擊按鈕或重新渲染時不會消失
     if "scan_res_df" in st.session_state:
-        # 重新渲染大盤結果與提示訊息
         if not st.session_state.scan_res_df.empty:
             st.success(st.session_state.scan_msg)
-            # 顯示 Google Drive 上傳狀態
             if st.session_state.get('auto_upload_gdrive', False):
-                if st.session_state.get('upload_success', False):
-                    st.success(f"☁️ 掃描結果已成功自動備份至 Google Drive `stream` 資料夾！")
-                else:
-                    st.error(f"☁️ Google Drive 上傳失敗：{st.session_state.get('upload_msg', '')}")
+                if st.session_state.get('upload_success', False): st.success(f"☁️ 掃描結果已成功自動備份至 Google Drive `stream` 資料夾！")
+                else: st.error(f"☁️ Google Drive 上傳失敗：{st.session_state.get('upload_msg', '')}")
         else:
             st.info(st.session_state.scan_msg)
             
@@ -2077,32 +2290,17 @@ with tab2:
         
         if not res_df.empty:
             st.markdown("### 📋 自訂輸出欄位與順序")
-            # 提供額外功能讓使用者調整順序，預設為固定好的 res_df.columns
             all_columns = res_df.columns.tolist()
-            selected_cols = st.multiselect(
-                "您可以新增/移除欄位，或依序點選、拖曳標籤來改變表格顯示順序：",
-                options=all_columns,
-                default=all_columns,
-                key="custom_column_order"
-            )
+            selected_cols = st.multiselect("您可以新增/移除欄位，或依序點選、拖曳標籤來改變表格顯示順序：", options=all_columns, default=all_columns, key="custom_column_order")
             
-            # 若使用者將欄位全清空，則顯示空表格以免報錯
             display_df = res_df[selected_cols] if selected_cols else pd.DataFrame()
-            
             if not display_df.empty:
                 st.dataframe(display_df, use_container_width=True)
-                
                 csv = display_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="📥 下載建議清單 (CSV)",
-                    data=csv,
-                    file_name=f'stock_scan_{algo_mode_saved}_results.csv',
-                    mime='text/csv'
-                )
+                st.download_button(label="📥 下載建議清單 (CSV)", data=csv, file_name=f'stock_scan_{algo_mode_saved}_results.csv', mime='text/csv')
             else:
                 st.warning("⚠️ 請至少選擇一個欄位來顯示資料。")
             
-            # --- 若為指定個股測試模式，印出每日指標詳細表供參數調整參考 ---
             if target_mode_saved == '指定個股測試' and 'test_stock_df' in st.session_state:
                 st.markdown("---")
                 st.markdown(f"### 🛠️ 參數測試詳細指標結果 - {st.session_state.get('test_ticker_name', '')}")
@@ -2110,45 +2308,23 @@ with tab2:
                 
                 debug_df = st.session_state.test_stock_df.copy()
                 if not debug_df.empty:
-                    # 擷取使用者設定的回測區間 (往前多抓前波與近波範圍天數做對照)
-                    if st.session_state.use_single_div:
-                        max_older_w = st.session_state.div_older_w
-                    else:
-                        max_older_w = max(20, 60) # 預設的三組比對最大天數為60
-                        
+                    max_older_w = st.session_state.div_older_w if st.session_state.use_single_div else max(20, 60)
                     start_offset = st.session_state.lookback_start + max_older_w + st.session_state.div_recent_w
                     end_offset = st.session_state.lookback_end
                     
                     start_idx = max(0, len(debug_df) - 1 - start_offset)
                     end_idx = max(1, len(debug_df) - end_offset)
-                    
                     debug_df = debug_df.iloc[start_idx:end_idx].copy()
                     
-                    # 補齊要展示的底層資訊
                     debug_df['BB_Width(%)'] = (debug_df['BB_Upper'] - debug_df['BB_Lower']) / (debug_df['MA20'] + 1e-8) * 100
                     
-                    # 進行所有輸出欄位的統一命名與去重複 (映射為全中文欄位)
                     rename_map = {
-                        'Close': '收盤價',
-                        'Low': '最低價',
-                        'Volume_Lots': '成交量(張)',
-                        'Vol_MA20': '月均量(張)',
-                        'Candle_Score': '反轉分數',
-                        'VCP_Score': 'VCP分數',
-                        'Reso_Score': '共振分數',
-                        'K': 'K值',
-                        'D': 'D值',
-                        'MACD': 'MACD_DIF',
-                        'MACD_Hist': 'MACD柱狀體',
-                        'BB_Width(%)': '布林寬度(%)',
-                        'KD_Cross_Recent': 'KD近期金叉',
-                        'MACD_Cross_Recent': 'MACD近期金叉',
-                        'PriceVol_Div_Pass': '量價雙背離',
-                        'Breakout_Signal': '長下引突破',
-                        'RSI盤整': 'RSI盤整中',
-                        '多空指標數': '多空指標數',
-                        '日KD多': '日KD偏多',
-                        '週KD多': '週KD偏多'
+                        'Close': '收盤價', 'Low': '最低價', 'Volume_Lots': '成交量(張)', 'Vol_MA20': '月均量(張)',
+                        'Candle_Score': '反轉分數', 'VCP_Score': 'VCP分數', 'Reso_Score': '共振分數',
+                        'K': 'K值', 'D': 'D值', 'MACD': 'MACD_DIF', 'MACD_Hist': 'MACD柱狀體',
+                        'BB_Width(%)': '布林寬度(%)', 'KD_Cross_Recent': 'KD近期金叉', 'MACD_Cross_Recent': 'MACD近期金叉',
+                        'PriceVol_Div_Pass': '量價雙背離', 'Breakout_Signal': '長下引突破',
+                        'RSI盤整': 'RSI盤整中', '多空指標數': '多空指標數', '日KD多': '日KD偏多', '週KD多': '週KD偏多'
                     }
                     
                     show_cols = list(rename_map.keys())
@@ -2163,10 +2339,8 @@ with tab2:
                         '反轉分數': "{:.2f}", 'VCP分數': "{:.2f}", '共振分數': "{:.2f}",
                         'K值': "{:.2f}", 'D值': "{:.2f}", 'MACD_DIF': "{:.3f}", 'MACD柱狀體': "{:.3f}", '布林寬度(%)': "{:.2f}"
                     }
-                    
                     st.dataframe(disp_df.style.format(format_dict), use_container_width=True)
             
-            # --- 跨分頁連動功能 ---
             st.markdown("---")
             st.markdown("### 🧬 進階基本面健檢連動")
             
@@ -2176,40 +2350,33 @@ with tab2:
                 st.session_state.run_batch_audit = True
                 st.session_state.audit_mode = "自選股批次掃描"
                 
-            st.button("🚀 將上述標的傳送至【財報雙軌健檢】(第3分頁) 進行基本面分析", type="primary", on_click=transfer_to_audit)
+            st.button("🚀 將上述標的傳送至【財報地雷與體質分析】進行基本面分析", type="primary", on_click=transfer_to_audit)
             
             if st.session_state.get('run_batch_audit', False):
-                st.success("✅ **傳送成功！已自動載入標的。** 請手動點擊上方的 **【📑 財報三表地雷掃描／財報體質與風險分析】** 分頁查看綜合評分（系統將自動從最佳到最差排序）。")
+                st.success("✅ **傳送成功！已自動載入標的。** 請手動點擊上方的 **【📑 財報三表地雷掃描】** 分頁查看綜合評分。")
 
 # ----------------------------------------------------
-# 頁籤 3：財報三表地雷掃描／財報體質與風險分析 (V7 獲利品質與金融豁免升級版)
+# 頁籤 3：財報三表地雷掃描
 # ----------------------------------------------------
-def render_trend_sparkline(trend_list):
-    """將趨勢陣列轉換為簡單的視覺化文字"""
-    if not trend_list or len(trend_list) < 2: return "資料不足"
-    valid_vals = [v for v in trend_list if pd.notna(v)]
-    if len(valid_vals) < 2: return "資料不足"
-    
-    res = []
-    for i in range(1, len(valid_vals)):
-        if valid_vals[i] > valid_vals[i-1]: res.append("↗")
-        elif valid_vals[i] < valid_vals[i-1]: res.append("↘")
-        else: res.append("→")
-    return " ".join(res[-3:])  # 只顯示最近三次的變化符號
+elif selected_page == "📑 財報三表地雷掃描":
+    def render_trend_sparkline(trend_list):
+        if not trend_list or len(trend_list) < 2: return "資料不足"
+        valid_vals = [v for v in trend_list if pd.notna(v)]
+        if len(valid_vals) < 2: return "資料不足"
+        res = []
+        for i in range(1, len(valid_vals)):
+            if valid_vals[i] > valid_vals[i-1]: res.append("↗")
+            elif valid_vals[i] < valid_vals[i-1]: res.append("↘")
+            else: res.append("→")
+        return " ".join(res[-3:]) 
 
-with tab3:
     st.write("透過財報三表（損益表、資產負債表、現金流量表）交叉勾稽，提供**「三表交叉異常診斷」**與**「動態合約負債與擴張防誤判引擎」**，挖掘具備真實造血力與安全結構的卓越企業。")
-    
-    # 使用 Session State 同步切換狀態
     audit_mode = st.radio("請選擇操作模式", ["單檔查詢", "自選股批次掃描"], horizontal=True, key="audit_mode")
     
     if audit_mode == "單檔查詢":
         c1, c2 = st.columns([4, 1])
-        with c1: 
-            audit_input = st.text_input("輸入單一股票代號", value="2495", key="audit_single").strip()
-        with c2: 
-            st.write(""); st.write("")
-            audit_btn = st.button("健檢財報", type="primary", use_container_width=True)
+        with c1: audit_input = st.text_input("輸入單一股票代號", value="2495", key="audit_single").strip()
+        with c2: st.write(""); st.write(""); audit_btn = st.button("健檢財報", type="primary", use_container_width=True)
             
         if audit_btn and audit_input:
             with st.spinner(f"⏳ 正在抓取 [{audit_input}] 季報資料並進行三表交叉診斷..."):
@@ -2223,87 +2390,65 @@ with tab3:
                 else:
                     st.subheader(f"📑 {name} ({audit_input}) 財報三表體質與風險診斷報告")
                     st.markdown(f"**當期季報：{res['當期季報']} | 分析期間：{res['比較基準']}**")
-                    
                     st.markdown("---")
                     st.markdown("### 【一、總體診斷】")
                     st.markdown(f"#### 綜合評級：{res['綜合評級']}")
-                    
                     c_sc1, c_sc2 = st.columns(2)
-                    with c_sc1:
-                        st.metric("🏆 體質綜合評分 (滿分100)", f"{res['體質分數']} 分")
-                    with c_sc2:
-                        st.metric("🛡️ 財務風險評分 (越低越好)", f"{res['風險分數']} 分")
+                    with c_sc1: st.metric("🏆 體質綜合評分 (滿分100)", f"{res['體質分數']} 分")
+                    with c_sc2: st.metric("🛡️ 財務風險評分 (越低越好)", f"{res['風險分數']} 分")
                     
                     st.markdown("---")
                     st.markdown("### 【二、三表核心指標】")
-                    
-                    # 處理 4Q Trend 成視覺化文字
                     core_df_data = []
                     for row in res["core_metrics"]:
                         r_dict = row.copy()
                         r_dict["4Q趨勢"] = render_trend_sparkline(row["4Q趨勢"]) if isinstance(row["4Q趨勢"], list) else row["4Q趨勢"]
                         core_df_data.append(r_dict)
-                        
                     st.dataframe(pd.DataFrame(core_df_data), use_container_width=True)
 
                     st.markdown("---")
                     st.markdown("### 【三、合約負債專區 (Contract Liabilities)】")
-                    
                     cl_c1, cl_c2, cl_c3, cl_c4 = st.columns(4)
                     cl_c1.metric("最新合約負債 (千)", res['cl_latest'])
                     cl_c2.metric("QoQ 季增率", res['cl_qoq'])
                     cl_c3.metric("YoY 年增率", res['cl_yoy'])
                     cl_c4.metric("佔營收比重", res['cl_rev_ratio'])
-                    
                     st.info(f"**合約負債判定狀態：** {res['cl_status']}")
                     if len([v for v in res['cl_8q'] if pd.notna(v)]) >= 5:
                         st.write(f"**歷史 8 季趨勢軌跡：** `{render_trend_sparkline(res['cl_8q'])}`")
                     
                     st.markdown("---")
                     st.markdown("### 【四、三表交叉診斷】")
-                    for text in res["cross_analysis"]:
-                        st.markdown(f"- {text}")
-                        
+                    for text in res["cross_analysis"]: st.markdown(f"- {text}")
                     st.markdown("---")
                     st.markdown("### 【五、風險共振】")
                     for text in res["risk_resonance"]:
-                        if "無重大風險" in text:
-                            st.success(f"- {text}")
-                        else:
-                            st.error(f"- {text}")
-                            
+                        if "無重大風險" in text: st.success(f"- {text}")
+                        else: st.error(f"- {text}")
                     st.markdown("---")
                     st.markdown("### 【六、正向特徵】")
                     for text in res["positives"]:
-                        if "無顯著突出" in text:
-                            st.warning(f"- {text}")
-                        else:
-                            st.success(f"- 🌟 {text}")
-                            
+                        if "無顯著突出" in text: st.warning(f"- {text}")
+                        else: st.success(f"- 🌟 {text}")
                     st.markdown("---")
                     st.markdown("### 【七、下一季追蹤事項】")
-                    for idx, text in enumerate(res["watch_list"]):
-                        st.markdown(f"{idx+1}. {text}")
+                    for idx, text in enumerate(res["watch_list"]): st.markdown(f"{idx+1}. {text}")
 
     else:
         st.write("請貼上你想健檢的股票清單（可使用逗號、空白、或換行分隔），系統將產出包含**「體質評分」**與**「財務風險」**的綜合比較清單。")
-        
         batch_input = st.text_area("輸入自選股清單", height=100, key="batch_input_area")
         batch_btn = st.button("執行批次交叉健檢", type="primary")
         
         if batch_btn or st.session_state.get('run_batch_audit', False):
-            if st.session_state.get('run_batch_audit', False):
-                st.session_state.run_batch_audit = False
+            if st.session_state.get('run_batch_audit', False): st.session_state.run_batch_audit = False
                 
             raw_tickers = re.split(r'[,\s\n]+', batch_input.strip())
             valid_tickers = [t.strip() for t in raw_tickers if t.strip()]
             
-            if not valid_tickers:
-                st.warning("⚠️ 找不到有效的股票代號。")
+            if not valid_tickers: st.warning("⚠️ 找不到有效的股票代號。")
             else:
                 stock_dict = get_all_tw_stocks()
                 session = get_yf_session()
-                
                 batch_results = []
                 status_text = st.empty()
                 p_bar = st.progress(0)
@@ -2316,12 +2461,8 @@ with tab3:
                     res = FinancialAuditStrategy.evaluate(yf_t, session)
                     if res["status"] == "success":
                         batch_results.append({
-                            "代號": t_input,
-                            "名稱": name,
-                            "當期季報": res["當期季報"],
-                            "綜合評級": res["綜合評級"],
-                            "體質分數": res["體質分數"],
-                            "風險分數": res["風險分數"],
+                            "代號": t_input, "名稱": name, "當期季報": res["當期季報"],
+                            "綜合評級": res["綜合評級"], "體質分數": res["體質分數"], "風險分數": res["風險分數"],
                             "合約負債判定": res["cl_status"].split(" ")[0] if " " in res["cl_status"] else res["cl_status"],
                             "ROE年化(%)": f"{res['ROE年化(%)']:.2f}%" if pd.notna(res.get('ROE年化(%)')) else "-",
                             "ROA年化(%)": f"{res['ROA年化(%)']:.2f}%" if pd.notna(res.get('ROA年化(%)')) else "-",
@@ -2332,58 +2473,41 @@ with tab3:
                             "CCC週期(天)": f"{res['CCC_now']:.0f}" if pd.notna(res['CCC_now']) else "-",
                             "收現天數(DSO)": f"{res['DSO_now']:.0f}" if pd.notna(res['DSO_now']) else "-",
                             "週轉天數(DIO)": f"{res['DIO_now']:.0f}" if pd.notna(res['DIO_now']) else "-",
-                            "警訊數": res["警訊數"],
-                            "護城河特徵": res["正向訊號"],
-                            "警示明細": res["診斷明細"]
+                            "警訊數": res["警訊數"], "護城河特徵": res["正向訊號"], "警示明細": res["診斷明細"]
                         })
                     time.sleep(0.5) 
                     p_bar.progress(min(1.0, (idx + 1) / len(valid_tickers)))
                     
-                status_text.empty()
-                p_bar.empty()
+                status_text.empty(); p_bar.empty()
                 
                 if batch_results:
                     st.success(f"🎉 批次健檢完成！共成功分析 {len(batch_results)} 檔標的。")
                     batch_df = pd.DataFrame(batch_results)
-                    
                     batch_df = batch_df.sort_values(by=["體質分數", "風險分數"], ascending=[False, True]).reset_index(drop=True)
                     batch_df.index = batch_df.index + 1
                     
                     st.dataframe(batch_df, use_container_width=True)
-                    
                     csv = batch_df.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📥 下載三表交叉財報健檢報告 (CSV)",
-                        data=csv,
-                        file_name=f'financial_cross_audit_{datetime.date.today()}.csv',
-                        mime='text/csv'
-                    )
-                else:
-                    st.error("❌ 清單內的所有標的皆無法取得有效財報數據，請確認代號正確性或 Yahoo 資料庫狀態。")
+                    st.download_button(label="📥 下載三表交叉財報健檢報告 (CSV)", data=csv, file_name=f'financial_cross_audit_{datetime.date.today()}.csv', mime='text/csv')
+                else: st.error("❌ 清單內的所有標的皆無法取得有效財報數據，請確認代號正確性或 Yahoo 資料庫狀態。")
 
 # ----------------------------------------------------
-# 頁籤 4：幾何型態滿足點測距 (W底/M頭)
+# 頁籤 4：幾何型態滿足點測距
 # ----------------------------------------------------
-with tab4:
+elif selected_page == "📐 幾何型態滿足點測距":
     st.write("利用量化演算法自動尋找波段轉折極值，並提供**「模式一：實體收盤價（過濾雜訊，對齊主力籌碼）」**與**「模式二：影線極值（包含極端恐慌斷頭與流動性插針）」**的雙重 1:1 及 1.618 幾何延伸測距。")
     
     col_g1, col_g2 = st.columns([4, 1])
-    with col_g1: 
-        geo_input = st.text_input("輸入股票代號", value="2609", key="geo_single", placeholder="例如：2330").strip()
-    with col_g2: 
-        st.write(""); st.write("")
-        geo_btn = st.button("計算幾何滿足點", type="primary", use_container_width=True)
+    with col_g1: geo_input = st.text_input("輸入股票代號", value="2609", key="geo_single", placeholder="例如：2330").strip()
+    with col_g2: st.write(""); st.write(""); geo_btn = st.button("計算幾何滿足點", type="primary", use_container_width=True)
 
     if geo_btn and geo_input:
         with st.spinner(f"⏳ 正在計算 [{geo_input}] 幾何滿足點與 SPC 管制界限..."):
             df, real_ticker = get_stock_data(geo_input)
-            
             if df.empty:
                 st.error("❌ 查無歷史數據，請確認代號是否正確。")
             else:
                 stock_name = get_tw_stock_name(real_ticker)
-                
-                # 計算基礎均線與布林/SPC
                 df['20MA'] = df['Close'].rolling(window=20).mean()
                 df['60MA'] = df['Close'].rolling(window=60).mean()
                 df['120MA'] = df['Close'].rolling(window=120).mean()
@@ -2391,13 +2515,11 @@ with tab4:
                 df['SPC_UCL'] = df['20MA'] + (2 * rolling_std)
                 df['SPC_LCL'] = df['20MA'] - (2 * rolling_std)
                 df['Z_Score'] = (df['Close'] - df['20MA']) / rolling_std
-                
                 latest = df.iloc[-1]
                 
                 st.subheader(f"📐 【{stock_name} ({real_ticker})】 量化幾何與 SPC 統計分析表")
                 st.markdown(f"**資料日期：{df.index[-1].strftime('%Y-%m-%d')}**")
                 
-                # 第一區塊：SPC 指標與均線
                 st.markdown("#### 1. 均線位階與 SPC 管制極限 (動態標準差)")
                 c_s1, c_s2, c_s3, c_s4 = st.columns(4)
                 c_s1.metric("最新收盤價", f"{latest['Close']:.2f}")
@@ -2408,20 +2530,15 @@ with tab4:
                 z_state = "常態波動區間段"
                 if latest['Z_Score'] < -2.0: z_state = "🚨 【極端負乖離超跌】 (空方拋售竭盡 / 統計異常)"
                 elif latest['Z_Score'] > 2.0: z_state = "🔥 【極端正乖離過熱】 (多方推升超買 / 統計異常)"
-                
                 st.info(f"**布林上軌 (+2σ)：** {latest['SPC_UCL']:.2f} ｜ **布林下軌 (-2σ)：** {latest['SPC_LCL']:.2f} ｜ **統計狀態：** {z_state}")
-                
                 st.markdown("---")
                 
-                # 計算兩種模式的形態測距
                 res_mode1 = GeometricPatternStrategy.calculate_geometric_patterns(df, 'Close', 'Close')
                 res_mode2 = GeometricPatternStrategy.calculate_geometric_patterns(df, 'High', 'Low')
                 
                 def render_pattern_result(res_dict, title, is_mode1=True):
                     st.markdown(f"#### {title}")
                     col_m1, col_m2 = st.columns(2)
-                    
-                    # 多方 W 底
                     with col_m1:
                         if res_dict["bull"]:
                             b = res_dict["bull"]
@@ -2433,8 +2550,6 @@ with tab4:
                                        f"- **1.618 延伸滿足位**：**{b['target_1618']:.2f} 元**")
                         else:
                             st.warning("**▲ 多方 W 底**：樣本不足，無法辨識完整雙底結構。")
-                            
-                    # 空方 M 頭
                     with col_m2:
                         if res_dict["bear"]:
                             b = res_dict["bear"]
@@ -2450,3 +2565,121 @@ with tab4:
                 render_pattern_result(res_mode1, "2. 模式一：實體收盤價模型（過濾盤中突刺，對齊主力籌碼實體成本）")
                 st.markdown("---")
                 render_pattern_result(res_mode2, "3. 模式二：影線極值模型（包含盤中插針、斷頭踩踏與極端低點）", is_mode1=False)
+
+# ----------------------------------------------------
+# 頁籤 5：台股量化技術分析與型態狀態機 (整合程式A)
+# ----------------------------------------------------
+elif selected_page == "🤖 量化型態狀態機 (程式A)":
+    st.write("這是由【程式A】整合而成的量化型態狀態機引擎。自動化掃描個股，評估「潛在型態、測試頸線、突破/跌破、回測、假突破、結構失效」等六大階段。")
+    
+    col_q1, col_q2 = st.columns([4, 1])
+    with col_q1: q_input = st.text_input("輸入股票代號", value="2330", key="quant_engine_input", placeholder="例如：2330").strip()
+    with col_q2: st.write(""); st.write(""); q_btn = st.button("啟動量化狀態機", type="primary", use_container_width=True)
+    
+    if q_btn and q_input:
+        with st.spinner(f"⏳ 正在載入 [{q_input}] 資料並通過量化引擎審查..."):
+            df, real_ticker = get_stock_data(q_input)
+            
+            if df.empty:
+                st.error("❌ 查無歷史數據，請確認代號是否正確。")
+            else:
+                try:
+                    stock_name = get_tw_stock_name(real_ticker)
+                    
+                    # 初始化引擎並處理資料
+                    engine = QuantPatternEngine(QuantConfig())
+                    df = engine.clean_and_validate_data(df)
+                    df = engine.compute_indicators(df)
+                    
+                    # 分析管線
+                    close_patterns = engine.analyze_pipeline(df=df, high_series=df['Close'], low_series=df['Close'])
+                    shadow_patterns = engine.analyze_pipeline(df=df, high_series=df['High'], low_series=df['Low'])
+                    
+                    latest = df.iloc[-1]
+                    latest_date = df.index[-1].strftime('%Y-%m-%d')
+                    latest_close = latest['Close']
+                    
+                    st.subheader(f"🤖 【{stock_name} ({real_ticker})】 台股量化狀態機分析報告")
+                    st.markdown(f"**最後有效交易日：** {latest_date}")
+                    st.markdown("---")
+                    
+                    st.markdown("### 一、核心量化數據與指標狀態")
+                    cq1, cq2, cq3, cq4 = st.columns(4)
+                    cq1.metric("最新收盤價", f"{latest_close:.2f}")
+                    cq2.metric("20MA 月線", f"{latest['20MA']:.2f}")
+                    cq3.metric("Z-Score", f"{latest['Z_Score']:.2f} σ")
+                    cq4.metric("量比 (相對 20MA)", f"{latest['Vol_Ratio']:.2f}x")
+                    
+                    z_desc = "極端負乖離 (超跌)" if latest['Z_Score'] < -2.0 else "極端正乖離 (過熱)" if latest['Z_Score'] > 2.0 else "常態隨機波動"
+                    st.info(f"**均線系統**：60MA: {latest['60MA']:.2f} | 120MA: {latest['120MA']:.2f if not pd.isna(latest['120MA']) else '樣本不足'}\n\n"
+                            f"**布林軌道**：上軌 {latest['BB_UCL']:.2f} | 下軌 {latest['BB_LCL']:.2f} ──► 狀態【{z_desc}】")
+                    
+                    st.markdown("---")
+                    
+                    def render_streamlit_pattern_block(p: Optional[GeometricPattern], title: str, l_price: float):
+                        st.markdown(f"#### {title}")
+                        if not p:
+                            st.warning("└─► 結構狀態：尚未辨識出符合幾何條件之型態結構。")
+                            return
+
+                        s1_str = f"{p.swing1.price:.2f} ({p.swing1.date.strftime('%m/%d')})"
+                        s2_str = f"{p.swing2.price:.2f} ({p.swing2.date.strftime('%m/%d')})"
+                        
+                        st.write(f"- **幾何極值**：點1 [{s1_str}] | 點2 [{s2_str}]")
+                        st.write(f"- **中間頸線價位**：{p.neckline.price:.2f} 元 ({p.neckline.date.strftime('%m/%d')})")
+                        
+                        state_color = "🟢" if "BREAKOUT_CONFIRMED" in p.state else ("🔴" if "FAILED" in p.state or "INVALID" in p.state else "🟡")
+                        st.markdown(f"- **當前型態狀態**：{state_color} **【{p.state}】**")
+                        
+                        if p.breakout_date:
+                            vol_tag = "✅ 有效放量" if p.vol_confirmed else "⚠️ 量能不足/平量"
+                            st.write(f"- **突破確認日**：{p.breakout_date.strftime('%Y-%m-%d')} ({vol_tag})")
+                            
+                        st.write(f"- **測距滿足位**：1:1 等幅 `{p.target_1to1:.2f}` 元 | 1.618 延伸 `{p.target_1618:.2f}` 元")
+                        st.write(f"- **結構失效防線**：`{p.invalidation_level:.2f}` 元")
+                        
+                        if p.state in [PatternState.BREAKOUT_CONFIRMED, PatternState.RETEST]:
+                            risk = abs(l_price - p.invalidation_level)
+                            reward_1to1 = abs(p.target_1to1 - l_price)
+                            if risk > 0 and ((p.p_type == 'W' and l_price < p.target_1to1) or (p.p_type == 'M' and l_price > p.target_1to1)):
+                                rr_ratio = reward_1to1 / risk
+                                st.success(f"└─► **實質風險報酬比 (至 1:1 目標)**：1 : {rr_ratio:.2f}")
+                            else:
+                                st.info("└─► 實質風報比：當前價已達標或風險防線無效。")
+                        else:
+                            st.info("└─► 實質風報比：型態尚未完成實體確認突破，不提供先行交易風報比。")
+                    
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        st.markdown("### 二、實體收盤價模型\n*(過濾盤中突刺，錨定實體持股籌碼)*")
+                        with st.container(border=True):
+                            render_streamlit_pattern_block(close_patterns['W'], "▲ 多方 W 底模型", latest_close)
+                            st.divider()
+                            render_streamlit_pattern_block(close_patterns['M'], "▼ 空方 M 頭模型", latest_close)
+                    
+                    with cc2:
+                        st.markdown("### 三、影線極值模型\n*(涵蓋盤中高低點與極端流動性)*")
+                        with st.container(border=True):
+                            render_streamlit_pattern_block(shadow_patterns['W'], "▲ 多方 W 底模型", latest_close)
+                            st.divider()
+                            render_streamlit_pattern_block(shadow_patterns['M'], "▼ 空方 M 頭模型", latest_close)
+                    
+                    st.markdown("---")
+                    st.markdown("### 四、客觀架構結論")
+                    
+                    final_states = []
+                    for model_res in [close_patterns, shadow_patterns]:
+                        for p in [model_res['W'], model_res['M']]:
+                            if p and p.state not in [PatternState.NONE, PatternState.INVALIDATED]:
+                                final_states.append(f"{p.p_type}底/頭: {p.state}")
+                    
+                    if final_states:
+                        st.success(f"**當前主導狀態**：{'; '.join(set(final_states))}")
+                    else:
+                        st.warning("**當前主導狀態**：目前無已確認或有效之典型反轉幾何結構，市場處於無型態整理或單向波段中。")
+                        
+                    st.caption("風險聲明：本工具提供之測距為幾何對稱與波動統計參考，非買賣保證；實務交易需嚴格執行防線停損。")
+
+                except Exception as e:
+                    st.error(f"量化狀態機計算過程發生錯誤：{str(e)}")
+
