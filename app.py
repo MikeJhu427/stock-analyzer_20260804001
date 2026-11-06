@@ -1253,10 +1253,15 @@ class QuantPatternEngine:
 
                 if neck_price <= max(t1.price, t2.price): continue
 
-                # 位階濾網檢驗：避免把大漲後的高檔旗形橫盤誤判為 W 底
+                # 【修正】：位階濾網檢驗時，確保抓取真正的區間低點與高點，並且扣除當下 pivot 本身造成「永遠是0%」的盲點
                 lookback_start = max(0, t1.idx - 60)
-                hist_low = float(df['Low'].iloc[lookback_start : t2.idx + 1].min())
-                hist_high = float(df['High'].iloc[lookback_start : t2.idx + 1].max())
+                if t1.idx > lookback_start:
+                    hist_low = float(low_series.iloc[lookback_start : t1.idx].min())
+                    hist_high = float(high_series.iloc[lookback_start : t1.idx].max())
+                else:
+                    hist_low = float(t1.price)
+                    hist_high = float(t1.price)
+                    
                 w_pos = (min(t1.price, t2.price) - hist_low) / (hist_high - hist_low + 1e-8)
 
                 if cfg.enable_regime_filter and w_pos > cfg.w_max_percentile:
@@ -1283,7 +1288,7 @@ class QuantPatternEngine:
                 price_diff = abs(p1.price - p2.price) / min(p1.price, p2.price)
                 if price_diff > cfg.price_sim_threshold: continue
 
-                # 排除明顯「頭頭高」上升波段被誤判為 M 頭 (右峰高於左峰超過 2.5% 視為上升趨勢通道而非平頭M頭)
+                # 排除明顯「頭頭高」上升波段被誤判為 M 頭
                 if cfg.enable_regime_filter and (p2.price - p1.price) / p1.price > 0.025:
                     continue
 
@@ -1299,10 +1304,15 @@ class QuantPatternEngine:
 
                 if neck_price >= min(p1.price, p2.price): continue
 
-                # 位階濾網檢驗：M 頭必須出現在波段相對高位階
+                # 【修正】：位階濾網檢驗防盲點
                 lookback_start = max(0, p1.idx - 60)
-                hist_low = float(df['Low'].iloc[lookback_start : p2.idx + 1].min())
-                hist_high = float(df['High'].iloc[lookback_start : p2.idx + 1].max())
+                if p1.idx > lookback_start:
+                    hist_low = float(low_series.iloc[lookback_start : p1.idx].min())
+                    hist_high = float(high_series.iloc[lookback_start : p1.idx].max())
+                else:
+                    hist_low = float(p1.price)
+                    hist_high = float(p1.price)
+                    
                 m_pos = (max(p1.price, p2.price) - hist_low) / (hist_high - hist_low + 1e-8)
 
                 if cfg.enable_regime_filter and m_pos < cfg.m_min_percentile:
@@ -1321,15 +1331,19 @@ class QuantPatternEngine:
 
         return patterns
 
+    # 【修正】：全新 evaluate_state_machine (修正量能覆寫、保留觸發日、修補死胡同狀態與起算點)
     def evaluate_state_machine(self, df: pd.DataFrame, pat: GeometricPattern) -> GeometricPattern:
         cfg = self.cfg
-        eval_start_idx = pat.swing2.idx + cfg.window_order
+        # 從右腳次日開始追蹤，避免漏算極值確認期內的快速突破
+        eval_start_idx = pat.swing2.idx + 1
         if eval_start_idx >= len(df):
             pat.state = PatternState.FORMING
             return pat
 
         consecutive_break_days = 0
         current_state = PatternState.FORMING
+        temp_break_date = None
+        temp_vol_conf = False
 
         for i in range(eval_start_idx, len(df)):
             close_p = df['Close'].iloc[i]
@@ -1339,65 +1353,98 @@ class QuantPatternEngine:
             if pat.p_type == 'W':
                 if close_p < pat.invalidation_level:
                     current_state = PatternState.INVALIDATED
+                    pat.breakout_date = None
+                    pat.vol_confirmed = False
                     break
 
-                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST, PatternState.DAY1_BREAK_WARNING]:
+                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST, PatternState.DAY1_BREAK_WARNING, PatternState.BREAKOUT_FAILED]:
                     if close_p >= pat.neckline.price * (1 + cfg.breakout_margin):
                         consecutive_break_days += 1
+                        if consecutive_break_days == 1:
+                            temp_break_date = cur_date
+                            temp_vol_conf = (vol_ratio >= cfg.vol_multiplier)
+                        else:
+                            # 期間內任一天達標量能即算有效放量
+                            temp_vol_conf = temp_vol_conf or (vol_ratio >= cfg.vol_multiplier)
+
                         if consecutive_break_days >= cfg.breakout_days:
                             current_state = PatternState.BREAKOUT_CONFIRMED
-                            pat.breakout_date = cur_date
-                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
                         else:
                             current_state = PatternState.DAY1_BREAK_WARNING
-                            pat.breakout_date = cur_date
-                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
+                        pat.breakout_date = temp_break_date
+                        pat.vol_confirmed = temp_vol_conf
                     else:
                         consecutive_break_days = 0
-                        if close_p >= pat.neckline.price * 0.98: current_state = PatternState.NECKLINE_TEST
-                        else: current_state = PatternState.FORMING
+                        temp_break_date = None
+                        temp_vol_conf = False
+                        if current_state != PatternState.BREAKOUT_FAILED:
+                            pat.breakout_date = None
+                            pat.vol_confirmed = False
+                            current_state = PatternState.NECKLINE_TEST if close_p >= pat.neckline.price * 0.98 else PatternState.FORMING
+
                 elif current_state == PatternState.BREAKOUT_CONFIRMED:
-                    if close_p < pat.neckline.price * (1 - cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
-                    elif close_p <= pat.neckline.price * (1 + cfg.breakout_margin): current_state = PatternState.RETEST
+                    if close_p < pat.neckline.price * (1 - cfg.breakout_margin):
+                        current_state = PatternState.BREAKOUT_FAILED
+                        consecutive_break_days = 0
+                    elif close_p <= pat.neckline.price * (1 + cfg.breakout_margin):
+                        current_state = PatternState.RETEST
+
                 elif current_state == PatternState.RETEST:
-                    if close_p < pat.neckline.price * (1 - cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
-                    elif close_p > pat.neckline.price * (1 + cfg.breakout_margin * 2): current_state = PatternState.BREAKOUT_CONFIRMED
+                    if close_p < pat.neckline.price * (1 - cfg.breakout_margin):
+                        current_state = PatternState.BREAKOUT_FAILED
+                        consecutive_break_days = 0
+                    elif close_p >= pat.neckline.price * (1 + cfg.breakout_margin):
+                        current_state = PatternState.BREAKOUT_CONFIRMED
 
             elif pat.p_type == 'M':
                 if close_p > pat.invalidation_level:
                     current_state = PatternState.INVALIDATED
+                    pat.breakout_date = None
+                    pat.vol_confirmed = False
                     break
 
-                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST, PatternState.DAY1_BREAK_WARNING]:
+                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST, PatternState.DAY1_BREAK_WARNING, PatternState.BREAKOUT_FAILED]:
                     if close_p <= pat.neckline.price * (1 - cfg.breakout_margin):
                         consecutive_break_days += 1
+                        if consecutive_break_days == 1:
+                            temp_break_date = cur_date
+                            temp_vol_conf = (vol_ratio >= cfg.vol_multiplier)
+                        else:
+                            temp_vol_conf = temp_vol_conf or (vol_ratio >= cfg.vol_multiplier)
+
                         if consecutive_break_days >= cfg.breakout_days:
                             current_state = PatternState.BREAKOUT_CONFIRMED
-                            pat.breakout_date = cur_date
-                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
                         else:
                             current_state = PatternState.DAY1_BREAK_WARNING
-                            pat.breakout_date = cur_date
-                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
+                        pat.breakout_date = temp_break_date
+                        pat.vol_confirmed = temp_vol_conf
                     else:
                         consecutive_break_days = 0
-                        if close_p <= pat.neckline.price * 1.02: current_state = PatternState.NECKLINE_TEST
-                        else: current_state = PatternState.FORMING
+                        temp_break_date = None
+                        temp_vol_conf = False
+                        if current_state != PatternState.BREAKOUT_FAILED:
+                            pat.breakout_date = None
+                            pat.vol_confirmed = False
+                            current_state = PatternState.NECKLINE_TEST if close_p <= pat.neckline.price * 1.02 else PatternState.FORMING
+
                 elif current_state == PatternState.BREAKOUT_CONFIRMED:
-                    if close_p > pat.neckline.price * (1 + cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
-                    elif close_p >= pat.neckline.price * (1 - cfg.breakout_margin): current_state = PatternState.RETEST
+                    if close_p > pat.neckline.price * (1 + cfg.breakout_margin):
+                        current_state = PatternState.BREAKOUT_FAILED
+                        consecutive_break_days = 0
+                    elif close_p >= pat.neckline.price * (1 - cfg.breakout_margin):
+                        current_state = PatternState.RETEST
+
                 elif current_state == PatternState.RETEST:
-                    if close_p > pat.neckline.price * (1 + cfg.breakout_margin): current_state = PatternState.BREAKOUT_FAILED
-                    elif close_p < pat.neckline.price * (1 - cfg.breakout_margin * 2): current_state = PatternState.BREAKOUT_CONFIRMED
+                    if close_p > pat.neckline.price * (1 + cfg.breakout_margin):
+                        current_state = PatternState.BREAKOUT_FAILED
+                        consecutive_break_days = 0
+                    elif close_p <= pat.neckline.price * (1 - cfg.breakout_margin):
+                        current_state = PatternState.BREAKOUT_CONFIRMED
 
         pat.state = current_state
         return pat
 
     def identify_diagonal_channel(self, df: pd.DataFrame, high_series: pd.Series, low_series: pd.Series) -> Optional[DiagonalChannelPattern]:
-        """
-        新增：斜向趨勢線與收斂楔形/通道辨識引擎
-        自動取近期兩組波段高低點建立動態趨勢軌道，捕捉上升楔形跌破、下降楔形突破與三角收斂
-        """
         highs = self.find_swings(df, high_series, is_high=True)
         lows = self.find_swings(df, low_series, is_high=False)
 
@@ -1410,7 +1457,6 @@ class QuantPatternEngine:
         if (h2.idx - h1.idx) < 4 or (l2.idx - l1.idx) < 4:
             return None
 
-        # 計算上下軌每日斜率 (元/K棒) 與百分比斜率
         upper_slope = (h2.price - h1.price) / (h2.idx - h1.idx)
         lower_slope = (l2.price - l1.price) / (l2.idx - l1.idx)
 
@@ -1421,7 +1467,6 @@ class QuantPatternEngine:
         proj_upper = h2.price + upper_slope * (last_idx - h2.idx)
         proj_lower = l2.price + lower_slope * (last_idx - l2.idx)
 
-        # 分類斜向型態
         if upper_pct_slope > 0.03 and lower_pct_slope > 0.03:
             if lower_pct_slope > upper_pct_slope * 1.15:
                 c_type = "上升收斂楔形 (Rising Wedge - 高檔收斂留意下軌跌破)"
@@ -1441,11 +1486,14 @@ class QuantPatternEngine:
         else:
             c_type = "橫向區間箱型通道 (Horizontal Box Channel)"
 
+        # 處理極端收斂至交錯導致壓力與支撐互換之情境
+        if proj_upper < proj_lower:
+            c_type += " (⚠️ 趨勢線已收斂交叉失效)"
+
         channel_height = max(h1.price, h2.price) - min(l1.price, l2.price)
         target_up = proj_upper + channel_height
         target_down = proj_lower - channel_height
 
-        # 狀態追蹤：從最後一個極值確認後開始掃描是否突破上軌或跌破下軌
         start_eval = max(h2.idx, l2.idx) + self.cfg.window_order
         start_eval = min(start_eval, last_idx)
 
@@ -1453,23 +1501,38 @@ class QuantPatternEngine:
         break_date = None
         vol_conf = False
 
+        # 【修正】：動態軌道狀態檢查 - 正確重置拉回軌道內的狀態、正確保留首次跌破日期與量能
         for i in range(start_eval, len(df)):
             cur_c = df['Close'].iloc[i]
             cur_vol_r = df['Vol_Ratio'].iloc[i]
             u_val = h2.price + upper_slope * (i - h2.idx)
             l_val = l2.price + lower_slope * (i - l2.idx)
+            
+            # 若軌道已交叉，則不再進行有效突破判定
+            if u_val < l_val:
+                state = "CHANNEL_INVALID (⚠️ 軌道已交叉失效)"
+                break_date = None
+                vol_conf = False
+                continue
 
             if cur_c < l_val * (1 - self.cfg.breakout_margin * 0.5):
-                state = "CHANNEL_BREAKDOWN (🚨 跌破下軌上升支撐線 / 轉弱訊號)"
-                break_date = df.index[i]
-                vol_conf = (cur_vol_r >= self.cfg.vol_multiplier)
+                if "BREAKDOWN" not in state:
+                    state = "CHANNEL_BREAKDOWN (🚨 跌破下軌上升支撐線 / 轉弱訊號)"
+                    break_date = df.index[i]
+                    vol_conf = (cur_vol_r >= self.cfg.vol_multiplier)
+                else:
+                    vol_conf = vol_conf or (cur_vol_r >= self.cfg.vol_multiplier)
             elif cur_c > u_val * (1 + self.cfg.breakout_margin * 0.5):
-                state = "CHANNEL_BREAKOUT (🚀 突破上軌壓力趨勢線 / 轉強訊號)"
-                break_date = df.index[i]
-                vol_conf = (cur_vol_r >= self.cfg.vol_multiplier)
+                if "BREAKOUT" not in state:
+                    state = "CHANNEL_BREAKOUT (🚀 突破上軌壓力趨勢線 / 轉強訊號)"
+                    break_date = df.index[i]
+                    vol_conf = (cur_vol_r >= self.cfg.vol_multiplier)
+                else:
+                    vol_conf = vol_conf or (cur_vol_r >= self.cfg.vol_multiplier)
             else:
-                if "BREAK" not in state:
-                    state = "WITHIN_CHANNEL (於趨勢軌道內運行中)"
+                state = "WITHIN_CHANNEL (於趨勢軌道內運行中)"
+                break_date = None
+                vol_conf = False
 
         return DiagonalChannelPattern(
             channel_type=c_type,
@@ -1491,8 +1554,9 @@ class QuantPatternEngine:
         eval_w = [self.evaluate_state_machine(df, p) for p in raw_w]
         eval_m = [self.evaluate_state_machine(df, p) for p in raw_m]
 
-        active_w = [p for p in eval_w if p.state != PatternState.INVALIDATED]
-        active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED]
+        # 【修正】：過濾掉距離當前超過 120 天未發動且不活躍的老舊型態殘留
+        active_w = [p for p in eval_w if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
+        active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
 
         return {
             'W': active_w[-1] if active_w else (eval_w[-1] if eval_w else None),
@@ -2762,19 +2826,27 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     engine = QuantPatternEngine(custom_cfg)
                     df = engine.clean_and_validate_data(df)
 
-                    # 若使用者輸入盤中即時價模擬，動態追加或覆寫最新一根K棒
+                    # 【修正】：盤中即時價模擬邏輯 - 判斷最後一筆日期是否已為今日，避免重複產生K棒，並將虛擬量能調降為 1.0 倍中性平量
                     if intraday_p > 0:
                         last_dt = df.index[-1]
-                        sim_dt = last_dt + pd.Timedelta(days=1)
-                        prev_c = float(df['Close'].iloc[-1])
-                        sim_row = pd.DataFrame({
-                            'Open': [prev_c],
-                            'High': [max(prev_c, intraday_p)],
-                            'Low': [min(prev_c, intraday_p)],
-                            'Close': [float(intraday_p)],
-                            'Volume': [float(df['Volume'].iloc[-20:].mean() * 1.3)]
-                        }, index=[sim_dt])
-                        df = pd.concat([df, sim_row])
+                        today_date = pd.Timestamp.now().date()
+                        if last_dt.date() == today_date:
+                            # 盤中已存在今日 K 棒，直接更新最新一筆，不新增列
+                            df.iloc[-1, df.columns.get_loc('High')] = max(float(df['High'].iloc[-1]), intraday_p)
+                            df.iloc[-1, df.columns.get_loc('Low')] = min(float(df['Low'].iloc[-1]), intraday_p)
+                            df.iloc[-1, df.columns.get_loc('Close')] = float(intraday_p)
+                        else:
+                            # 收盤後或跨日模擬，量能預設採 20MA 的 1.0 倍（中性平量），避免強制觸發帶量確認
+                            sim_dt = last_dt + pd.Timedelta(days=1)
+                            prev_c = float(df['Close'].iloc[-1])
+                            sim_row = pd.DataFrame({
+                                'Open': [prev_c],
+                                'High': [max(prev_c, intraday_p)],
+                                'Low': [min(prev_c, intraday_p)],
+                                'Close': [float(intraday_p)],
+                                'Volume': [float(df['Volume'].iloc[-20:].mean() * 1.0)]
+                            }, index=[sim_dt])
+                            df = pd.concat([df, sim_row])
 
                     df = engine.compute_indicators(df)
                     
@@ -2845,7 +2917,7 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     def render_streamlit_pattern_block(p: Optional[GeometricPattern], title: str, l_price: float):
                         st.markdown(f"#### {title}")
                         if not p:
-                            st.warning("└─► 結構狀態：未辨識出符合「對稱誤差」與「波段位階濾網」之水平型態（已自動排除高檔W底或頭頭高之上升通道）。")
+                            st.warning("└─► 結構狀態：未辨識出符合「對稱誤差」與「波段位階濾網」之水平型態（已自動排除高檔W底或頭頭高之上升通道，或型態已超過120天過期）。")
                             return
 
                         s1_str = f"{p.swing1.price:.2f} ({p.swing1.date.strftime('%m/%d')})"
@@ -2865,13 +2937,16 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                         st.write(f"- **結構失效防線**：`{p.invalidation_level:.2f}` 元")
                         
                         if p.state in [PatternState.BREAKOUT_CONFIRMED, PatternState.RETEST, PatternState.DAY1_BREAK_WARNING]:
-                            risk = abs(l_price - p.invalidation_level)
+                            # 【修正】：風報比分母改為以「頸線假突破容錯區」為實際停損防線，取代原本過深的失效防線
+                            practical_sl = p.neckline.price * (1 - 0.01) if p.p_type == 'W' else p.neckline.price * (1 + 0.01)
+                            risk = abs(l_price - practical_sl)
                             reward_1to1 = abs(p.target_1to1 - l_price)
+                            
                             if risk > 0 and ((p.p_type == 'W' and l_price < p.target_1to1) or (p.p_type == 'M' and l_price > p.target_1to1)):
                                 rr_ratio = reward_1to1 / risk
-                                st.success(f"└─► **實質風險報酬比 (至 1:1 目標)**：1 : {rr_ratio:.2f}")
+                                st.success(f"└─► **實質風險報酬比 (至 1:1 目標)**：1 : {rr_ratio:.2f} (以頸線破線為防守)")
                             else:
-                                st.info("└─► 實質風報比：當前價已達標或風險防線無效。")
+                                st.info("└─► 實質風報比：當前價已達標或防守距離過近。")
                         else:
                             st.info("└─► 實質風報比：型態尚未完成確認突破，不提供先行交易風報比。")
                     
