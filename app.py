@@ -1466,7 +1466,6 @@ page_options = [
     "🤖 量化型態狀態機 (程式A)"
 ]
 
-# 套用樣式，確保按鈕排版美觀
 st.markdown("""
     <style>
     div.row-widget.stRadio > div{flex-direction:row;flex-wrap:wrap;}
@@ -2586,12 +2585,10 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                 try:
                     stock_name = get_tw_stock_name(real_ticker)
                     
-                    # 初始化引擎並處理資料
                     engine = QuantPatternEngine(QuantConfig())
                     df = engine.clean_and_validate_data(df)
                     df = engine.compute_indicators(df)
                     
-                    # 分析管線
                     close_patterns = engine.analyze_pipeline(df=df, high_series=df['Close'], low_series=df['Close'])
                     shadow_patterns = engine.analyze_pipeline(df=df, high_series=df['High'], low_series=df['Low'])
                     
@@ -2611,7 +2608,9 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     cq4.metric("量比 (相對 20MA)", f"{latest['Vol_Ratio']:.2f}x")
                     
                     z_desc = "極端負乖離 (超跌)" if latest['Z_Score'] < -2.0 else "極端正乖離 (過熱)" if latest['Z_Score'] > 2.0 else "常態隨機波動"
-                    st.info(f"**均線系統**：60MA: {latest['60MA']:.2f} | 120MA: {latest['120MA']:.2f if not pd.isna(latest['120MA']) else '樣本不足'}\n\n"
+                    ma120_str = f"{latest['120MA']:.2f}" if not pd.isna(latest['120MA']) else "樣本不足"
+                    
+                    st.info(f"**均線系統**：60MA: {latest['60MA']:.2f} | 120MA: {ma120_str}\n\n"
                             f"**布林軌道**：上軌 {latest['BB_UCL']:.2f} | 下軌 {latest['BB_LCL']:.2f} ──► 狀態【{z_desc}】")
                     
                     st.markdown("---")
