@@ -10,6 +10,7 @@ import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
+from scipy.signal import argrelextrema
 from bs4 import BeautifulSoup
 import pandas as pd
 import yfinance as yf
@@ -1021,6 +1022,60 @@ class FinancialAuditStrategy:
             return {"status": "error", "msg": f"解析 {ticker_symbol} 發生錯誤：{str(e)}"}
 
 # ==========================================
+# 幾何形態測距模組 (W底 / M頭 等幅與延伸測距)
+# ==========================================
+class GeometricPatternStrategy:
+    @staticmethod
+    def calculate_geometric_patterns(df, high_col, low_col, window_order=5):
+        """
+        傳入 df 以及需要計算的極值基準欄位 (實體K為 Close/Close, 影線極值為 High/Low)
+        """
+        high_idx = argrelextrema(df[high_col].values, np.greater, order=window_order)[0]
+        low_idx = argrelextrema(df[low_col].values, np.less, order=window_order)[0]
+        
+        result = {"bull": None, "bear": None}
+        
+        # --- 多方模型：W 底突破測距 ---
+        if len(low_idx) >= 2 and len(high_idx) >= 1:
+            v1_idx, v2_idx = low_idx[-2], low_idx[-1]
+            trough1 = df[low_col].iloc[v1_idx]
+            trough2 = df[low_col].iloc[v2_idx]
+            
+            between_highs = df[high_col].iloc[v1_idx:v2_idx]
+            neckline_bull = between_highs.max() if not between_highs.empty else df[high_col].iloc[high_idx[-1]]
+            
+            w_height = neckline_bull - min(trough1, trough2)
+            result["bull"] = {
+                "trough1": trough1, "date1": df.index[v1_idx].strftime('%m/%d'),
+                "trough2": trough2, "date2": df.index[v2_idx].strftime('%m/%d'),
+                "neckline": neckline_bull,
+                "height": w_height,
+                "target_1to1": neckline_bull + w_height,
+                "target_1618": neckline_bull + (w_height * 1.618)
+            }
+
+        # --- 空方模型：M 頭跌破測距 ---
+        if len(high_idx) >= 2 and len(low_idx) >= 1:
+            p1_idx, p2_idx = high_idx[-2], high_idx[-1]
+            peak1 = df[high_col].iloc[p1_idx]
+            peak2 = df[high_col].iloc[p2_idx]
+            
+            between_lows = df[low_col].iloc[p1_idx:p2_idx]
+            neckline_bear = between_lows.min() if not between_lows.empty else df[low_col].iloc[low_idx[-1]]
+            
+            m_height = max(peak1, peak2) - neckline_bear
+            result["bear"] = {
+                "peak1": peak1, "date1": df.index[p1_idx].strftime('%m/%d'),
+                "peak2": peak2, "date2": df.index[p2_idx].strftime('%m/%d'),
+                "neckline": neckline_bear,
+                "height": m_height,
+                "target_1to1": neckline_bear - m_height,
+                "target_1618": neckline_bear - (m_height * 1.618)
+            }
+            
+        return result
+
+# ==========================================
 # 網路請求與全域快取
 # ==========================================
 def get_yf_session():
@@ -1128,7 +1183,8 @@ if missing_keys or "backtest_date_obj" not in st.session_state:
 st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)", "📑 財報三表地雷掃描／財報體質與風險分析"])
+# 依需求新增第 4 個分頁
+tab1, tab2, tab3, tab4 = st.tabs(["📊 單檔深度解析", "🚀 全市場智慧掃描 (回測/翻轉/VCP/共振/背離)", "📑 財報三表地雷掃描／財報體質與風險分析", "📐 幾何型態滿足點測距"])
 
 # ----------------------------------------------------
 # 頁籤 1：單檔深度解析
@@ -2304,3 +2360,93 @@ with tab3:
                     )
                 else:
                     st.error("❌ 清單內的所有標的皆無法取得有效財報數據，請確認代號正確性或 Yahoo 資料庫狀態。")
+
+# ----------------------------------------------------
+# 頁籤 4：幾何型態滿足點測距 (W底/M頭)
+# ----------------------------------------------------
+with tab4:
+    st.write("利用量化演算法自動尋找波段轉折極值，並提供**「模式一：實體收盤價（過濾雜訊，對齊主力籌碼）」**與**「模式二：影線極值（包含極端恐慌斷頭與流動性插針）」**的雙重 1:1 及 1.618 幾何延伸測距。")
+    
+    col_g1, col_g2 = st.columns([4, 1])
+    with col_g1: 
+        geo_input = st.text_input("輸入股票代號", value="2609", key="geo_single", placeholder="例如：2330").strip()
+    with col_g2: 
+        st.write(""); st.write("")
+        geo_btn = st.button("計算幾何滿足點", type="primary", use_container_width=True)
+
+    if geo_btn and geo_input:
+        with st.spinner(f"⏳ 正在計算 [{geo_input}] 幾何滿足點與 SPC 管制界限..."):
+            df, real_ticker = get_stock_data(geo_input)
+            
+            if df.empty:
+                st.error("❌ 查無歷史數據，請確認代號是否正確。")
+            else:
+                stock_name = get_tw_stock_name(real_ticker)
+                
+                # 計算基礎均線與布林/SPC
+                df['20MA'] = df['Close'].rolling(window=20).mean()
+                df['60MA'] = df['Close'].rolling(window=60).mean()
+                df['120MA'] = df['Close'].rolling(window=120).mean()
+                rolling_std = df['Close'].rolling(window=20).std()
+                df['SPC_UCL'] = df['20MA'] + (2 * rolling_std)
+                df['SPC_LCL'] = df['20MA'] - (2 * rolling_std)
+                df['Z_Score'] = (df['Close'] - df['20MA']) / rolling_std
+                
+                latest = df.iloc[-1]
+                
+                st.subheader(f"📐 【{stock_name} ({real_ticker})】 量化幾何與 SPC 統計分析表")
+                st.markdown(f"**資料日期：{df.index[-1].strftime('%Y-%m-%d')}**")
+                
+                # 第一區塊：SPC 指標與均線
+                st.markdown("#### 1. 均線位階與 SPC 管制極限 (動態標準差)")
+                c_s1, c_s2, c_s3, c_s4 = st.columns(4)
+                c_s1.metric("最新收盤價", f"{latest['Close']:.2f}")
+                c_s2.metric("月線 / 季線", f"{latest['20MA']:.2f} / {latest['60MA']:.2f}")
+                c_s3.metric("半年線 (120MA)", f"{latest['120MA']:.2f}" if not pd.isna(latest['120MA']) else "-")
+                c_s4.metric("當前 Z-Score", f"{latest['Z_Score']:.2f}")
+                
+                z_state = "常態波動區間段"
+                if latest['Z_Score'] < -2.0: z_state = "🚨 【極端負乖離超跌】 (空方拋售竭盡 / 統計異常)"
+                elif latest['Z_Score'] > 2.0: z_state = "🔥 【極端正乖離過熱】 (多方推升超買 / 統計異常)"
+                
+                st.info(f"**布林上軌 (+2σ)：** {latest['SPC_UCL']:.2f} ｜ **布林下軌 (-2σ)：** {latest['SPC_LCL']:.2f} ｜ **統計狀態：** {z_state}")
+                
+                st.markdown("---")
+                
+                # 計算兩種模式的形態測距
+                res_mode1 = GeometricPatternStrategy.calculate_geometric_patterns(df, 'Close', 'Close')
+                res_mode2 = GeometricPatternStrategy.calculate_geometric_patterns(df, 'High', 'Low')
+                
+                def render_pattern_result(res_dict, title, is_mode1=True):
+                    st.markdown(f"#### {title}")
+                    col_m1, col_m2 = st.columns(2)
+                    
+                    # 多方 W 底
+                    with col_m1:
+                        if res_dict["bull"]:
+                            b = res_dict["bull"]
+                            st.success(f"**▲ 多方進攻：W 底突破測距**\n\n"
+                                       f"- **波段雙底**：{b['trough1']:.2f} ({b['date1']}) 與 {b['trough2']:.2f} ({b['date2']})\n"
+                                       f"- **進攻頸線**：{b['neckline']:.2f} 元\n"
+                                       f"- **型態高度**：{b['height']:.2f} 元\n"
+                                       f"- **1:1 漲幅滿足位**：**{b['target_1to1']:.2f} 元**\n"
+                                       f"- **1.618 延伸滿足位**：**{b['target_1618']:.2f} 元**")
+                        else:
+                            st.warning("**▲ 多方 W 底**：樣本不足，無法辨識完整雙底結構。")
+                            
+                    # 空方 M 頭
+                    with col_m2:
+                        if res_dict["bear"]:
+                            b = res_dict["bear"]
+                            st.error(f"**▼ 空方摜壓：M 頭跌破測距**\n\n"
+                                     f"- **波段雙峰**：{b['peak1']:.2f} ({b['date1']}) 與 {b['peak2']:.2f} ({b['date2']})\n"
+                                     f"- **防守頸線**：{b['neckline']:.2f} 元\n"
+                                     f"- **型態高度**：{b['height']:.2f} 元\n"
+                                     f"- **1:1 跌幅滿足位**：**{b['target_1to1']:.2f} 元**\n"
+                                     f"- **1.618 延伸滿足位**：**{b['target_1618']:.2f} 元**")
+                        else:
+                            st.warning("**▼ 空方 M 頭**：樣本不足，無法辨識完整雙峰結構。")
+                
+                render_pattern_result(res_mode1, "2. 模式一：實體收盤價模型（過濾盤中突刺，對齊主力籌碼實體成本）")
+                st.markdown("---")
+                render_pattern_result(res_mode2, "3. 模式二：影線極值模型（包含盤中插針、斷頭踩踏與極端低點）", is_mode1=False)
