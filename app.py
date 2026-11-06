@@ -1072,22 +1072,26 @@ class GeometricPatternStrategy:
         return result
 
 # ==============================================================================
-# 程式A: 量化狀態機與資料結構定義 (匯入新增)
+# 程式A (升級版): 量化狀態機、位階濾網與斜向通道/楔形引擎
 # ==============================================================================
 @dataclass
 class QuantConfig:
-    window_order: int = 5           
-    price_sim_threshold: float = 0.05 
-    min_time_gap: int = 8           
-    max_time_gap: int = 60          
-    breakout_margin: float = 0.01   
-    breakout_days: int = 2          
-    vol_multiplier: float = 1.2     
-    risk_margin: float = 0.02       
+    window_order: int = 5             # 極值確認左右 K 棒數
+    price_sim_threshold: float = 0.03 # 雙底/雙峰價格對稱容許誤差 (由 5% 收緊至 3%，減少頭頭高誤判)
+    min_time_gap: int = 8             # 兩個極值間的最小 K 棒間隔
+    max_time_gap: int = 60            # 兩個極值間的最大 K 棒間隔
+    breakout_margin: float = 0.01     # 頸線突破有效價格幅度門檻 (1%)
+    breakout_days: int = 2            # 收盤價突破頸線需連續維持的天數
+    vol_multiplier: float = 1.2       # 突破時成交量相對 20MA 均量之確認倍數
+    risk_margin: float = 0.02         # 結構失效參考區間 (低點/高點外延 2%)
+    enable_regime_filter: bool = True # 波段高低位階濾網 (排除高檔W底與低檔M頭)
+    w_max_percentile: float = 0.60    # W底雙底必須位於近60日區間下60%位階內
+    m_min_percentile: float = 0.40    # M頭雙峰必須位於近60日區間上40%位階以上
 
 class PatternState:
     FORMING = "FORMING (潛在型態形成中)"
     NECKLINE_TEST = "NECKLINE_TEST (價格接近頸線測試)"
+    DAY1_BREAK_WARNING = "DAY1_BREAK_WARNING (首日突破/跌破頸線預警，待次日確認)"
     BREAKOUT_CONFIRMED = "BREAKOUT_CONFIRMED (有效突破/跌破頸線)"
     RETEST = "RETEST (突破後回測頸線)"
     BREAKOUT_FAILED = "BREAKOUT_FAILED (突破跌回頸線/假突破失敗)"
@@ -1110,9 +1114,28 @@ class GeometricPattern:
     height: float
     target_1to1: float
     target_1618: float
-    invalidation_level: float       
+    invalidation_level: float
+    regime_note: str = "符合波段位階"
     state: str = PatternState.FORMING
     breakout_date: Optional[pd.Timestamp] = None
+    vol_confirmed: bool = False
+
+@dataclass
+class DiagonalChannelPattern:
+    channel_type: str               # 上升收斂楔形 / 上升通道 / 下降楔形 / 對稱三角收斂 等
+    high1: SwingPoint
+    high2: SwingPoint
+    low1: SwingPoint
+    low2: SwingPoint
+    upper_slope: float              # 上軌每日斜率 (元/日)
+    lower_slope: float              # 下軌每日斜率 (元/日)
+    proj_upper: float               # 今日動態上軌壓力價
+    proj_lower: float               # 今日動態下軌支撐價
+    channel_height: float           # 通道/楔形開口最大高度
+    target_up: float                # 向上突破等幅目標
+    target_down: float              # 向下跌破等幅目標
+    state: str                      # 軌道內運行 / 跌破下軌 / 突破上軌
+    break_date: Optional[pd.Timestamp] = None
     vol_confirmed: bool = False
 
 class QuantPatternEngine:
@@ -1174,6 +1197,11 @@ class QuantPatternEngine:
             df['Vol_Ratio'] = np.where(df['Vol_20MA'] > 0, vol_ratio, 1.0)
             df['Vol_Ratio'] = np.nan_to_num(df['Vol_Ratio'], nan=1.0)
 
+        # 新增：近 60 日價格位階百分位 (0.0 = 60日最低，1.0 = 60日最高)
+        roll_min60 = df['Low'].rolling(window=60, min_periods=20).min()
+        roll_max60 = df['High'].rolling(window=60, min_periods=20).max()
+        df['Pos_60D'] = (df['Close'] - roll_min60) / (roll_max60 - roll_min60 + 1e-8)
+
         return df
 
     def find_swings(self, df: pd.DataFrame, series: pd.Series, is_high: bool) -> List[SwingPoint]:
@@ -1225,11 +1253,23 @@ class QuantPatternEngine:
 
                 if neck_price <= max(t1.price, t2.price): continue
 
+                # 位階濾網檢驗：避免把大漲後的高檔旗形橫盤誤判為 W 底
+                lookback_start = max(0, t1.idx - 60)
+                hist_low = float(df['Low'].iloc[lookback_start : t2.idx + 1].min())
+                hist_high = float(df['High'].iloc[lookback_start : t2.idx + 1].max())
+                w_pos = (min(t1.price, t2.price) - hist_low) / (hist_high - hist_low + 1e-8)
+
+                if cfg.enable_regime_filter and w_pos > cfg.w_max_percentile:
+                    continue
+                
+                regime_str = f"波段低位階 ({w_pos*100:.0f}%分位)" if w_pos <= 0.4 else f"中繼整理位階 ({w_pos*100:.0f}%分位)"
+
                 h = neck_price - min(t1.price, t2.price)
                 pat = GeometricPattern(
                     p_type='W', swing1=t1, swing2=t2, neckline=neckline,
                     height=h, target_1to1=neck_price + h, target_1618=neck_price + (h * 1.618),
-                    invalidation_level=min(t1.price, t2.price) * (1 - cfg.risk_margin)
+                    invalidation_level=min(t1.price, t2.price) * (1 - cfg.risk_margin),
+                    regime_note=regime_str
                 )
                 patterns.append(pat)
 
@@ -1243,6 +1283,10 @@ class QuantPatternEngine:
                 price_diff = abs(p1.price - p2.price) / min(p1.price, p2.price)
                 if price_diff > cfg.price_sim_threshold: continue
 
+                # 排除明顯「頭頭高」上升波段被誤判為 M 頭 (右峰高於左峰超過 2.5% 視為上升趨勢通道而非平頭M頭)
+                if cfg.enable_regime_filter and (p2.price - p1.price) / p1.price > 0.025:
+                    continue
+
                 if p2.idx - p1.idx <= 1: continue
                 mid_slice = low_series.iloc[p1.idx + 1 : p2.idx]
                 if mid_slice.empty: continue
@@ -1255,11 +1299,23 @@ class QuantPatternEngine:
 
                 if neck_price >= min(p1.price, p2.price): continue
 
+                # 位階濾網檢驗：M 頭必須出現在波段相對高位階
+                lookback_start = max(0, p1.idx - 60)
+                hist_low = float(df['Low'].iloc[lookback_start : p2.idx + 1].min())
+                hist_high = float(df['High'].iloc[lookback_start : p2.idx + 1].max())
+                m_pos = (max(p1.price, p2.price) - hist_low) / (hist_high - hist_low + 1e-8)
+
+                if cfg.enable_regime_filter and m_pos < cfg.m_min_percentile:
+                    continue
+
+                regime_str = f"波段高位階 ({m_pos*100:.0f}%分位)" if m_pos >= 0.6 else f"中繼震盪位階 ({m_pos*100:.0f}%分位)"
+
                 h = max(p1.price, p2.price) - neck_price
                 pat = GeometricPattern(
                     p_type='M', swing1=p1, swing2=p2, neckline=neckline,
                     height=h, target_1to1=neck_price - h, target_1618=neck_price - (h * 1.618),
-                    invalidation_level=max(p1.price, p2.price) * (1 + cfg.risk_margin)
+                    invalidation_level=max(p1.price, p2.price) * (1 + cfg.risk_margin),
+                    regime_note=regime_str
                 )
                 patterns.append(pat)
 
@@ -1285,11 +1341,15 @@ class QuantPatternEngine:
                     current_state = PatternState.INVALIDATED
                     break
 
-                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST]:
+                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST, PatternState.DAY1_BREAK_WARNING]:
                     if close_p >= pat.neckline.price * (1 + cfg.breakout_margin):
                         consecutive_break_days += 1
                         if consecutive_break_days >= cfg.breakout_days:
                             current_state = PatternState.BREAKOUT_CONFIRMED
+                            pat.breakout_date = cur_date
+                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
+                        else:
+                            current_state = PatternState.DAY1_BREAK_WARNING
                             pat.breakout_date = cur_date
                             pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
                     else:
@@ -1308,11 +1368,15 @@ class QuantPatternEngine:
                     current_state = PatternState.INVALIDATED
                     break
 
-                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST]:
+                if current_state in [PatternState.FORMING, PatternState.NECKLINE_TEST, PatternState.DAY1_BREAK_WARNING]:
                     if close_p <= pat.neckline.price * (1 - cfg.breakout_margin):
                         consecutive_break_days += 1
                         if consecutive_break_days >= cfg.breakout_days:
                             current_state = PatternState.BREAKOUT_CONFIRMED
+                            pat.breakout_date = cur_date
+                            pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
+                        else:
+                            current_state = PatternState.DAY1_BREAK_WARNING
                             pat.breakout_date = cur_date
                             pat.vol_confirmed = (vol_ratio >= cfg.vol_multiplier)
                     else:
@@ -1328,6 +1392,94 @@ class QuantPatternEngine:
 
         pat.state = current_state
         return pat
+
+    def identify_diagonal_channel(self, df: pd.DataFrame, high_series: pd.Series, low_series: pd.Series) -> Optional[DiagonalChannelPattern]:
+        """
+        新增：斜向趨勢線與收斂楔形/通道辨識引擎
+        自動取近期兩組波段高低點建立動態趨勢軌道，捕捉上升楔形跌破、下降楔形突破與三角收斂
+        """
+        highs = self.find_swings(df, high_series, is_high=True)
+        lows = self.find_swings(df, low_series, is_high=False)
+
+        if len(highs) < 2 or len(lows) < 2:
+            return None
+
+        h1, h2 = highs[-2], highs[-1]
+        l1, l2 = lows[-2], lows[-1]
+
+        if (h2.idx - h1.idx) < 4 or (l2.idx - l1.idx) < 4:
+            return None
+
+        # 計算上下軌每日斜率 (元/K棒) 與百分比斜率
+        upper_slope = (h2.price - h1.price) / (h2.idx - h1.idx)
+        lower_slope = (l2.price - l1.price) / (l2.idx - l1.idx)
+
+        upper_pct_slope = (upper_slope / h1.price) * 100
+        lower_pct_slope = (lower_slope / l1.price) * 100
+
+        last_idx = len(df) - 1
+        proj_upper = h2.price + upper_slope * (last_idx - h2.idx)
+        proj_lower = l2.price + lower_slope * (last_idx - l2.idx)
+
+        # 分類斜向型態
+        if upper_pct_slope > 0.03 and lower_pct_slope > 0.03:
+            if lower_pct_slope > upper_pct_slope * 1.15:
+                c_type = "上升收斂楔形 (Rising Wedge - 高檔收斂留意下軌跌破)"
+            else:
+                c_type = "上升趨勢通道 (Ascending Channel - 頭頭高底底高)"
+        elif upper_pct_slope < -0.03 and lower_pct_slope < -0.03:
+            if upper_pct_slope < lower_pct_slope * 1.15:
+                c_type = "下降收斂楔形 (Falling Wedge - 末端收斂留意上軌突破)"
+            else:
+                c_type = "下降趨勢通道 (Descending Channel - 頭頭低底底低)"
+        elif upper_pct_slope < -0.02 and lower_pct_slope > 0.02:
+            c_type = "對稱三角收斂 (Symmetric Triangle - 多空壓縮待變盤)"
+        elif abs(upper_pct_slope) <= 0.03 and lower_pct_slope > 0.03:
+            c_type = "上升直角三角形 (Ascending Triangle - 平頂底墊高)"
+        elif upper_pct_slope < -0.03 and abs(lower_pct_slope) <= 0.03:
+            c_type = "下降直角三角形 (Descending Triangle - 頂降低平底)"
+        else:
+            c_type = "橫向區間箱型通道 (Horizontal Box Channel)"
+
+        channel_height = max(h1.price, h2.price) - min(l1.price, l2.price)
+        target_up = proj_upper + channel_height
+        target_down = proj_lower - channel_height
+
+        # 狀態追蹤：從最後一個極值確認後開始掃描是否突破上軌或跌破下軌
+        start_eval = max(h2.idx, l2.idx) + self.cfg.window_order
+        start_eval = min(start_eval, last_idx)
+
+        state = "WITHIN_CHANNEL (於趨勢軌道內運行中)"
+        break_date = None
+        vol_conf = False
+
+        for i in range(start_eval, len(df)):
+            cur_c = df['Close'].iloc[i]
+            cur_vol_r = df['Vol_Ratio'].iloc[i]
+            u_val = h2.price + upper_slope * (i - h2.idx)
+            l_val = l2.price + lower_slope * (i - l2.idx)
+
+            if cur_c < l_val * (1 - self.cfg.breakout_margin * 0.5):
+                state = "CHANNEL_BREAKDOWN (🚨 跌破下軌上升支撐線 / 轉弱訊號)"
+                break_date = df.index[i]
+                vol_conf = (cur_vol_r >= self.cfg.vol_multiplier)
+            elif cur_c > u_val * (1 + self.cfg.breakout_margin * 0.5):
+                state = "CHANNEL_BREAKOUT (🚀 突破上軌壓力趨勢線 / 轉強訊號)"
+                break_date = df.index[i]
+                vol_conf = (cur_vol_r >= self.cfg.vol_multiplier)
+            else:
+                if "BREAK" not in state:
+                    state = "WITHIN_CHANNEL (於趨勢軌道內運行中)"
+
+        return DiagonalChannelPattern(
+            channel_type=c_type,
+            high1=h1, high2=h2, low1=l1, low2=l2,
+            upper_slope=upper_slope, lower_slope=lower_slope,
+            proj_upper=proj_upper, proj_lower=proj_lower,
+            channel_height=channel_height,
+            target_up=target_up, target_down=target_down,
+            state=state, break_date=break_date, vol_confirmed=vol_conf
+        )
 
     def analyze_pipeline(self, df: pd.DataFrame, high_series: pd.Series, low_series: pd.Series) -> Dict[str, Optional[GeometricPattern]]:
         highs = self.find_swings(df, high_series, is_high=True)
@@ -1456,7 +1608,7 @@ st.title("📈 台股 K線型態與位階深度解析系統")
 st.markdown("<style>header {visibility: hidden;}</style>", unsafe_allow_html=True)
 
 # ----------------------------------------------------
-# 取代原有的 st.tabs，改用橫向單選紐 (st.radio) 作為快速切換分頁導航
+# 橫向單選鈕 (st.radio) 作為快速切換分頁導航
 # ----------------------------------------------------
 page_options = [
     "📊 單檔深度解析", 
@@ -2566,14 +2718,30 @@ elif selected_page == "📐 幾何型態滿足點測距":
                 render_pattern_result(res_mode2, "3. 模式二：影線極值模型（包含盤中插針、斷頭踩踏與極端低點）", is_mode1=False)
 
 # ----------------------------------------------------
-# 頁籤 5：台股量化技術分析與型態狀態機 (整合程式A)
+# 頁籤 5：台股量化技術分析與型態狀態機 (程式A 全面進化版)
 # ----------------------------------------------------
 elif selected_page == "🤖 量化型態狀態機 (程式A)":
-    st.write("這是由【程式A】整合而成的量化型態狀態機引擎。自動化掃描個股，評估「潛在型態、測試頸線、突破/跌破、回測、假突破、結構失效」等六大階段。")
+    st.write("結合**「60日波段位階濾網」**、**「斜向收斂楔形/通道趨勢線引擎」**與**「首日破線即時預警狀態」**，徹底解決高檔橫盤誤判 W 底、頭頭高誤判 M 頭以及盤中長黑延遲反應等結構盲點。")
     
-    col_q1, col_q2 = st.columns([4, 1])
-    with col_q1: q_input = st.text_input("輸入股票代號", value="2330", key="quant_engine_input", placeholder="例如：2330").strip()
-    with col_q2: st.write(""); st.write(""); q_btn = st.button("啟動量化狀態機", type="primary", use_container_width=True)
+    with st.expander("⚙️ 狀態機與幾何參數微調 (選填)", expanded=False):
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        with qc1:
+            cfg_win = st.number_input("極值確認左右 K 棒數", min_value=2, max_value=15, value=5, step=1)
+        with qc2:
+            cfg_sim = st.number_input("雙底/雙峰對稱誤差(%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5) / 100.0
+        with qc3:
+            cfg_b_days = st.number_input("突破連續確認天數", min_value=1, max_value=5, value=2, step=1)
+        with qc4:
+            cfg_regime = st.checkbox("啟用波段位階濾網 (防高檔W底/頭頭高M頭)", value=True)
+
+    col_q1, col_q2, col_q3 = st.columns([2.5, 1.5, 1])
+    with col_q1:
+        q_input = st.text_input("輸入股票代號", value="2609", key="quant_engine_input", placeholder="例如：2609、2330").strip()
+    with col_q2:
+        intraday_p = st.number_input("盤中即時價模擬 (0為不啟用)", min_value=0.0, value=0.0, step=0.1, help="若盤中出現急殺(如57.1)但Yahoo日K尚未更新，可輸入即時價立即查看破線狀態")
+    with col_q3:
+        st.write(""); st.write("")
+        q_btn = st.button("啟動量化狀態機", type="primary", use_container_width=True)
     
     if q_btn and q_input:
         with st.spinner(f"⏳ 正在載入 [{q_input}] 資料並通過量化引擎審查..."):
@@ -2585,59 +2753,118 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                 try:
                     stock_name = get_tw_stock_name(real_ticker)
                     
-                    engine = QuantPatternEngine(QuantConfig())
+                    custom_cfg = QuantConfig(
+                        window_order=int(cfg_win),
+                        price_sim_threshold=float(cfg_sim),
+                        breakout_days=int(cfg_b_days),
+                        enable_regime_filter=bool(cfg_regime)
+                    )
+                    engine = QuantPatternEngine(custom_cfg)
                     df = engine.clean_and_validate_data(df)
+
+                    # 若使用者輸入盤中即時價模擬，動態追加或覆寫最新一根K棒
+                    if intraday_p > 0:
+                        last_dt = df.index[-1]
+                        sim_dt = last_dt + pd.Timedelta(days=1)
+                        prev_c = float(df['Close'].iloc[-1])
+                        sim_row = pd.DataFrame({
+                            'Open': [prev_c],
+                            'High': [max(prev_c, intraday_p)],
+                            'Low': [min(prev_c, intraday_p)],
+                            'Close': [float(intraday_p)],
+                            'Volume': [float(df['Volume'].iloc[-20:].mean() * 1.3)]
+                        }, index=[sim_dt])
+                        df = pd.concat([df, sim_row])
+
                     df = engine.compute_indicators(df)
                     
+                    # 1. 水平頸線 W底/M頭 雙模型分析
                     close_patterns = engine.analyze_pipeline(df=df, high_series=df['Close'], low_series=df['Close'])
                     shadow_patterns = engine.analyze_pipeline(df=df, high_series=df['High'], low_series=df['Low'])
                     
+                    # 2. 斜向趨勢線與收斂楔形/通道分析
+                    diag_close = engine.identify_diagonal_channel(df=df, high_series=df['Close'], low_series=df['Close'])
+                    diag_shadow = engine.identify_diagonal_channel(df=df, high_series=df['High'], low_series=df['Low'])
+
                     latest = df.iloc[-1]
-                    latest_date = df.index[-1].strftime('%Y-%m-%d')
+                    latest_date = df.index[-1].strftime('%Y-%m-%d') + (" (含盤中即時模擬)" if intraday_p > 0 else "")
                     latest_close = latest['Close']
                     
                     st.subheader(f"🤖 【{stock_name} ({real_ticker})】 台股量化狀態機分析報告")
                     st.markdown(f"**最後有效交易日：** {latest_date}")
                     st.markdown("---")
                     
-                    st.markdown("### 一、核心量化數據與指標狀態")
-                    cq1, cq2, cq3, cq4 = st.columns(4)
-                    cq1.metric("最新收盤價", f"{latest_close:.2f}")
-                    cq2.metric("20MA 月線", f"{latest['20MA']:.2f}")
-                    cq3.metric("Z-Score", f"{latest['Z_Score']:.2f} σ")
-                    cq4.metric("量比 (相對 20MA)", f"{latest['Vol_Ratio']:.2f}x")
+                    st.markdown("### 一、核心量化數據與位階狀態")
+                    cq1, cq2, cq3, cq4, cq5 = st.columns(5)
+                    cq1.metric("最新基準價", f"{latest_close:.2f}")
+                    cq2.metric("20MA / 60MA", f"{latest['20MA']:.2f} / {latest['60MA']:.2f}")
+                    cq3.metric("60日位階百分位", f"{latest['Pos_60D']*100:.1f}%")
+                    cq4.metric("Z-Score", f"{latest['Z_Score']:.2f} σ")
+                    cq5.metric("量比 (相對 20MA)", f"{latest['Vol_Ratio']:.2f}x")
                     
                     z_desc = "極端負乖離 (超跌)" if latest['Z_Score'] < -2.0 else "極端正乖離 (過熱)" if latest['Z_Score'] > 2.0 else "常態隨機波動"
                     ma120_str = f"{latest['120MA']:.2f}" if not pd.isna(latest['120MA']) else "樣本不足"
                     
-                    st.info(f"**均線系統**：60MA: {latest['60MA']:.2f} | 120MA: {ma120_str}\n\n"
-                            f"**布林軌道**：上軌 {latest['BB_UCL']:.2f} | 下軌 {latest['BB_LCL']:.2f} ──► 狀態【{z_desc}】")
+                    st.info(f"**均線系統**：20MA: {latest['20MA']:.2f} | 60MA: {latest['60MA']:.2f} | 120MA: {ma120_str}\n\n"
+                            f"**布林軌道**：上軌 {latest['BB_UCL']:.2f} | 下軌 {latest['BB_LCL']:.2f} ──► 波動狀態【{z_desc}】")
                     
+                    st.markdown("---")
+                    st.markdown("### 二、斜向趨勢軌道與收斂楔形/通道診斷 (解決斜向趨勢線盲點)")
+
+                    def render_diagonal_block(d_pat: Optional[DiagonalChannelPattern], title: str, cur_p: float):
+                        st.markdown(f"#### {title}")
+                        if not d_pat:
+                            st.warning("└─► 樣本極值不足，無法建構斜向趨勢軌道。")
+                            return
+                        st.markdown(f"- **辨識幾何結構**：**【{d_pat.channel_type}】**")
+                        st.write(f"- **上軌波段高點**：{d_pat.high1.price:.2f} ({d_pat.high1.date.strftime('%m/%d')}) ──► {d_pat.high2.price:.2f} ({d_pat.high2.date.strftime('%m/%d')}) | 斜率: `{d_pat.upper_slope:+.2f}` 元/日")
+                        st.write(f"- **下軌波段低點**：{d_pat.low1.price:.2f} ({d_pat.low1.date.strftime('%m/%d')}) ──► {d_pat.low2.price:.2f} ({d_pat.low2.date.strftime('%m/%d')}) | 斜率: `{d_pat.lower_slope:+.2f}` 元/日")
+                        st.write(f"- **今日動態軌道界限**：上軌壓力 `{d_pat.proj_upper:.2f}` 元 ｜ 下軌支撐 `{d_pat.proj_lower:.2f}` 元")
+                        
+                        if "BREAKDOWN" in d_pat.state:
+                            v_str = "放量摜破" if d_pat.vol_confirmed else "跌破"
+                            b_dt = d_pat.break_date.strftime('%Y-%m-%d') if d_pat.break_date else "-"
+                            st.error(f"**當前軌道狀態**：{d_pat.state}\n\n- **觸發日期**：{b_dt} ({v_str}) ｜ **現價 ({cur_p:.2f}) 已跌破動態下軌 ({d_pat.proj_lower:.2f})**\n- **等幅下修測距參考**：`{d_pat.target_down:.2f}` 元")
+                        elif "BREAKOUT" in d_pat.state:
+                            v_str = "帶量突破" if d_pat.vol_confirmed else "突破"
+                            b_dt = d_pat.break_date.strftime('%Y-%m-%d') if d_pat.break_date else "-"
+                            st.success(f"**當前軌道狀態**：{d_pat.state}\n\n- **觸發日期**：{b_dt} ({v_str}) ｜ **現價 ({cur_p:.2f}) 已突破動態上軌 ({d_pat.proj_upper:.2f})**\n- **等幅上攻測距參考**：`{d_pat.target_up:.2f}` 元")
+                        else:
+                            st.info(f"**當前軌道狀態**：{d_pat.state}\n\n- 現價 ({cur_p:.2f}) 介於下軌支撐 `{d_pat.proj_lower:.2f}` 與上軌壓力 `{d_pat.proj_upper:.2f}` 之間。")
+
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        with st.container(border=True):
+                            render_diagonal_block(diag_close, "📐 實體收盤價趨勢軌道", latest_close)
+                    with dc2:
+                        with st.container(border=True):
+                            render_diagonal_block(diag_shadow, "📐 高低影線極值趨勢軌道", latest_close)
+
                     st.markdown("---")
                     
                     def render_streamlit_pattern_block(p: Optional[GeometricPattern], title: str, l_price: float):
                         st.markdown(f"#### {title}")
                         if not p:
-                            st.warning("└─► 結構狀態：尚未辨識出符合幾何條件之型態結構。")
+                            st.warning("└─► 結構狀態：未辨識出符合「對稱誤差」與「波段位階濾網」之水平型態（已自動排除高檔W底或頭頭高之上升通道）。")
                             return
 
                         s1_str = f"{p.swing1.price:.2f} ({p.swing1.date.strftime('%m/%d')})"
                         s2_str = f"{p.swing2.price:.2f} ({p.swing2.date.strftime('%m/%d')})"
                         
-                        st.write(f"- **幾何極值**：點1 [{s1_str}] | 點2 [{s2_str}]")
+                        st.write(f"- **幾何極值**：點1 [{s1_str}] | 點2 [{s2_str}] ──► *{p.regime_note}*")
                         st.write(f"- **中間頸線價位**：{p.neckline.price:.2f} 元 ({p.neckline.date.strftime('%m/%d')})")
                         
-                        state_color = "🟢" if "BREAKOUT_CONFIRMED" in p.state else ("🔴" if "FAILED" in p.state or "INVALID" in p.state else "🟡")
+                        state_color = "🟢" if "BREAKOUT_CONFIRMED" in p.state else ("🟠" if "DAY1_BREAK" in p.state else ("🔴" if "FAILED" in p.state or "INVALID" in p.state else "🟡"))
                         st.markdown(f"- **當前型態狀態**：{state_color} **【{p.state}】**")
                         
                         if p.breakout_date:
                             vol_tag = "✅ 有效放量" if p.vol_confirmed else "⚠️ 量能不足/平量"
-                            st.write(f"- **突破確認日**：{p.breakout_date.strftime('%Y-%m-%d')} ({vol_tag})")
+                            st.write(f"- **突破/跌破觸發日**：{p.breakout_date.strftime('%Y-%m-%d')} ({vol_tag})")
                             
                         st.write(f"- **測距滿足位**：1:1 等幅 `{p.target_1to1:.2f}` 元 | 1.618 延伸 `{p.target_1618:.2f}` 元")
                         st.write(f"- **結構失效防線**：`{p.invalidation_level:.2f}` 元")
                         
-                        if p.state in [PatternState.BREAKOUT_CONFIRMED, PatternState.RETEST]:
+                        if p.state in [PatternState.BREAKOUT_CONFIRMED, PatternState.RETEST, PatternState.DAY1_BREAK_WARNING]:
                             risk = abs(l_price - p.invalidation_level)
                             reward_1to1 = abs(p.target_1to1 - l_price)
                             if risk > 0 and ((p.p_type == 'W' and l_price < p.target_1to1) or (p.p_type == 'M' and l_price > p.target_1to1)):
@@ -2646,39 +2873,41 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                             else:
                                 st.info("└─► 實質風報比：當前價已達標或風險防線無效。")
                         else:
-                            st.info("└─► 實質風報比：型態尚未完成實體確認突破，不提供先行交易風報比。")
+                            st.info("└─► 實質風報比：型態尚未完成確認突破，不提供先行交易風報比。")
                     
                     cc1, cc2 = st.columns(2)
                     with cc1:
-                        st.markdown("### 二、實體收盤價模型\n*(過濾盤中突刺，錨定實體持股籌碼)*")
+                        st.markdown("### 三、水平頸線：實體收盤價模型\n*(過濾盤中突刺，錨定實體持股籌碼)*")
                         with st.container(border=True):
                             render_streamlit_pattern_block(close_patterns['W'], "▲ 多方 W 底模型", latest_close)
                             st.divider()
                             render_streamlit_pattern_block(close_patterns['M'], "▼ 空方 M 頭模型", latest_close)
                     
                     with cc2:
-                        st.markdown("### 三、影線極值模型\n*(涵蓋盤中高低點與極端流動性)*")
+                        st.markdown("### 四、水平頸線：影線極值模型\n*(涵蓋盤中高低點與極端流動性)*")
                         with st.container(border=True):
                             render_streamlit_pattern_block(shadow_patterns['W'], "▲ 多方 W 底模型", latest_close)
                             st.divider()
                             render_streamlit_pattern_block(shadow_patterns['M'], "▼ 空方 M 頭模型", latest_close)
                     
                     st.markdown("---")
-                    st.markdown("### 四、客觀架構結論")
+                    st.markdown("### 五、客觀架構綜合結論")
                     
                     final_states = []
+                    for d_label, d_res in [("實體軌道", diag_close), ("影線軌道", diag_shadow)]:
+                        if d_res and "BREAK" in d_res.state:
+                            final_states.append(f"{d_label} [{d_res.channel_type.split(' ')[0]}]: {d_res.state}")
                     for model_res in [close_patterns, shadow_patterns]:
                         for p in [model_res['W'], model_res['M']]:
                             if p and p.state not in [PatternState.NONE, PatternState.INVALIDATED]:
-                                final_states.append(f"{p.p_type}底/頭: {p.state}")
+                                final_states.append(f"水平{p.p_type}型態: {p.state}")
                     
                     if final_states:
-                        st.success(f"**當前主導狀態**：{'; '.join(set(final_states))}")
+                        st.success(f"**當前主導狀態**：{' ； '.join(dict.fromkeys(final_states))}")
                     else:
-                        st.warning("**當前主導狀態**：目前無已確認或有效之典型反轉幾何結構，市場處於無型態整理或單向波段中。")
+                        st.warning("**當前主導狀態**：目前無已確認之水平反轉型態或趨勢線突破，市場處於軌道內整理或單向波段中。")
                         
                     st.caption("風險聲明：本工具提供之測距為幾何對稱與波動統計參考，非買賣保證；實務交易需嚴格執行防線停損。")
 
                 except Exception as e:
                     st.error(f"量化狀態機計算過程發生錯誤：{str(e)}")
-
