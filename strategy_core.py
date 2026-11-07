@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
 }
 
 # 擴充演算法清單 (UI自動抓取此清單顯示，隨時可加)
-SCAN_ALGO_CHOICES = ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破', '*回測走揚年線']
+SCAN_ALGO_CHOICES = ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破', '*回測走揚年線', '低位長下引量縮突破']
 
 # ==========================================
 # 網路與工具模組
@@ -442,6 +442,42 @@ class MA240PullbackRightSideStrategy:
         is_pass = (score_ma240 >= 1.0) and held_ma240 and (score_pullback >= 2.5) and (total_score >= DEFAULT_CONFIG["min_ma240_score"])
         return {"is_pass": is_pass, "score": total_score}
 
+class LowPositionShrinkVolumeBreakoutStrategy:
+    @staticmethod
+    def evaluate(df):
+        res = pd.Series(False, index=df.index)
+        if len(df) < 62: return res
+        df = df.copy()
+
+        # 確保擁有 Volume_Lots (一般在呼叫前會轉換，若無則自動補足避免報錯)
+        if 'Volume_Lots' not in df.columns:
+            df['Volume_Lots'] = df.get('Volume', pd.Series(0, index=df.index)) / 1000.0
+
+        # 1. 60日低位階 (排除當天 T0 與前一天 T-1，從 T-2 往前算 60 天區間)
+        min_60 = df['Low'].shift(2).rolling(window=60).min()
+        max_60 = df['High'].shift(2).rolling(window=60).max()
+        
+        # 判定前一天 (T-1) 是否處於低位階 (T-1 收盤價位於過去60天區間底部 20%以內，或直接破底)
+        pos_60 = (df['Close'].shift(1) - min_60) / (max_60 - min_60 + 1e-8)
+        cond_low_pos = pos_60 <= 0.20
+
+        # 2. 前一天 (T-1) 必須出量且帶長下引線
+        body_1 = abs(df['Close'].shift(1) - df['Open'].shift(1))
+        lower_shadow_1 = df[['Open', 'Close']].shift(1).min(axis=1) - df['Low'].shift(1)
+        range_1 = (df['High'].shift(1) - df['Low'].shift(1)).replace(0, 1e-8)
+
+        # 條件：下影線大於實體 1.5 倍，且佔全天振幅 40% 以上
+        cond_long_shadow = (lower_shadow_1 > body_1 * 1.5) & ((lower_shadow_1 / range_1) >= 0.4)
+        # 條件：T-1 成交量大於 T-2 成交量
+        cond_vol_up_1 = df['Volume_Lots'].shift(1) > df['Volume_Lots'].shift(2)
+
+        # 3. 當天 (T0) 收盤高於前一天高點，且量縮
+        cond_today_break = df['Close'] > df['High'].shift(1)
+        cond_today_vol_shrink = df['Volume_Lots'] < df['Volume_Lots'].shift(1)
+
+        valid = cond_low_pos & cond_long_shadow & cond_vol_up_1 & cond_today_break & cond_today_vol_shrink
+        return valid.fillna(False)
+
 class WeeklyAnalysisStrategy:
     @staticmethod
     def evaluate(long_df, div_pairs, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, price_col):
@@ -489,6 +525,10 @@ class ScanEngine:
         )
         df['Breakout_Signal'] = LongLowerShadowBreakoutStrategy.evaluate(df)
         df['MA240_P1_Pass'] = MA240PullbackRightSideStrategy.evaluate_phase1(df)
+        
+        # 擴充：低位階長下引量縮突破
+        df['LowPos_Breakout_Pass'] = LowPositionShrinkVolumeBreakoutStrategy.evaluate(df)
+        
         return df
 
     @staticmethod
@@ -500,12 +540,14 @@ class ScanEngine:
         is_pv = (algo_mode in ['全部', '量價雙背離']) and row.get('PriceVol_Div_Pass', False)
         is_brk = (algo_mode in ['全部', '長下引突破']) and row.get('Breakout_Signal', False)
         is_ma240 = (algo_mode in ['全部', '*回測走揚年線']) and row.get('MA240_P1_Pass', False)
+        is_lowpos_brk = (algo_mode in ['全部', '低位長下引量縮突破']) and row.get('LowPos_Breakout_Pass', False)
         
-        passed = is_r or is_v or is_reso or is_pv or is_brk or is_ma240 or force_pass
+        passed = is_r or is_v or is_reso or is_pv or is_brk or is_ma240 or is_lowpos_brk or force_pass
         combo_score = (row.get('Candle_Score', 0) + row.get('VCP_Score', 0) + row.get('Reso_Score', 0) + 
                        (20 if row.get('PriceVol_Div_Pass', False) else 0) + 
                        (10 if row.get('Breakout_Signal', False) else 0) + 
-                       (12 if row.get('MA240_P1_Pass', False) else 0))
+                       (12 if row.get('MA240_P1_Pass', False) else 0) +
+                       (15 if row.get('LowPos_Breakout_Pass', False) else 0))
         return passed, combo_score
 
     @staticmethod
@@ -514,6 +556,8 @@ class ScanEngine:
         if item.get("量價雙背離") == "✅ 是": base_tags.append("量價雙背離")
         if item.get("長下引突破") == "✅ 是": base_tags.append("長下引突破")
         if item.get("*回測走揚年線") == "✅ 是": base_tags.append("*回測走揚年線")
+        # 兼容 app.py 直接吃字串，或是核心傳遞 boolean 值
+        if item.get("低位長下引量縮突破") == "✅ 是" or item.get("LowPos_Breakout_Pass", False): base_tags.append("低位量縮突破")
         if item.get("反轉分數", 0) >= config.get("min_score", 8.0): base_tags.append("底部翻轉")
         if item.get("VCP分數", 0) >= config.get("min_vcp_score", 10.0): base_tags.append("VCP收斂")
         if item.get("共振分數", 0) >= config.get("min_reso_score", 10.0): base_tags.append("指標共振")
@@ -983,4 +1027,3 @@ class QuantPatternEngine:
         active_w = [p for p in eval_w if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
         active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
         return {'W': active_w[-1] if active_w else None, 'M': active_m[-1] if active_m else None}
-
