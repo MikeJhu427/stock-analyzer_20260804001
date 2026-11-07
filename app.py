@@ -876,4 +876,3 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     st.success(f"**當前主導狀態**：{' ； '.join(dict.fromkeys(final_states))}")
                 else:
                     st.warning("**當前主導狀態**：目前無已確認之水平反轉型態或趨勢線突破，市場處於軌道內整理或單向波段中。")
-```
