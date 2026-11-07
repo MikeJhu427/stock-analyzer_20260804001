@@ -40,9 +40,15 @@ def save_config(config):
             json.dump(config, f, ensure_ascii=False, indent=4)
     except Exception: pass
 
+# ==========================================
+# 快取自癒機制升級：破壞舊快取並防止空值駐留
+# ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_all_tw_stocks():
-    return core.fetch_all_tw_stocks()
+def get_all_tw_stocks(cache_version="v2"):
+    stocks = core.fetch_all_tw_stocks()
+    if not stocks:
+        get_all_tw_stocks.clear() # 防呆機制：若抓取失敗，立即清除快取，避免空值存活 24 小時
+    return stocks
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_tw_stock_name(ticker):
@@ -298,7 +304,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         status_text, progress_bar = st.empty(), st.progress(0)
         stock_dict = get_all_tw_stocks()
         if not stock_dict:
-            status_text.empty(); progress_bar.empty(); st.error("❌ 無法取得台股清單。"); st.stop()
+            status_text.empty(); progress_bar.empty(); st.error("❌ 無法取得台股清單。 (請確認伺服器網路狀態或稍後再試)"); st.stop()
 
         tickers = [core.resolve_ticker(test_ticker_input, stock_dict)] if scan_target_mode == "指定個股測試" else list(stock_dict.keys())
         config_dict = {k: st.session_state[k] for k in core.DEFAULT_CONFIG.keys() if k in st.session_state}
@@ -389,6 +395,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 "MACD金叉判定": "✅ 是" if best_row['MACD_Cross_Recent'] else "❌ 否",
                                 "反轉分數": round(float(best_row['Candle_Score']), 2), "VCP分數": round(float(best_row['VCP_Score']), 2), "共振分數": round(float(best_row['Reso_Score']), 2),
                                 "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否", "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
+                                "低位量縮突破": "✅ 是" if best_row.get('LowPos_Breakout_Pass') else "❌ 否",
                                 "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
                                 "進場位置建議": rec_status, "盤整過濾": "✅ 盤整中" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
@@ -462,7 +469,7 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
-        base_cols.extend(['演算法建議結果', '*回測走揚年線', '*年線回測分數', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'])
+        base_cols.extend(['演算法建議結果', '*回測走揚年線', '*年線回測分數', '長下引突破', '低位量縮突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'])
         if config_dict["use_weekly_filter"]: base_cols.extend(['週K共振', '週K背離'])
         base_cols.extend(['年線/半年線空排', '年線斜率(%)', '半年線斜率(%)'])
 
