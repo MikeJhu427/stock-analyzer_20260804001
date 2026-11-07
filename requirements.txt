@@ -6,3 +6,5 @@ matplotlib
 beautifulsoup4
 requests
 scipy
+html5lib
+lxml
