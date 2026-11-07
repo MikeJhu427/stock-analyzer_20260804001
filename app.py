@@ -4,6 +4,7 @@ import warnings
 import datetime
 import time
 import re
+import importlib 
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -14,6 +15,7 @@ import matplotlib.dates as mdates
 import streamlit as st
 import strategy_core as core
 
+importlib.reload(core)
 warnings.filterwarnings("ignore")
 
 OUTPUT_COLUMN_CONFIG = {
@@ -40,14 +42,11 @@ def save_config(config):
             json.dump(config, f, ensure_ascii=False, indent=4)
     except Exception: pass
 
-# ==========================================
-# 快取自癒機制升級：破壞舊快取並防止空值駐留
-# ==========================================
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_all_tw_stocks(cache_version="v2"):
+def get_all_tw_stocks(cache_version="v4"):
     stocks = core.fetch_all_tw_stocks()
     if not stocks:
-        get_all_tw_stocks.clear() # 防呆機制：若抓取失敗，立即清除快取，避免空值存活 24 小時
+        get_all_tw_stocks.clear()
     return stocks
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -136,11 +135,15 @@ if selected_page == "📊 單檔深度解析":
                 df['Prev_VWMA20'] = df['VWMA20'].shift(1)
                 df['Vol_MA20'] = df['Volume_Lots'].rolling(window=20).mean()
 
-                vols_arr, opens_arr, closes_arr = df['Volume'].values, df['Open'].values, df['Close'].values
+                vols_arr = df['Volume'].values
+                opens_arr = df['Open'].values
+                closes_arr = df['Close'].values
                 defense_arr = np.full(len(df), np.nan)
+                
                 for i in range(60, len(df)):
                     max_idx = (i - 60) + np.argmax(vols_arr[i-60:i+1])
                     defense_arr[i] = min(opens_arr[max_idx], closes_arr[max_idx])
+                    
                 df['Max_Vol_Defense'] = defense_arr
                 df['Prev_Defense'] = df['Max_Vol_Defense'].shift(1)
 
@@ -303,8 +306,12 @@ elif selected_page == "🚀 全市場智慧掃描":
     if st.button("🚀 開始智慧區間掃描", type="primary"):
         status_text, progress_bar = st.empty(), st.progress(0)
         stock_dict = get_all_tw_stocks()
+        
         if not stock_dict:
-            status_text.empty(); progress_bar.empty(); st.error("❌ 無法取得台股清單。 (請確認伺服器網路狀態或稍後再試)"); st.stop()
+            status_text.empty()
+            progress_bar.empty()
+            st.error("❌ 無法取得台股清單。 (請確認伺服器網路狀態或稍後再試)")
+            st.stop()
 
         tickers = [core.resolve_ticker(test_ticker_input, stock_dict)] if scan_target_mode == "指定個股測試" else list(stock_dict.keys())
         config_dict = {k: st.session_state[k] for k in core.DEFAULT_CONFIG.keys() if k in st.session_state}
@@ -372,13 +379,19 @@ elif selected_page == "🚀 全市場智慧掃描":
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
 
                         count_30d = 0
+                        
+                        # -------------------------
+                        # 修復先前被截斷的迴圈區塊
+                        # -------------------------
                         if config_dict["enable_30d_backtest"] and best_row is not None:
                             for b_offset in range(best_offset + 1, best_offset + 31):
-                                if len(df) <= b_offset + 1: continue
+                                if len(df) <= b_offset + 1:
+                                    continue
                                 c_row = df.iloc[-1 - b_offset]
                                 if c_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"] or force_pass:
                                     c_pass, _ = core.ScanEngine.check_algo_pass(c_row, config_dict, algo_mode, force_pass)
-                                    if c_pass: count_30d += 1
+                                    if c_pass:
+                                        count_30d += 1
 
                         if best_row is not None:
                             last_expert = expert_res_df.iloc[-1 - best_offset]
@@ -507,7 +520,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 st.success("✅ **傳送成功！已自動載入標的。** 請切換至 **【📑 財報三表地雷掃描】** 分頁。")
 
 # ----------------------------------------------------
-# 頁籤 3：財報三表地雷掃描 (完整 UI 排版)
+# 頁籤 3：財報三表地雷掃描 
 # ----------------------------------------------------
 elif selected_page == "📑 財報三表地雷掃描":
     def render_trend_sparkline(trend_list):
@@ -636,7 +649,7 @@ elif selected_page == "📑 財報三表地雷掃描":
                     st.download_button(label="📥 下載三表交叉財報健檢報告 (CSV)", data=csv, file_name=f'financial_cross_audit_{datetime.date.today()}.csv', mime='text/csv')
 
 # ----------------------------------------------------
-# 頁籤 4：幾何型態滿足點測距 (完整 UI 排版)
+# 頁籤 4：幾何型態滿足點測距 
 # ----------------------------------------------------
 elif selected_page == "📐 幾何型態滿足點測距":
     st.write("利用量化演算法自動尋找波段轉折極值，並提供**「模式一：實體收盤價（過濾雜訊，對齊主力籌碼）」**與**「模式二：影線極值（包含極端恐慌斷頭與流動性插針）」**的雙重 1:1 及 1.618 幾何延伸測距。")
@@ -711,7 +724,7 @@ elif selected_page == "📐 幾何型態滿足點測距":
                 render_pattern_result(res_mode2, "3. 模式二：影線極值模型（包含盤中插針、斷頭踩踏與極端低點）")
 
 # ----------------------------------------------------
-# 頁籤 5：量化型態狀態機 (完整 UI 排版)
+# 頁籤 5：量化型態狀態機 
 # ----------------------------------------------------
 elif selected_page == "🤖 量化型態狀態機 (程式A)":
     st.write("結合**「60日波段位階濾網」**、**「斜向收斂楔形/通道趨勢線引擎」**與**「首日破線即時預警狀態」**，徹底解決高檔橫盤誤判 W 底、頭頭高誤判 M 頭以及盤中長黑延遲反應等結構盲點。")
