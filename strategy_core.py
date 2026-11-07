@@ -76,23 +76,73 @@ def get_yf_session():
 
 def fetch_all_tw_stocks():
     stocks = {}
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    for mode in ['2', '4']: 
-        suffix = '.TW' if mode == '2' else '.TWO'
-        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-        try:
-            res = requests.get(url, headers=headers, timeout=15)
-            res.encoding = 'big5' 
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for tr in soup.find_all('tr'):
-                tds = tr.find_all('td')
-                if len(tds) > 0:
-                    text = tds[0].text.strip()
-                    if '\u3000' in text:
-                        code, name = text.split('\u3000')
-                        if code.isdigit() and len(code) == 4:
-                            stocks[code + suffix] = name
-        except Exception: pass
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/json,application/xhtml+xml'
+    }
+    
+    def is_valid_code(c):
+        # 支援 4 碼純數字 (一般股票) 與 00 開頭的 ETF (如 0050, 00631L)
+        return (c.isdigit() and len(c) == 4) or (c.startswith('00') and len(c) >= 4)
+
+    # 方法 1: 證交所 ISIN 爬蟲 (最完整，但海外 IP 或 GitHub Actions 易被阻擋)
+    try:
+        for mode in ['2', '4']: 
+            suffix = '.TW' if mode == '2' else '.TWO'
+            url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                res.encoding = 'big5' 
+                soup = BeautifulSoup(res.text, 'html.parser')
+                for tr in soup.find_all('tr'):
+                    tds = tr.find_all('td')
+                    if len(tds) > 0:
+                        text = tds[0].text.strip()
+                        if '\u3000' in text:
+                            code, name = text.split('\u3000')
+                            if is_valid_code(code):
+                                stocks[code + suffix] = name
+        if len(stocks) > 1000:
+            return stocks
+    except Exception: 
+        pass
+
+    # 方法 2: FinMind 開放 API 備援 (海外 IP 友善)
+    try:
+        fm_url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
+        res_fm = requests.get(fm_url, headers=headers, timeout=10)
+        if res_fm.status_code == 200:
+            data = res_fm.json().get('data', [])
+            for item in data:
+                code = str(item.get('stock_id', '')).strip()
+                name = str(item.get('stock_name', '')).strip()
+                mkt = str(item.get('type', '')).strip().lower()
+                if is_valid_code(code):
+                    if mkt == 'twse': stocks[code + '.TW'] = name
+                    elif mkt == 'tpex': stocks[code + '.TWO'] = name
+        if len(stocks) > 1000:
+            return stocks
+    except Exception:
+        pass
+        
+    # 方法 3: 政府 OpenData API 終極備援
+    try:
+        res_twse = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=10)
+        if res_twse.status_code == 200:
+            for item in res_twse.json():
+                code = str(item.get('Code', '')).strip()
+                if is_valid_code(code):
+                    stocks[code + '.TW'] = str(item.get('Name', '')).strip()
+                    
+        res_tpex = requests.get("https://www.tpex.org.tw/openapi/v1/mktdata/tpexod/BPSR", headers=headers, timeout=10)
+        if res_tpex.status_code == 200:
+            for item in res_tpex.json():
+                code = str(item.get('SecuritiesCompanyCode', '')).strip()
+                if is_valid_code(code):
+                    stocks[code + '.TWO'] = str(item.get('CompanyName', '')).strip()
+    except Exception:
+        pass
+
     return stocks
 
 def fetch_tw_stock_name(ticker):
@@ -449,29 +499,22 @@ class LowPositionShrinkVolumeBreakoutStrategy:
         if len(df) < 62: return res
         df = df.copy()
 
-        # 確保擁有 Volume_Lots (一般在呼叫前會轉換，若無則自動補足避免報錯)
         if 'Volume_Lots' not in df.columns:
             df['Volume_Lots'] = df.get('Volume', pd.Series(0, index=df.index)) / 1000.0
 
-        # 1. 60日低位階 (排除當天 T0 與前一天 T-1，從 T-2 往前算 60 天區間)
         min_60 = df['Low'].shift(2).rolling(window=60).min()
         max_60 = df['High'].shift(2).rolling(window=60).max()
         
-        # 判定前一天 (T-1) 是否處於低位階 (T-1 收盤價位於過去60天區間底部 20%以內，或直接破底)
         pos_60 = (df['Close'].shift(1) - min_60) / (max_60 - min_60 + 1e-8)
         cond_low_pos = pos_60 <= 0.20
 
-        # 2. 前一天 (T-1) 必須出量且帶長下引線
         body_1 = abs(df['Close'].shift(1) - df['Open'].shift(1))
         lower_shadow_1 = df[['Open', 'Close']].shift(1).min(axis=1) - df['Low'].shift(1)
         range_1 = (df['High'].shift(1) - df['Low'].shift(1)).replace(0, 1e-8)
 
-        # 條件：下影線大於實體 1.5 倍，且佔全天振幅 40% 以上
         cond_long_shadow = (lower_shadow_1 > body_1 * 1.5) & ((lower_shadow_1 / range_1) >= 0.4)
-        # 條件：T-1 成交量大於 T-2 成交量
         cond_vol_up_1 = df['Volume_Lots'].shift(1) > df['Volume_Lots'].shift(2)
 
-        # 3. 當天 (T0) 收盤高於前一天高點，且量縮
         cond_today_break = df['Close'] > df['High'].shift(1)
         cond_today_vol_shrink = df['Volume_Lots'] < df['Volume_Lots'].shift(1)
 
@@ -504,7 +547,6 @@ class WeeklyAnalysisStrategy:
 class ScanEngine:
     @staticmethod
     def calculate_all_phase1_scores(df, config):
-        """將所有掃描演算法一次計算完畢，避免兩邊程式各自刻重複的 if/else"""
         df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
         df['VCP_Score'] = VCPStrategy.evaluate(df)
         price_col = 'Low' if config.get("reso_price_basis") == "最低價 (Low)" else 'Close'
@@ -525,15 +567,12 @@ class ScanEngine:
         )
         df['Breakout_Signal'] = LongLowerShadowBreakoutStrategy.evaluate(df)
         df['MA240_P1_Pass'] = MA240PullbackRightSideStrategy.evaluate_phase1(df)
-        
-        # 擴充：低位階長下引量縮突破
         df['LowPos_Breakout_Pass'] = LowPositionShrinkVolumeBreakoutStrategy.evaluate(df)
         
         return df
 
     @staticmethod
     def check_algo_pass(row, config, algo_mode, force_pass=False):
-        """根據選擇的演算法判定該列是否入選"""
         is_r = (algo_mode in ['全部', '底部翻轉']) and (row.get('Candle_Score', 0) >= config.get("min_score", 8.0))
         is_v = (algo_mode in ['全部', 'VCP']) and (row.get('VCP_Score', 0) >= config.get("min_vcp_score", 10.0))
         is_reso = (algo_mode in ['全部', '指標共振']) and (row.get('Reso_Score', 0) >= config.get("min_reso_score", 10.0))
@@ -556,7 +595,6 @@ class ScanEngine:
         if item.get("量價雙背離") == "✅ 是": base_tags.append("量價雙背離")
         if item.get("長下引突破") == "✅ 是": base_tags.append("長下引突破")
         if item.get("*回測走揚年線") == "✅ 是": base_tags.append("*回測走揚年線")
-        # 兼容 app.py 直接吃字串，或是核心傳遞 boolean 值
         if item.get("低位長下引量縮突破") == "✅ 是" or item.get("LowPos_Breakout_Pass", False): base_tags.append("低位量縮突破")
         if item.get("反轉分數", 0) >= config.get("min_score", 8.0): base_tags.append("底部翻轉")
         if item.get("VCP分數", 0) >= config.get("min_vcp_score", 10.0): base_tags.append("VCP收斂")
