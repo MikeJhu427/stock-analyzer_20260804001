@@ -315,6 +315,10 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         tickers = [core.resolve_ticker(test_ticker_input, stock_dict)] if scan_target_mode == "指定個股測試" else list(stock_dict.keys())
         config_dict = {k: st.session_state[k] for k in core.DEFAULT_CONFIG.keys() if k in st.session_state}
+        
+        # [修復點] 手動補上 backtest_date_obj，解決 KeyError
+        config_dict["backtest_date_obj"] = st.session_state.backtest_date_obj
+
         div_pairs = [(config_dict["div_recent_w"], config_dict["div_older_w"])] if config_dict["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
 
         dl_kwargs = {"period": "2y"}
@@ -379,10 +383,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
 
                         count_30d = 0
-                        
-                        # -------------------------
-                        # 修復先前被截斷的迴圈區塊
-                        # -------------------------
                         if config_dict["enable_30d_backtest"] and best_row is not None:
                             for b_offset in range(best_offset + 1, best_offset + 31):
                                 if len(df) <= b_offset + 1:
