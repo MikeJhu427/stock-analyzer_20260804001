@@ -28,17 +28,29 @@ def run_full_scan():
         chunk = tickers[i:i+chunk_size]
         try:
             import yfinance as yf
+            # 🚀 同步下載「日線」與「60分K線 (1個月)」資料，時間成本完全攤平
             data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=yf_session)
+            data_60m = yf.download(chunk, period="1mo", interval="60m", threads=False, progress=False, session=yf_session)
+            
             for ticker in chunk:
                 try:
+                    # 整理日線資料
                     if isinstance(data.columns, pd.MultiIndex):
                         if ticker in data.columns.get_level_values(0): df = data.xs(ticker, axis=1, level=0).dropna(how='all')
                         elif ticker in data.columns.get_level_values(1): df = data.xs(ticker, axis=1, level=1).dropna(how='all')
                         else: df = pd.DataFrame()
                     else: df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
 
+                    # 整理 60 分 K 資料
+                    if isinstance(data_60m.columns, pd.MultiIndex):
+                        if ticker in data_60m.columns.get_level_values(0): df_60m = data_60m.xs(ticker, axis=1, level=0).dropna(how='all')
+                        elif ticker in data_60m.columns.get_level_values(1): df_60m = data_60m.xs(ticker, axis=1, level=1).dropna(how='all')
+                        else: df_60m = pd.DataFrame()
+                    else: df_60m = data_60m.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
+
                     if df.empty or len(df) <= CONFIG["lookback_start"] + 20: continue
 
+                    # === 日線運算 ===
                     df = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df))
                     df = core.TechnicalIndicators.add_rsi(df)
                     expert_res_df = core.ExpertTradingStrategy.evaluate(df)
@@ -50,9 +62,7 @@ def run_full_scan():
                     df['MA60'] = df['Close'].rolling(60).mean()
                     df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
 
-                    # 一鍵完成所有核心策略的 Phase 1 計算 (包含最新加入的雙底正背離與右肩回測)
                     df = core.ScanEngine.calculate_all_phase1_scores(df, CONFIG)
-
                     best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
 
                     for offset in range(CONFIG["lookback_end"], CONFIG["lookback_start"] + 1):
@@ -66,24 +76,50 @@ def run_full_scan():
                             if is_pass and (combo_score > best_combined_score or best_row is None):
                                 best_combined_score, best_row, best_offset, best_vol_mult = combo_score, t_row, offset, vol_mult
 
-                    count_30d = 0
-                    if CONFIG["enable_30d_backtest"] and best_row is not None:
-                        for b_offset in range(best_offset + 1, best_offset + 31):
-                            if len(df) <= b_offset + 1: continue
-                            c_row = df.iloc[-1 - b_offset]
-                            if pd.isna(c_row.get('Vol_MA20')): continue
-                            if c_row['Vol_MA20'] >= CONFIG["min_vol_ma20"]:
-                                c_pass, _ = core.ScanEngine.check_algo_pass(c_row, CONFIG, CONFIG['algo_mode'])
-                                if c_pass: count_30d += 1
+                    # === 60 分 K 線獨立運算 ===
+                    pass_60m_adv = False
+                    adv_60m_data = None
+                    if not df_60m.empty and len(df_60m) >= 60:
+                        df_60m = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df_60m))
+                        df_60m['Volume_Lots'] = df_60m.get('Volume', pd.Series(0)) / 1000.0
+                        df_60m['MA20'] = df_60m['Close'].rolling(20).mean()
+                        df_60m['BB_Lower'] = df_60m['MA20'] - 2 * df_60m['Close'].rolling(20).std()
+                        
+                        adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
+                        if not adv_res_60m.empty:
+                            last_60m = adv_res_60m.iloc[-1]
+                            # 若最新一根 60 分 K 滿足底倉突破或回測加碼，強迫過關！
+                            if last_60m.get('Adv_Signal_A', False) or last_60m.get('Adv_Signal_B', False):
+                                pass_60m_adv = True
+                                adv_60m_data = last_60m
 
-                    if best_row is not None:
+                    # === 判定整合 (日線過關 OR 60分K過關 都收錄) ===
+                    if (best_row is not None and best_combined_score >= 0) or pass_60m_adv:
+                        # 若只有 60 分 K 過關但日線沒過，基底顯示改用日線最後一根數據
+                        if best_row is None:
+                            best_row = df.iloc[-1]
+                            best_offset = 0
+                            prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
+                            best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
+
+                        count_30d = 0
+                        if CONFIG["enable_30d_backtest"]:
+                            for b_offset in range(best_offset + 1, min(len(df)-1, best_offset + 31)):
+                                c_row = df.iloc[-1 - b_offset]
+                                if pd.isna(c_row.get('Vol_MA20')): continue
+                                if c_row['Vol_MA20'] >= CONFIG["min_vol_ma20"]:
+                                    c_pass, _ = core.ScanEngine.check_algo_pass(c_row, CONFIG, CONFIG['algo_mode'])
+                                    if c_pass: count_30d += 1
+
                         last_expert = expert_res_df.iloc[-1 - best_offset]
-                        rec_status = "-"
-                        if CONFIG["use_cross_position_filter"]:
-                            rec_status = "✅ 建議參考" if float(best_row['K']) < CONFIG["cross_position_threshold"] else "⚠️ 位置偏高"
+                        rec_status = "✅ 建議參考" if float(best_row['K']) < CONFIG["cross_position_threshold"] else "⚠️ 位置偏高"
+                        
+                        # 決定進階價位輸出來源：以觸發的層級為準 (60分K優先顯示)
+                        adv_src = adv_60m_data if pass_60m_adv else best_row
 
                         reversal_candidates[ticker] = {
                             "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
+                            "_Pass_60m_Adv": pass_60m_adv, "_Adv_60m_Data": adv_60m_data,
                             "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
                             "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                             "近30日觸發次數": count_30d if CONFIG["enable_30d_backtest"] else "-",
@@ -100,13 +136,12 @@ def run_full_scan():
                             "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否",
                             "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
                             "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
-                            # 🚀 新增的高階雙底/右肩回測訊號與關鍵價位
-                            "左腳(Low1)": round(float(best_row['Adv_Low_1']), 2) if pd.notna(best_row.get('Adv_Low_1')) else "-",
-                            "破底(Low2/停損)": round(float(best_row['Adv_Low_2']), 2) if pd.notna(best_row.get('Adv_Low_2')) else "-",
-                            "上影線頸線": round(float(best_row['Adv_Neckline_1']), 2) if pd.notna(best_row.get('Adv_Neckline_1')) else "-",
-                            "右肩回測價": round(float(best_row['Adv_Support_RS']), 2) if pd.notna(best_row.get('Adv_Support_RS')) else "-",
-                            "預估1段目標": round(float(best_row['Adv_Target_1x']), 2) if pd.notna(best_row.get('Adv_Target_1x')) else "-",
-                            "預估3段目標": round(float(best_row['Adv_Target_3x']), 2) if pd.notna(best_row.get('Adv_Target_3x')) else "-",
+                            "左腳(Low1)": round(float(adv_src['Adv_Low_1']), 2) if pd.notna(adv_src.get('Adv_Low_1')) else "-",
+                            "破底(Low2/停損)": round(float(adv_src['Adv_Low_2']), 2) if pd.notna(adv_src.get('Adv_Low_2')) else "-",
+                            "上影線頸線": round(float(adv_src['Adv_Neckline_1']), 2) if pd.notna(adv_src.get('Adv_Neckline_1')) else "-",
+                            "右肩回測價": round(float(adv_src['Adv_Support_RS']), 2) if pd.notna(adv_src.get('Adv_Support_RS')) else "-",
+                            "預估1段目標": round(float(adv_src['Adv_Target_1x']), 2) if pd.notna(adv_src.get('Adv_Target_1x')) else "-",
+                            "預估3段目標": round(float(adv_src['Adv_Target_3x']), 2) if pd.notna(adv_src.get('Adv_Target_3x')) else "-",
                             "進場位置建議": rec_status,
                             "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
                             "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
@@ -129,6 +164,7 @@ def run_full_scan():
     for item in reversal_list:
         try:
             ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
+            pass_60m_adv, adv_60m_data = item.pop("_Pass_60m_Adv"), item.pop("_Adv_60m_Data")
             has_daily_div, has_m60_div = False, False
             item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
 
@@ -174,39 +210,19 @@ def run_full_scan():
                     item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
                     if res_tags: has_daily_div = True
 
-            try:
-                time.sleep(0.5)
-                m60_df = yf.Ticker(ticker, session=yf_session).history(interval="60m", period="730d")
-                if specific_offset > 0 and not daily_df.empty:
-                    target_date = daily_df.index[-1].date()
-                    m60_df = m60_df[[d.date() <= target_date for d in m60_df.index]]
-                if not m60_df.empty:
-                    m60_df = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(m60_df))
-                    for r_w, o_w in div_pairs:
-                        d_kd, d_macd = False, False
-                        for b in range(0, 20):
-                            if len(m60_df) <= b + r_w + o_w: break
-                            temp_df = m60_df.iloc[:len(m60_df)-b] if b > 0 else m60_df
-                            if not d_kd: d_kd = core.DivergenceStrategy.check_bottom_divergence(temp_df, 'Low', 'K', 'K', 'D', r_w, o_w, CONFIG["recent_lows_cnt"], CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"], CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"])
-                            if not d_macd: d_macd = core.DivergenceStrategy.check_bottom_divergence(temp_df, 'Low', 'MACD_Hist', 'MACD', 'MACD_Signal', r_w, o_w, CONFIG["recent_lows_cnt"], CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"], CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"])
-                            if d_kd and d_macd: break
-                        res_tags = [x for x, b in zip(["KD", "MACD"], [d_kd, d_macd]) if b]
-                        item[f"60分K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
-                        if res_tags: has_m60_div = True
-                else:
-                    for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
-            except Exception:
-                for r_w, o_w in div_pairs: item[f"60分K背離({r_w},{o_w})"] = "無資料"
-
             base_tags = core.ScanEngine.generate_base_tags(item, CONFIG)
-            div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
+            div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
+            
+            # 🚀 加入明顯的 60 分 K 觸發提示標籤
+            if pass_60m_adv:
+                sig_name = "【🔥 60分K底倉突破】" if adv_60m_data.get('Adv_Signal_A') else "【🔥 60分K右肩回測】"
+                base_tags.insert(0, sig_name)
+
             item["演算法建議結果"] = " & ".join(base_tags) + div_tag if base_tags else "觀察標的" + div_tag
             final_results.append(item)
         except Exception: continue
 
     res_df = pd.DataFrame(final_results)
-    
-    # 🚀 將新的價位與策略欄位加入報表輸出 Base_cols 中
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
     base_cols.extend([
@@ -227,7 +243,7 @@ def run_full_scan():
     res_df.index = res_df.index + 1
 
     print("📊 掃描完成！最終報表標的預覽：")
-    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '破底(Low2/停損)', '上影線頸線', '右肩回測價']].to_string())
+    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '破底(Low2/停損)', '上影線頸線']].to_string())
 
     webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
     token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
