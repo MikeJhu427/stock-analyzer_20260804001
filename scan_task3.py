@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import strategy_core as core
 
-# 使用 Core 預設參數 (可在此腳本環境覆寫)
 CONFIG = core.DEFAULT_CONFIG.copy()
 
 def run_full_scan():
@@ -28,15 +27,11 @@ def run_full_scan():
         chunk = tickers[i:i+chunk_size]
         try:
             import yfinance as yf
-            # 同步下載「日線」與「60分K線 (1個月)」資料，時間成本完全攤平
             data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=yf_session)
-            
-            # 預設排程全市場掃描開啟 60分K 雙底輔助
             data_60m = yf.download(chunk, period="1mo", interval="60m", threads=False, progress=False, session=yf_session)
             
             for ticker in chunk:
                 try:
-                    # === 整理日線資料 ===
                     if isinstance(data.columns, pd.MultiIndex):
                         if ticker in data.columns.get_level_values(0): df = data.xs(ticker, axis=1, level=0).dropna(how='all')
                         elif ticker in data.columns.get_level_values(1): df = data.xs(ticker, axis=1, level=1).dropna(how='all')
@@ -70,7 +65,6 @@ def run_full_scan():
                             if is_pass and (combo_score > best_combined_score or best_row is None):
                                 best_combined_score, best_row, best_offset, best_vol_mult = combo_score, t_row, offset, vol_mult
 
-                    # === 整理 60 分 K 輔助運算 ===
                     pass_60m_adv = False
                     adv_60m_data = None
                     if data_60m is not None:
@@ -88,10 +82,7 @@ def run_full_scan():
                             
                             adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
                             if not adv_res_60m.empty:
-                                # 取得日線判定基準日 (若日線沒過，取最後一日)
                                 target_eval_date = df.index[-1 - best_offset].date() if (best_row is not None and best_offset >= 0) else df.index[-1].date()
-                                
-                                # 鎖定回測當日，盤中任一小時有觸發就算過關
                                 adv_res_60m_target_day = adv_res_60m[adv_res_60m.index.tz_localize(None).date == target_eval_date]
                                 if not adv_res_60m_target_day.empty:
                                     triggered_rows = adv_res_60m_target_day[(adv_res_60m_target_day['Adv_Signal_A'] == True) | (adv_res_60m_target_day['Adv_Signal_B'] == True)]
@@ -99,9 +90,7 @@ def run_full_scan():
                                         pass_60m_adv = True
                                         adv_60m_data = triggered_rows.iloc[-1]
 
-                    # === 判定整合與紀錄 ===
                     if (best_row is not None and best_combined_score >= 0) or pass_60m_adv:
-                        # 針對只中 60分K 但日線沒中的情況做底層保護
                         if best_row is None:
                             best_row = df.iloc[-1]
                             best_offset = 0
@@ -171,6 +160,8 @@ def run_full_scan():
             pass_60m_adv, adv_60m_data = item.pop("_Pass_60m_Adv"), item.pop("_Adv_60m_Data")
             has_daily_div, has_m60_div = False, False
             item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
+            item['均線最大最小差異百分比(%)'] = "-"
+            item['均線糾結狀態'] = "-"
 
             try:
                 if isinstance(long_data.columns, pd.MultiIndex):
@@ -181,6 +172,11 @@ def run_full_scan():
 
                 if not long_df.empty:
                     if specific_offset > 0: long_df = long_df.iloc[:-specific_offset]
+
+                    if len(long_df) >= 240:
+                        ent_res = core.MA240PullbackRightSideStrategy.evaluate_ma_entanglement(long_df)
+                        item['均線最大最小差異百分比(%)'] = ent_res['ma_diff_pct']
+                        item['均線糾結狀態'] = ent_res['ma_tangled']
 
                     if len(long_df) >= 120:
                         ma120 = long_df['Close'].rolling(120).mean()
@@ -230,7 +226,7 @@ def run_full_scan():
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
     base_cols.extend([
-        '演算法建議結果', '*回測走揚年線', '*年線回測分數', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '*回測走揚年線', '*年線回測分數', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
         '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
         '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
     ])
@@ -243,11 +239,11 @@ def run_full_scan():
     if CONFIG["show_ma120_slope"]: base_cols.append('半年線斜率(%)')
 
     cols = base_cols + [c for c in res_df.columns if '背離' in c and c not in base_cols]
-    res_df = res_df[cols].sort_values(by=["*年線回測分數", "共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False, False]).reset_index(drop=True)
+    res_df = res_df[[c for c in cols if c in res_df.columns]].sort_values(by=["*年線回測分數", "共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False, False]).reset_index(drop=True)
     res_df.index = res_df.index + 1
 
     print("📊 掃描完成！最終報表標的預覽：")
-    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '破底(Low2/停損)', '上影線頸線']].to_string())
+    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態']].to_string())
 
     webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
     token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
