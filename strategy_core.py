@@ -62,7 +62,8 @@ DEFAULT_CONFIG = {
     "backtest_date": str(datetime.date.today())
 }
 
-SCAN_ALGO_CHOICES = ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破', '*回測走揚年線', '低位長下引量縮突破']
+# 🚀 這裡新增了「雙底正背離與右肩回測」選項
+SCAN_ALGO_CHOICES = ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破', '*回測走揚年線', '低位長下引量縮突破', '雙底正背離與右肩回測']
 
 # ==========================================
 # 網路與工具模組
@@ -733,6 +734,107 @@ class WeeklyAnalysisStrategy:
         except Exception:
             return {"週K共振": "錯誤", "週K背離": "錯誤"}
 
+# 🚀 這裡新增了全新的【雙底正背離與右肩回測 (AdvancedBottomStrategy)】模組
+class AdvancedBottomStrategy:
+    @staticmethod
+    def evaluate(df):
+        # 初始化輸出結構
+        res = pd.DataFrame(index=df.index, columns=[
+            'Adv_Signal_A', 'Adv_Signal_B', 'Adv_Low_1', 'Adv_Low_2',
+            'Adv_Neckline_1', 'Adv_Support_RS', 'Adv_Target_1x', 'Adv_Target_3x'
+        ])
+        for c in ['Adv_Signal_A', 'Adv_Signal_B']: res[c] = False
+        for c in ['Adv_Low_1', 'Adv_Low_2', 'Adv_Neckline_1', 'Adv_Support_RS', 'Adv_Target_1x', 'Adv_Target_3x']: res[c] = np.nan
+
+        if len(df) < 60:
+            return res
+
+        # 預計算與取得相關數值
+        vol_ma5 = df.get('Volume_Lots', df['Volume'] / 1000.0).rolling(5).mean().values
+        ma20 = df.get('MA20', df['Close'].rolling(20).mean())
+        bb_lower = df.get('BB_Lower', ma20 - 2 * df['Close'].rolling(20).std()).values
+
+        lows = df['Low'].values
+        highs = df['High'].values
+        closes = df['Close'].values
+        opens = df['Open'].values
+        k_vals = df.get('K', pd.Series(50, index=df.index)).values
+        d_vals = df.get('D', pd.Series(50, index=df.index)).values
+        macd_h = df.get('MACD_Hist', pd.Series(0, index=df.index)).values
+        macd = df.get('MACD', pd.Series(0, index=df.index)).values
+        vol = df.get('Volume_Lots', df['Volume'] / 1000.0).values
+        
+        # 尋找所有波段轉折極值 (預設 Order=5)
+        pivot_lows_idx = argrelextrema(lows, np.less, order=5)[0]
+        pivot_highs_idx = argrelextrema(highs, np.greater, order=5)[0]
+
+        # 透過時間迴圈計算確保不引用未來數據
+        for i in range(20, len(df)):
+            # 取得當前 K 棒(i)之前的有效低點極值
+            valid_lows = [idx for idx in pivot_lows_idx if idx < i - 1]
+            if len(valid_lows) < 2: continue
+
+            idx_L1, idx_L2 = valid_lows[-2], valid_lows[-1]
+            
+            # 條件 1：破底確認 (Low_2 < Low_1)
+            if lows[idx_L2] >= lows[idx_L1]: continue
+
+            # 條件 2：正背離驗證 (KD 與 MACD)
+            kd_div = (k_vals[idx_L2] > k_vals[idx_L1]) or (d_vals[idx_L2] > d_vals[idx_L1])
+            macd_div = (macd_h[idx_L2] > macd_h[idx_L1]) or (macd[idx_L2] > macd[idx_L1])
+            if not (kd_div and macd_div): continue
+
+            # 尋找 Neckline_1：Low_1 前方緊鄰的反彈波段上影線高點
+            valid_highs_before_L1 = [idx for idx in pivot_highs_idx if idx < idx_L1]
+            if valid_highs_before_L1:
+                neckline_1 = highs[valid_highs_before_L1[-1]]
+            else:
+                neckline_1 = np.max(highs[max(0, idx_L1-10):idx_L1+1])
+
+            # 尋找 Support_RightShoulder：破底長黑前的起跌實體底 (擷取 L1 到 L2 之間單日跌幅最大的前一天)
+            if idx_L2 > idx_L1 + 1:
+                diffs = np.diff(closes[idx_L1:idx_L2+1])
+                if len(diffs) > 0:
+                    drop_idx = idx_L1 + np.argmin(diffs)
+                    sup_rs = min(closes[drop_idx], opens[drop_idx])
+                else:
+                    sup_rs = min(closes[idx_L1], opens[idx_L1])
+            else:
+                sup_rs = min(closes[idx_L1], opens[idx_L1])
+
+            # 計算 Low_2 以來的止跌紅K數量
+            red_candles_since_L2 = sum(1 for j in range(idx_L2, i+1) if closes[j] > opens[j])
+
+            # 訊號 A (底倉突破)：收盤大於上影線頸線 + 帶量 + K值>=20 + 第二根紅K
+            sig_A = (closes[i] > neckline_1) and (vol[i] > vol_ma5[i]) and \
+                    (k_vals[i] >= 20) and (closes[i] > opens[i]) and \
+                    (red_candles_since_L2 >= 2)
+
+            # 訊號 B (右肩回測加碼)：先前出現過 Signal A，且回測到 Support 區間或布林下軌量縮不破底
+            sig_A_history = any((closes[j] > neckline_1 and vol[j] > vol_ma5[j] and closes[j] > opens[j] and k_vals[j] >= 20) for j in range(idx_L2, i))
+            
+            sig_B = False
+            if sig_A_history:
+                in_zone = (lows[i] <= sup_rs) and (lows[i] >= lows[idx_L1] * 0.95)
+                near_bb = (lows[i] <= bb_lower[i] * 1.02)
+                if (in_zone or near_bb) and (closes[i] >= lows[idx_L2]) and (vol[i] < vol_ma5[i]):
+                    sig_B = True
+
+            # 若觸發任一訊號，寫入點位與目標價
+            if sig_A or sig_B:
+                res.iloc[i, res.columns.get_loc('Adv_Signal_A')] = sig_A
+                res.iloc[i, res.columns.get_loc('Adv_Signal_B')] = sig_B
+                res.iloc[i, res.columns.get_loc('Adv_Low_1')] = lows[idx_L1]
+                res.iloc[i, res.columns.get_loc('Adv_Low_2')] = lows[idx_L2]
+                res.iloc[i, res.columns.get_loc('Adv_Neckline_1')] = neckline_1
+                res.iloc[i, res.columns.get_loc('Adv_Support_RS')] = sup_rs
+
+                neckline_2 = np.max(highs[idx_L2:i+1])
+                res.iloc[i, res.columns.get_loc('Adv_Target_1x')] = neckline_2 + (neckline_2 - lows[idx_L2])
+                res.iloc[i, res.columns.get_loc('Adv_Target_3x')] = neckline_2 + (neckline_2 - lows[idx_L2]) * 3
+
+        return res
+
 # ==========================================
 # 高階統合引擎 (ScanEngine)
 # ==========================================
@@ -764,6 +866,11 @@ class ScanEngine:
         df['MA240_P1_Pass'] = MA240PullbackRightSideStrategy.evaluate_phase1(df)
         df['LowPos_Breakout_Pass'] = LowPositionShrinkVolumeBreakoutStrategy.evaluate(df)
         
+        # 🚀 在 Phase 1 併入新的 AdvancedBottomStrategy 演算法模組
+        adv_res = AdvancedBottomStrategy.evaluate(df)
+        for col in adv_res.columns:
+            df[col] = adv_res[col]
+            
         return df
 
     @staticmethod
@@ -776,7 +883,10 @@ class ScanEngine:
         is_ma240 = (algo_mode in ['全部', '*回測走揚年線']) and row.get('MA240_P1_Pass', False)
         is_lowpos_brk = (algo_mode in ['全部', '低位長下引量縮突破']) and row.get('LowPos_Breakout_Pass', False)
         
-        passed = is_r or is_v or is_reso or is_pv or is_brk or is_ma240 or is_lowpos_brk or force_pass
+        # 🚀 這裡新增抓取雙底背離突破(Signal A)與回測加碼(Signal B)的命中判定
+        is_adv = (algo_mode in ['全部', '雙底正背離與右肩回測']) and (row.get('Adv_Signal_A', False) or row.get('Adv_Signal_B', False))
+        
+        passed = is_r or is_v or is_reso or is_pv or is_brk or is_ma240 or is_lowpos_brk or is_adv or force_pass
         
         combo_score = 0
         combo_score += row.get('Candle_Score', 0)
@@ -786,12 +896,21 @@ class ScanEngine:
         combo_score += 10 if row.get('Breakout_Signal', False) else 0
         combo_score += 12 if row.get('MA240_P1_Pass', False) else 0
         combo_score += 15 if row.get('LowPos_Breakout_Pass', False) else 0
+        # 🚀 給予進階背離策略極高的 combo 加權分，讓這類標的排在較上面
+        combo_score += 25 if row.get('Adv_Signal_A', False) else 0
+        combo_score += 30 if row.get('Adv_Signal_B', False) else 0
         
         return passed, combo_score
 
     @staticmethod
     def generate_base_tags(item, config):
         base_tags = []
+        # 🚀 加入新的標籤顯示
+        if item.get("Adv_Signal_A") == "✅ 是":
+            base_tags.append("雙底突破(底倉)")
+        if item.get("Adv_Signal_B") == "✅ 是":
+            base_tags.append("右肩回測(加碼)")
+            
         if item.get("量價雙背離") == "✅ 是":
             base_tags.append("量價雙背離")
         if item.get("長下引突破") == "✅ 是":
