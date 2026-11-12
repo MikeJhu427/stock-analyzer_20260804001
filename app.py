@@ -810,7 +810,7 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
     with col_q2: intraday_p = st.number_input("盤中即時價模擬 (0為不啟用)", min_value=0.0, value=0.0, step=0.1)
     with col_q3:
         st.write(""); st.write("")
-        q_btn = st.button("啟動量化狀態機", type="primary", use_container_width=True)
+        q_btn = st.button("啟量化狀態機", type="primary", use_container_width=True)
 
     if q_btn and q_input:
         with st.spinner(f"⏳ 正在載入 [{q_input}] 資料並通過量化引擎審查..."):
