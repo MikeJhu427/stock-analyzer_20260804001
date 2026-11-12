@@ -62,6 +62,7 @@ st.set_page_config(page_title="台股 K線型態與位階深度解析系統", la
 if "audit_mode" not in st.session_state: st.session_state.audit_mode = "單檔查詢"
 if "batch_input_area" not in st.session_state: st.session_state.batch_input_area = "2330, 2454, 3231, 6147, 1909"
 if "run_batch_audit" not in st.session_state: st.session_state.run_batch_audit = False
+if "enable_60m_adv_scan" not in st.session_state: st.session_state.enable_60m_adv_scan = False
 if "config" not in st.session_state: st.session_state.config = load_config()
 if "current_profile" not in st.session_state: st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
 
@@ -188,7 +189,6 @@ if selected_page == "📊 單檔深度解析":
                     st.warning(f"**三指標共振持股建議：**\n\n{core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數'])} (同步偏多數: {last_expert['多空指標數']})")
                 st.markdown("---")
                 
-                # 🚀 顯示進階雙底與右肩狀態
                 if 'Adv_Signal_A' in last_row and (last_row['Adv_Signal_A'] or last_row['Adv_Signal_B']):
                     st.success(f"🚨 **量化雙底正背離模組觸發**\n\n"
                                f"- 觸發狀態：{'✅ 底倉突破 (Signal A)' if last_row['Adv_Signal_A'] else '✅ 右肩回測加碼 (Signal B)'}\n"
@@ -282,11 +282,13 @@ elif selected_page == "🚀 全市場智慧掃描":
         with col_m3: algo_mode = st.radio("請選擇欲執行的掃描演算法", core.SCAN_ALGO_CHOICES, horizontal=True)
 
         st.markdown("**2. 基礎掃描參數、時光機回測與雲端備份設定**")
-        col_b1, col_b2, col_b3, col_b4 = st.columns([1, 1.2, 1, 1.2])
+        col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns([1, 1.2, 1, 1.2, 1.4])
         with col_b1: st.checkbox("啟用指定日期回測", key="use_backtest_date")
         with col_b2: st.date_input("選擇回測基準日", key="backtest_date_obj", disabled=not st.session_state.use_backtest_date)
         with col_b3: st.checkbox("近 30日觸發統計", key="enable_30d_backtest")
         with col_b4: st.checkbox("自動上傳 Google Drive", key="auto_upload_gdrive")
+        # 🚀 加入 60 分 K 輔助掃描 UI 參數選項 (預設為不勾選)
+        with col_b5: st.checkbox("啟用 60分K 雙底/右肩掃描 (耗時較長)", key="enable_60m_adv_scan")
 
         col_a, col_b, col_c, col_d, col_e = st.columns(5)
         with col_a:
@@ -325,6 +327,8 @@ elif selected_page == "🚀 全市場智慧掃描":
         tickers = [core.resolve_ticker(test_ticker_input, stock_dict)] if scan_target_mode == "指定個股測試" else list(stock_dict.keys())
         config_dict = {k: st.session_state[k] for k in core.DEFAULT_CONFIG.keys() if k in st.session_state}
         config_dict["backtest_date_obj"] = st.session_state.backtest_date_obj
+        # 取出開關狀態
+        config_dict["enable_60m_adv_scan"] = st.session_state.enable_60m_adv_scan
 
         div_pairs = [(config_dict["div_recent_w"], config_dict["div_older_w"])] if config_dict["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
 
@@ -342,8 +346,15 @@ elif selected_page == "🚀 全市場智慧掃描":
             status_text.text(f"正在全市場掃描：進度 {min(i+chunk_size, len(tickers))} / {len(tickers)} 檔...")
             try:
                 data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
+                
+                # 🚀 若開啟參數則同步請求 60 分鐘線
+                data_60m = None
+                if config_dict.get("enable_60m_adv_scan", False):
+                    data_60m = yf.download(chunk, period="1mo", interval="60m", threads=False, progress=False, session=yf_session)
+
                 for ticker in chunk:
                     try:
+                        # === 整理日線資料 ===
                         if isinstance(data.columns, pd.MultiIndex):
                             if ticker in data.columns.get_level_values(0): df = data.xs(ticker, axis=1, level=0).dropna(how='all')
                             elif ticker in data.columns.get_level_values(1): df = data.xs(ticker, axis=1, level=1).dropna(how='all')
@@ -389,24 +400,54 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 if is_pass and (combo > best_combined_score or best_row is None):
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
 
-                        count_30d = 0
-                        if config_dict["enable_30d_backtest"] and best_row is not None:
-                            for b_offset in range(best_offset + 1, best_offset + 31):
-                                if len(df) <= b_offset + 1:
-                                    continue
-                                c_row = df.iloc[-1 - b_offset]
-                                if c_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"] or force_pass:
-                                    c_pass, _ = core.ScanEngine.check_algo_pass(c_row, config_dict, algo_mode, force_pass)
-                                    if c_pass:
-                                        count_30d += 1
+                        # === 整理 60 分 K 輔助運算 ===
+                        pass_60m_adv = False
+                        adv_60m_data = None
+                        if config_dict.get("enable_60m_adv_scan", False) and data_60m is not None:
+                            if isinstance(data_60m.columns, pd.MultiIndex):
+                                if ticker in data_60m.columns.get_level_values(0): df_60m = data_60m.xs(ticker, axis=1, level=0).dropna(how='all')
+                                elif ticker in data_60m.columns.get_level_values(1): df_60m = data_60m.xs(ticker, axis=1, level=1).dropna(how='all')
+                                else: df_60m = pd.DataFrame()
+                            else: df_60m = data_60m.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
 
-                        if best_row is not None:
+                            if not df_60m.empty and len(df_60m) >= 60:
+                                df_60m = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df_60m))
+                                df_60m['Volume_Lots'] = df_60m.get('Volume', pd.Series(0)) / 1000.0
+                                df_60m['MA20'] = df_60m['Close'].rolling(20).mean()
+                                df_60m['BB_Lower'] = df_60m['MA20'] - 2 * df_60m['Close'].rolling(20).std()
+                                
+                                adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
+                                if not adv_res_60m.empty:
+                                    last_60m = adv_res_60m.iloc[-1]
+                                    if last_60m.get('Adv_Signal_A', False) or last_60m.get('Adv_Signal_B', False):
+                                        pass_60m_adv = True
+                                        adv_60m_data = last_60m
+
+                        # === 判定整合與紀錄 ===
+                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or force_pass:
+                            # 針對只中 60分K 但日線沒中的情況做底層保護
+                            if best_row is None:
+                                best_row = df.iloc[-1]
+                                best_offset = 0
+                                prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
+                                best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
+
+                            count_30d = 0
+                            if config_dict["enable_30d_backtest"]:
+                                for b_offset in range(best_offset + 1, min(len(df)-1, best_offset + 31)):
+                                    c_row = df.iloc[-1 - b_offset]
+                                    if c_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"] or force_pass:
+                                        c_pass, _ = core.ScanEngine.check_algo_pass(c_row, config_dict, algo_mode, force_pass)
+                                        if c_pass:
+                                            count_30d += 1
+
                             last_expert = expert_res_df.iloc[-1 - best_offset]
                             rec_status = "✅ 建議參考" if float(best_row['K']) < config_dict.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
+                            adv_src = adv_60m_data if pass_60m_adv and adv_60m_data is not None else best_row
 
-                            # 🚀 報表輸出新增欄位 (Advanced Bottom Strategy 資料寫入)
                             reversal_candidates[ticker] = {
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
+                                "_Pass_60m_Adv": pass_60m_adv, "_Adv_60m_Data": adv_60m_data,
                                 "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
                                 "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                                 "近30日觸發次數": count_30d if config_dict["enable_30d_backtest"] else "-",
@@ -419,12 +460,12 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否", "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
                                 "低位量縮突破": "✅ 是" if best_row.get('LowPos_Breakout_Pass') else "❌ 否",
                                 "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
-                                "左腳(Low1)": round(float(best_row['Adv_Low_1']), 2) if pd.notna(best_row.get('Adv_Low_1')) else "-",
-                                "破底(Low2/停損)": round(float(best_row['Adv_Low_2']), 2) if pd.notna(best_row.get('Adv_Low_2')) else "-",
-                                "上影線頸線": round(float(best_row['Adv_Neckline_1']), 2) if pd.notna(best_row.get('Adv_Neckline_1')) else "-",
-                                "右肩回測價": round(float(best_row['Adv_Support_RS']), 2) if pd.notna(best_row.get('Adv_Support_RS')) else "-",
-                                "預估1段目標": round(float(best_row['Adv_Target_1x']), 2) if pd.notna(best_row.get('Adv_Target_1x')) else "-",
-                                "預估3段目標": round(float(best_row['Adv_Target_3x']), 2) if pd.notna(best_row.get('Adv_Target_3x')) else "-",
+                                "左腳(Low1)": round(float(adv_src['Adv_Low_1']), 2) if pd.notna(adv_src.get('Adv_Low_1')) else "-",
+                                "破底(Low2/停損)": round(float(adv_src['Adv_Low_2']), 2) if pd.notna(adv_src.get('Adv_Low_2')) else "-",
+                                "上影線頸線": round(float(adv_src['Adv_Neckline_1']), 2) if pd.notna(adv_src.get('Adv_Neckline_1')) else "-",
+                                "右肩回測價": round(float(adv_src['Adv_Support_RS']), 2) if pd.notna(adv_src.get('Adv_Support_RS')) else "-",
+                                "預估1段目標": round(float(adv_src['Adv_Target_1x']), 2) if pd.notna(adv_src.get('Adv_Target_1x')) else "-",
+                                "預估3段目標": round(float(adv_src['Adv_Target_3x']), 2) if pd.notna(adv_src.get('Adv_Target_3x')) else "-",
                                 "進場位置建議": rec_status, "盤整過濾": "✅ 盤整中" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
                                 "多週期KD": core.ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
@@ -441,6 +482,7 @@ elif selected_page == "🚀 全市場智慧掃描":
             for idx, item in enumerate(reversal_list):
                 try:
                     ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
+                    pass_60m_adv, adv_60m_data = item.pop("_Pass_60m_Adv", False), item.pop("_Adv_60m_Data", None)
                     has_daily_div, has_m60_div = False, False
                     item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
 
@@ -486,7 +528,12 @@ elif selected_page == "🚀 全市場智慧掃描":
 
                     base_tags = core.ScanEngine.generate_base_tags(item, config_dict)
                     if not base_tags and scan_target_mode == "指定個股測試": base_tags.append("未達標(測試)")
-                    div_tag = " + 雙級別共振" if (has_daily_div and has_m60_div) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if has_m60_div else " (無背離)"))
+                    div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
+                    
+                    if pass_60m_adv and adv_60m_data is not None:
+                        sig_name = "【🔥 60分K底倉突破】" if adv_60m_data.get('Adv_Signal_A') else "【🔥 60分K右肩回測】"
+                        base_tags.insert(0, sig_name)
+
                     item["演算法建議結果"] = " & ".join(base_tags) + div_tag
                     final_results.append(item)
                 except Exception: pass
@@ -495,7 +542,6 @@ elif selected_page == "🚀 全市場智慧掃描":
         status_text.empty(); progress_bar.empty()
         res_df = pd.DataFrame(final_results)
 
-        # 🚀 同步將新欄位加入 UI 顯示
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
         base_cols.extend([
