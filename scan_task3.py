@@ -28,29 +28,23 @@ def run_full_scan():
         chunk = tickers[i:i+chunk_size]
         try:
             import yfinance as yf
-            # 🚀 同步下載「日線」與「60分K線 (1個月)」資料，時間成本完全攤平
+            # 同步下載「日線」與「60分K線 (1個月)」資料，時間成本完全攤平
             data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=yf_session)
+            
+            # 預設排程全市場掃描開啟 60分K 雙底輔助
             data_60m = yf.download(chunk, period="1mo", interval="60m", threads=False, progress=False, session=yf_session)
             
             for ticker in chunk:
                 try:
-                    # 整理日線資料
+                    # === 整理日線資料 ===
                     if isinstance(data.columns, pd.MultiIndex):
                         if ticker in data.columns.get_level_values(0): df = data.xs(ticker, axis=1, level=0).dropna(how='all')
                         elif ticker in data.columns.get_level_values(1): df = data.xs(ticker, axis=1, level=1).dropna(how='all')
                         else: df = pd.DataFrame()
                     else: df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
 
-                    # 整理 60 分 K 資料
-                    if isinstance(data_60m.columns, pd.MultiIndex):
-                        if ticker in data_60m.columns.get_level_values(0): df_60m = data_60m.xs(ticker, axis=1, level=0).dropna(how='all')
-                        elif ticker in data_60m.columns.get_level_values(1): df_60m = data_60m.xs(ticker, axis=1, level=1).dropna(how='all')
-                        else: df_60m = pd.DataFrame()
-                    else: df_60m = data_60m.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
-
                     if df.empty or len(df) <= CONFIG["lookback_start"] + 20: continue
 
-                    # === 日線運算 ===
                     df = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df))
                     df = core.TechnicalIndicators.add_rsi(df)
                     expert_res_df = core.ExpertTradingStrategy.evaluate(df)
@@ -76,26 +70,38 @@ def run_full_scan():
                             if is_pass and (combo_score > best_combined_score or best_row is None):
                                 best_combined_score, best_row, best_offset, best_vol_mult = combo_score, t_row, offset, vol_mult
 
-                    # === 60 分 K 線獨立運算 ===
+                    # === 整理 60 分 K 輔助運算 ===
                     pass_60m_adv = False
                     adv_60m_data = None
-                    if not df_60m.empty and len(df_60m) >= 60:
-                        df_60m = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df_60m))
-                        df_60m['Volume_Lots'] = df_60m.get('Volume', pd.Series(0)) / 1000.0
-                        df_60m['MA20'] = df_60m['Close'].rolling(20).mean()
-                        df_60m['BB_Lower'] = df_60m['MA20'] - 2 * df_60m['Close'].rolling(20).std()
-                        
-                        adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
-                        if not adv_res_60m.empty:
-                            last_60m = adv_res_60m.iloc[-1]
-                            # 若最新一根 60 分 K 滿足底倉突破或回測加碼，強迫過關！
-                            if last_60m.get('Adv_Signal_A', False) or last_60m.get('Adv_Signal_B', False):
-                                pass_60m_adv = True
-                                adv_60m_data = last_60m
+                    if data_60m is not None:
+                        if isinstance(data_60m.columns, pd.MultiIndex):
+                            if ticker in data_60m.columns.get_level_values(0): df_60m = data_60m.xs(ticker, axis=1, level=0).dropna(how='all')
+                            elif ticker in data_60m.columns.get_level_values(1): df_60m = data_60m.xs(ticker, axis=1, level=1).dropna(how='all')
+                            else: df_60m = pd.DataFrame()
+                        else: df_60m = data_60m.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
 
-                    # === 判定整合 (日線過關 OR 60分K過關 都收錄) ===
+                        if not df_60m.empty and len(df_60m) >= 60:
+                            df_60m = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df_60m))
+                            df_60m['Volume_Lots'] = df_60m.get('Volume', pd.Series(0)) / 1000.0
+                            df_60m['MA20'] = df_60m['Close'].rolling(20).mean()
+                            df_60m['BB_Lower'] = df_60m['MA20'] - 2 * df_60m['Close'].rolling(20).std()
+                            
+                            adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
+                            if not adv_res_60m.empty:
+                                # 取得日線判定基準日 (若日線沒過，取最後一日)
+                                target_eval_date = df.index[-1 - best_offset].date() if (best_row is not None and best_offset >= 0) else df.index[-1].date()
+                                
+                                # 鎖定回測當日，盤中任一小時有觸發就算過關
+                                adv_res_60m_target_day = adv_res_60m[adv_res_60m.index.tz_localize(None).date == target_eval_date]
+                                if not adv_res_60m_target_day.empty:
+                                    triggered_rows = adv_res_60m_target_day[(adv_res_60m_target_day['Adv_Signal_A'] == True) | (adv_res_60m_target_day['Adv_Signal_B'] == True)]
+                                    if not triggered_rows.empty:
+                                        pass_60m_adv = True
+                                        adv_60m_data = triggered_rows.iloc[-1]
+
+                    # === 判定整合與紀錄 ===
                     if (best_row is not None and best_combined_score >= 0) or pass_60m_adv:
-                        # 若只有 60 分 K 過關但日線沒過，基底顯示改用日線最後一根數據
+                        # 針對只中 60分K 但日線沒中的情況做底層保護
                         if best_row is None:
                             best_row = df.iloc[-1]
                             best_offset = 0
@@ -112,10 +118,8 @@ def run_full_scan():
                                     if c_pass: count_30d += 1
 
                         last_expert = expert_res_df.iloc[-1 - best_offset]
-                        rec_status = "✅ 建議參考" if float(best_row['K']) < CONFIG["cross_position_threshold"] else "⚠️ 位置偏高"
-                        
-                        # 決定進階價位輸出來源：以觸發的層級為準 (60分K優先顯示)
-                        adv_src = adv_60m_data if pass_60m_adv else best_row
+                        rec_status = "✅ 建議參考" if float(best_row['K']) < CONFIG.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
+                        adv_src = adv_60m_data if pass_60m_adv and adv_60m_data is not None else best_row
 
                         reversal_candidates[ticker] = {
                             "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
@@ -213,8 +217,7 @@ def run_full_scan():
             base_tags = core.ScanEngine.generate_base_tags(item, CONFIG)
             div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
             
-            # 🚀 加入明顯的 60 分 K 觸發提示標籤
-            if pass_60m_adv:
+            if pass_60m_adv and adv_60m_data is not None:
                 sig_name = "【🔥 60分K底倉突破】" if adv_60m_data.get('Adv_Signal_A') else "【🔥 60分K右肩回測】"
                 base_tags.insert(0, sig_name)
 
@@ -223,6 +226,7 @@ def run_full_scan():
         except Exception: continue
 
     res_df = pd.DataFrame(final_results)
+    
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
     base_cols.extend([
