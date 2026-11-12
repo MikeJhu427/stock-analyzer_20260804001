@@ -43,7 +43,7 @@ def save_config(config):
     except Exception: pass
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_all_tw_stocks(cache_version="v4"):
+def get_all_tw_stocks(cache_version="v5"):
     stocks = core.fetch_all_tw_stocks()
     if not stocks:
         get_all_tw_stocks.clear()
@@ -187,6 +187,15 @@ if selected_page == "📊 單檔深度解析":
                 with col_e3:
                     st.warning(f"**三指標共振持股建議：**\n\n{core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數'])} (同步偏多數: {last_expert['多空指標數']})")
                 st.markdown("---")
+                
+                # 🚀 顯示進階雙底與右肩狀態
+                if 'Adv_Signal_A' in last_row and (last_row['Adv_Signal_A'] or last_row['Adv_Signal_B']):
+                    st.success(f"🚨 **量化雙底正背離模組觸發**\n\n"
+                               f"- 觸發狀態：{'✅ 底倉突破 (Signal A)' if last_row['Adv_Signal_A'] else '✅ 右肩回測加碼 (Signal B)'}\n"
+                               f"- 左腳低點：{last_row['Adv_Low_1']:.2f} | 破底停損：{last_row['Adv_Low_2']:.2f}\n"
+                               f"- 上影線頸線：{last_row['Adv_Neckline_1']:.2f} | 右肩回測基準：{last_row.get('Adv_Support_RS', 0):.2f}\n"
+                               f"- 預估 1 段目標：{last_row['Adv_Target_1x']:.2f} | 預估 3 段目標：{last_row['Adv_Target_3x']:.2f}")
+                    st.markdown("---")
 
                 st.markdown(f"**更新日期：{last_date} | 最新收盤價：{last_row['Close']:.2f}**")
                 with st.container(height=165):
@@ -315,8 +324,6 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         tickers = [core.resolve_ticker(test_ticker_input, stock_dict)] if scan_target_mode == "指定個股測試" else list(stock_dict.keys())
         config_dict = {k: st.session_state[k] for k in core.DEFAULT_CONFIG.keys() if k in st.session_state}
-        
-        # [修復點] 手動補上 backtest_date_obj，解決 KeyError
         config_dict["backtest_date_obj"] = st.session_state.backtest_date_obj
 
         div_pairs = [(config_dict["div_recent_w"], config_dict["div_older_w"])] if config_dict["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
@@ -397,6 +404,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                             last_expert = expert_res_df.iloc[-1 - best_offset]
                             rec_status = "✅ 建議參考" if float(best_row['K']) < config_dict.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
 
+                            # 🚀 報表輸出新增欄位 (Advanced Bottom Strategy 資料寫入)
                             reversal_candidates[ticker] = {
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                 "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
@@ -404,12 +412,19 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 "近30日觸發次數": count_30d if config_dict["enable_30d_backtest"] else "-",
                                 "當日收盤": round(float(best_row['Close']), 2), "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
                                 "當日成交量(張)": int(best_row['Volume_Lots']), "量增倍數": round(best_vol_mult, 2), "月均量(張)": int(best_row['Vol_MA20']),
-                                "DIF": round(float(best_row['MACD']), 3), "KD金叉判定": "✅ 是" if best_row['KD_Cross_Recent'] else "❌ 否",
+                                "DIF": round(float(best_row['MACD']), 3), "當日KD(K值)": round(float(best_row['K']), 2),
+                                "KD金叉判定": "✅ 是" if best_row['KD_Cross_Recent'] else "❌ 否",
                                 "MACD金叉判定": "✅ 是" if best_row['MACD_Cross_Recent'] else "❌ 否",
                                 "反轉分數": round(float(best_row['Candle_Score']), 2), "VCP分數": round(float(best_row['VCP_Score']), 2), "共振分數": round(float(best_row['Reso_Score']), 2),
                                 "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否", "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
                                 "低位量縮突破": "✅ 是" if best_row.get('LowPos_Breakout_Pass') else "❌ 否",
                                 "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
+                                "左腳(Low1)": round(float(best_row['Adv_Low_1']), 2) if pd.notna(best_row.get('Adv_Low_1')) else "-",
+                                "破底(Low2/停損)": round(float(best_row['Adv_Low_2']), 2) if pd.notna(best_row.get('Adv_Low_2')) else "-",
+                                "上影線頸線": round(float(best_row['Adv_Neckline_1']), 2) if pd.notna(best_row.get('Adv_Neckline_1')) else "-",
+                                "右肩回測價": round(float(best_row['Adv_Support_RS']), 2) if pd.notna(best_row.get('Adv_Support_RS')) else "-",
+                                "預估1段目標": round(float(best_row['Adv_Target_1x']), 2) if pd.notna(best_row.get('Adv_Target_1x')) else "-",
+                                "預估3段目標": round(float(best_row['Adv_Target_3x']), 2) if pd.notna(best_row.get('Adv_Target_3x')) else "-",
                                 "進場位置建議": rec_status, "盤整過濾": "✅ 盤整中" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
                                 "多週期KD": core.ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
@@ -480,9 +495,14 @@ elif selected_page == "🚀 全市場智慧掃描":
         status_text.empty(); progress_bar.empty()
         res_df = pd.DataFrame(final_results)
 
+        # 🚀 同步將新欄位加入 UI 顯示
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
-        base_cols.extend(['演算法建議結果', '*回測走揚年線', '*年線回測分數', '長下引突破', '低位量縮突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'])
+        base_cols.extend([
+            '演算法建議結果', '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
+            '*回測走揚年線', '*年線回測分數', '長下引突破', '低位量縮突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+            '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
+        ])
         if config_dict["use_weekly_filter"]: base_cols.extend(['週K共振', '週K背離'])
         base_cols.extend(['年線/半年線空排', '年線斜率(%)', '半年線斜率(%)'])
 
