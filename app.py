@@ -396,7 +396,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 if is_pass and (combo > best_combined_score or best_row is None):
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
 
-                        # === 🚀 60 分 K 輔助運算與回測保護修正 ===
                         pass_60m_adv = False
                         adv_60m_data = None
                         if config_dict.get("enable_60m_adv_scan", False) and data_60m is not None:
@@ -406,7 +405,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 else: df_60m = pd.DataFrame()
                             else: df_60m = data_60m.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
                             
-                            # 防未來數據：60分K也要依照回測日切斷
                             if config_dict["use_backtest_date"] and not df_60m.empty:
                                 target_date_pd = pd.to_datetime(config_dict["backtest_date_obj"])
                                 df_60m = df_60m[df_60m.index.tz_localize(None).normalize() <= target_date_pd]
@@ -419,7 +417,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 
                                 adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
                                 if not adv_res_60m.empty:
-                                    # 鎖定回測當日，只要盤中任一小時有觸發就算過關
                                     target_eval_date = df.index[-1 - best_offset].date() if (best_row is not None and best_offset >= 0) else df.index[-1].date()
                                     adv_res_60m_target_day = adv_res_60m[adv_res_60m.index.tz_localize(None).date == target_eval_date]
                                     
@@ -489,6 +486,8 @@ elif selected_page == "🚀 全市場智慧掃描":
                     pass_60m_adv, adv_60m_data = item.pop("_Pass_60m_Adv", False), item.pop("_Adv_60m_Data", None)
                     has_daily_div, has_m60_div = False, False
                     item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
+                    item['均線最大最小差異百分比(%)'] = "-"
+                    item['均線糾結狀態'] = "-"
 
                     try:
                         if isinstance(long_data.columns, pd.MultiIndex):
@@ -500,6 +499,11 @@ elif selected_page == "🚀 全市場智慧掃描":
                         if not long_df.empty:
                             if config_dict["use_backtest_date"]: long_df = long_df[long_df.index.tz_localize(None).normalize() <= pd.to_datetime(config_dict["backtest_date_obj"])]
                             if specific_offset > 0: long_df = long_df.iloc[:-specific_offset]
+
+                            if len(long_df) >= 240:
+                                ent_res = core.MA240PullbackRightSideStrategy.evaluate_ma_entanglement(long_df)
+                                item['均線最大最小差異百分比(%)'] = ent_res['ma_diff_pct']
+                                item['均線糾結狀態'] = ent_res['ma_tangled']
 
                             if len(long_df) >= 120: item['半年線斜率(%)'] = round((long_df['Close'].rolling(120).mean().iloc[-1] - long_df['Close'].rolling(120).mean().iloc[-2]) / long_df['Close'].rolling(120).mean().iloc[-2] * 100, 3)
                             if len(long_df) >= 240:
@@ -548,7 +552,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
         base_cols.extend([
-            '演算法建議結果', '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
+            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
             '*回測走揚年線', '*年線回測分數', '長下引突破', '低位量縮突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
             '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
         ])
