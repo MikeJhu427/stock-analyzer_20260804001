@@ -62,7 +62,6 @@ DEFAULT_CONFIG = {
     "backtest_date": str(datetime.date.today())
 }
 
-# 🚀 這裡新增了「雙底正背離與右肩回測」選項
 SCAN_ALGO_CHOICES = ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破', '*回測走揚年線', '低位長下引量縮突破', '雙底正背離與右肩回測']
 
 # ==========================================
@@ -664,6 +663,38 @@ class MA240PullbackRightSideStrategy:
         
         return {"is_pass": is_pass, "score": total_score}
 
+    @staticmethod
+    def evaluate_ma_entanglement(long_df):
+        if long_df is None or len(long_df) < 240:
+            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
+        
+        close = long_df['Close']
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1]
+        ma120 = close.rolling(120).mean().iloc[-1]
+        ma240 = close.rolling(240).mean().iloc[-1]
+        
+        ma120_prev = close.rolling(120).mean().iloc[-5]
+        ma240_prev = close.rolling(240).mean().iloc[-5]
+        
+        ma120_slope = (ma120 - ma120_prev) / (ma120_prev + 1e-8) * 100
+        ma240_slope = (ma240 - ma240_prev) / (ma240_prev + 1e-8) * 100
+        
+        mas = [ma20, ma60, ma120, ma240]
+        if any(pd.isna(mas)):
+            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
+            
+        ma_max = max(mas)
+        ma_min = min(mas)
+        diff_pct = (ma_max - ma_min) / (ma_min + 1e-8) * 100
+        
+        is_120_flat = abs(ma120_slope) < 0.05
+        is_240_flat = abs(ma240_slope) < 0.05
+        
+        tangled = "均線糾結" if (diff_pct < 5.0 and is_120_flat and is_240_flat) else "否"
+        
+        return {"ma_diff_pct": round(diff_pct, 2), "ma_tangled": tangled}
+
 class LowPositionShrinkVolumeBreakoutStrategy:
     @staticmethod
     def evaluate(df):
@@ -734,7 +765,6 @@ class WeeklyAnalysisStrategy:
         except Exception:
             return {"週K共振": "錯誤", "週K背離": "錯誤"}
 
-# 🚀 全新【雙底正背離與右肩回測】模組
 class AdvancedBottomStrategy:
     @staticmethod
     def evaluate(df):
@@ -821,9 +851,6 @@ class AdvancedBottomStrategy:
 
         return res
 
-# ==========================================
-# 高階統合引擎 (ScanEngine)
-# ==========================================
 class ScanEngine:
     @staticmethod
     def calculate_all_phase1_scores(df, config):
@@ -908,9 +935,6 @@ class ScanEngine:
             base_tags.append("指標共振")
         return base_tags
 
-# ==========================================
-# 財報三表地雷掃描 (FinancialAuditStrategy)
-# ==========================================
 class FinancialAuditStrategy:
     @staticmethod
     def _safe_float(value):
@@ -1232,11 +1256,8 @@ class FinancialAuditStrategy:
                 "診斷明細": " | ".join(risk_resonance)
             }
         except Exception as e:
-            return {"status": "error", "msg": f"解析發生錯誤：{str(e)}"}
+            return {"status": "error", "msg": f"發生錯誤：{str(e)}"}
 
-# ==========================================
-# 幾何形態測距與量化引擎 (QuantPatternEngine)
-# ==========================================
 class GeometricPatternStrategy:
     @staticmethod
     def calculate_geometric_patterns(df, high_col, low_col, window_order=5):
