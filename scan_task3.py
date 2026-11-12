@@ -1,6 +1,7 @@
 import os
 import time
 import datetime
+import numpy as np
 import pandas as pd
 import strategy_core as core
 
@@ -49,7 +50,7 @@ def run_full_scan():
                     df['MA60'] = df['Close'].rolling(60).mean()
                     df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
 
-                    # 一鍵完成所有核心策略的 Phase 1 計算
+                    # 一鍵完成所有核心策略的 Phase 1 計算 (包含最新加入的雙底正背離與右肩回測)
                     df = core.ScanEngine.calculate_all_phase1_scores(df, CONFIG)
 
                     best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
@@ -92,12 +93,20 @@ def run_full_scan():
                             "量增倍數": round(best_vol_mult, 2),
                             "月均量(張)": int(best_row['Vol_MA20']),
                             "DIF": round(float(best_row['MACD']), 3),
+                            "當日KD(K值)": round(float(best_row['K']), 2),
                             "反轉分數": round(float(best_row['Candle_Score']), 2),
                             "VCP分數": round(float(best_row['VCP_Score']), 2),
                             "共振分數": round(float(best_row['Reso_Score']), 2),
                             "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否",
                             "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
                             "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
+                            # 🚀 新增的高階雙底/右肩回測訊號與關鍵價位
+                            "左腳(Low1)": round(float(best_row['Adv_Low_1']), 2) if pd.notna(best_row.get('Adv_Low_1')) else "-",
+                            "破底(Low2/停損)": round(float(best_row['Adv_Low_2']), 2) if pd.notna(best_row.get('Adv_Low_2')) else "-",
+                            "上影線頸線": round(float(best_row['Adv_Neckline_1']), 2) if pd.notna(best_row.get('Adv_Neckline_1')) else "-",
+                            "右肩回測價": round(float(best_row['Adv_Support_RS']), 2) if pd.notna(best_row.get('Adv_Support_RS')) else "-",
+                            "預估1段目標": round(float(best_row['Adv_Target_1x']), 2) if pd.notna(best_row.get('Adv_Target_1x')) else "-",
+                            "預估3段目標": round(float(best_row['Adv_Target_3x']), 2) if pd.notna(best_row.get('Adv_Target_3x')) else "-",
                             "進場位置建議": rec_status,
                             "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
                             "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
@@ -196,10 +205,13 @@ def run_full_scan():
         except Exception: continue
 
     res_df = pd.DataFrame(final_results)
+    
+    # 🚀 將新的價位與策略欄位加入報表輸出 Base_cols 中
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
     base_cols.extend([
         '演算法建議結果', '*回測走揚年線', '*年線回測分數', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+        '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
         '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
     ])
     if CONFIG["use_weekly_filter"]:
@@ -215,7 +227,7 @@ def run_full_scan():
     res_df.index = res_df.index + 1
 
     print("📊 掃描完成！最終報表標的預覽：")
-    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '*年線回測分數', '當日收盤', '量增倍數']].to_string())
+    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '破底(Low2/停損)', '上影線頸線', '右肩回測價']].to_string())
 
     webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
     token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
