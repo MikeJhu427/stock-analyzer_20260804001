@@ -287,7 +287,6 @@ elif selected_page == "🚀 全市場智慧掃描":
         with col_b2: st.date_input("選擇回測基準日", key="backtest_date_obj", disabled=not st.session_state.use_backtest_date)
         with col_b3: st.checkbox("近 30日觸發統計", key="enable_30d_backtest")
         with col_b4: st.checkbox("自動上傳 Google Drive", key="auto_upload_gdrive")
-        # 🚀 加入 60 分 K 輔助掃描 UI 參數選項 (預設為不勾選)
         with col_b5: st.checkbox("啟用 60分K 雙底/右肩掃描 (耗時較長)", key="enable_60m_adv_scan")
 
         col_a, col_b, col_c, col_d, col_e = st.columns(5)
@@ -327,7 +326,6 @@ elif selected_page == "🚀 全市場智慧掃描":
         tickers = [core.resolve_ticker(test_ticker_input, stock_dict)] if scan_target_mode == "指定個股測試" else list(stock_dict.keys())
         config_dict = {k: st.session_state[k] for k in core.DEFAULT_CONFIG.keys() if k in st.session_state}
         config_dict["backtest_date_obj"] = st.session_state.backtest_date_obj
-        # 取出開關狀態
         config_dict["enable_60m_adv_scan"] = st.session_state.enable_60m_adv_scan
 
         div_pairs = [(config_dict["div_recent_w"], config_dict["div_older_w"])] if config_dict["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
@@ -347,14 +345,12 @@ elif selected_page == "🚀 全市場智慧掃描":
             try:
                 data = yf.download(chunk, threads=False, progress=False, session=yf_session, **dl_kwargs)
                 
-                # 🚀 若開啟參數則同步請求 60 分鐘線
                 data_60m = None
                 if config_dict.get("enable_60m_adv_scan", False):
                     data_60m = yf.download(chunk, period="1mo", interval="60m", threads=False, progress=False, session=yf_session)
 
                 for ticker in chunk:
                     try:
-                        # === 整理日線資料 ===
                         if isinstance(data.columns, pd.MultiIndex):
                             if ticker in data.columns.get_level_values(0): df = data.xs(ticker, axis=1, level=0).dropna(how='all')
                             elif ticker in data.columns.get_level_values(1): df = data.xs(ticker, axis=1, level=1).dropna(how='all')
@@ -400,7 +396,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 if is_pass and (combo > best_combined_score or best_row is None):
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
 
-                        # === 整理 60 分 K 輔助運算 ===
+                        # === 🚀 60 分 K 輔助運算與回測保護修正 ===
                         pass_60m_adv = False
                         adv_60m_data = None
                         if config_dict.get("enable_60m_adv_scan", False) and data_60m is not None:
@@ -409,6 +405,11 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 elif ticker in data_60m.columns.get_level_values(1): df_60m = data_60m.xs(ticker, axis=1, level=1).dropna(how='all')
                                 else: df_60m = pd.DataFrame()
                             else: df_60m = data_60m.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
+                            
+                            # 防未來數據：60分K也要依照回測日切斷
+                            if config_dict["use_backtest_date"] and not df_60m.empty:
+                                target_date_pd = pd.to_datetime(config_dict["backtest_date_obj"])
+                                df_60m = df_60m[df_60m.index.tz_localize(None).normalize() <= target_date_pd]
 
                             if not df_60m.empty and len(df_60m) >= 60:
                                 df_60m = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df_60m))
@@ -418,14 +419,17 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 
                                 adv_res_60m = core.AdvancedBottomStrategy.evaluate(df_60m)
                                 if not adv_res_60m.empty:
-                                    last_60m = adv_res_60m.iloc[-1]
-                                    if last_60m.get('Adv_Signal_A', False) or last_60m.get('Adv_Signal_B', False):
-                                        pass_60m_adv = True
-                                        adv_60m_data = last_60m
+                                    # 鎖定回測當日，只要盤中任一小時有觸發就算過關
+                                    target_eval_date = df.index[-1 - best_offset].date() if (best_row is not None and best_offset >= 0) else df.index[-1].date()
+                                    adv_res_60m_target_day = adv_res_60m[adv_res_60m.index.tz_localize(None).date == target_eval_date]
+                                    
+                                    if not adv_res_60m_target_day.empty:
+                                        triggered_rows = adv_res_60m_target_day[(adv_res_60m_target_day['Adv_Signal_A'] == True) | (adv_res_60m_target_day['Adv_Signal_B'] == True)]
+                                        if not triggered_rows.empty:
+                                            pass_60m_adv = True
+                                            adv_60m_data = triggered_rows.iloc[-1]
 
-                        # === 判定整合與紀錄 ===
                         if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or force_pass:
-                            # 針對只中 60分K 但日線沒中的情況做底層保護
                             if best_row is None:
                                 best_row = df.iloc[-1]
                                 best_offset = 0
@@ -527,7 +531,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                             if res_tags: has_daily_div = True
 
                     base_tags = core.ScanEngine.generate_base_tags(item, config_dict)
-                    if not base_tags and scan_target_mode == "指定個股測試": base_tags.append("未達標(測試)")
                     div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
                     
                     if pass_60m_adv and adv_60m_data is not None:
