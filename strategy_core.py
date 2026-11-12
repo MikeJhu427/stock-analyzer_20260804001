@@ -691,7 +691,7 @@ class MA240PullbackRightSideStrategy:
         is_120_flat = abs(ma120_slope) < 0.05
         is_240_flat = abs(ma240_slope) < 0.05
         
-        tangled = "均線糾結" if (diff_pct < 5.0 and is_120_flat and is_240_flat) else "否"
+        tangled = "均線糾結" if (diff_pct < 6.0 and is_120_flat and is_240_flat) else "否"
         
         return {"ma_diff_pct": round(diff_pct, 2), "ma_tangled": tangled}
 
