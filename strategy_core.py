@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import datetime
 import base64
@@ -218,7 +219,9 @@ class GoogleDriveUploader:
                 "mimeType": mime_type
             }
             
-            response = requests.post(webhook_url, data=payload, timeout=30, verify=False)
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(webhook_url, data=json.dumps(payload), headers=headers, timeout=30, verify=False)
+            
             result = response.json()
             if result.get("status") == "success":
                 return True, result.get("fileUrl", "成功")
