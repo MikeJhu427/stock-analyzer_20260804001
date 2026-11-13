@@ -195,7 +195,6 @@ class GoogleDriveUploader:
         if not webhook_url or not webhook_url.startswith("https://script.google.com/"):
             return False, "無效的 Google Apps Script Webhook 網址"
         try:
-            # 支援相容新舊參數
             actual_bytes = file_bytes if file_bytes is not None else csv_bytes
             
             if actual_bytes is not None:
@@ -208,7 +207,6 @@ class GoogleDriveUploader:
                 
             encoded_data = base64.b64encode(file_data).decode('utf-8')
             
-            # 自動判定 mimeType 以解決 xlsx 在 Google 雲端硬碟亂碼與解析錯誤的問題
             mime_type = "text/csv"
             if file_name.endswith('.xlsx'):
                 mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -217,7 +215,7 @@ class GoogleDriveUploader:
                 "token": token, 
                 "fileName": file_name, 
                 "fileData": encoded_data,
-                "mimeType": mime_type  # 加入 MimeType 指引
+                "mimeType": mime_type
             }
             
             response = requests.post(webhook_url, data=payload, timeout=30, verify=False)
