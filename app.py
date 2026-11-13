@@ -66,6 +66,7 @@ if "run_batch_audit" not in st.session_state: st.session_state.run_batch_audit =
 if "enable_60m_adv_scan" not in st.session_state: st.session_state.enable_60m_adv_scan = False
 if "config" not in st.session_state: st.session_state.config = load_config()
 if "current_profile" not in st.session_state: st.session_state.current_profile = st.session_state.config.get("last_used", "預設參數 (Default)")
+if "upload_msg" not in st.session_state: st.session_state.upload_msg = ""
 
 def apply_profile_to_state(profile_name):
     prof = st.session_state.config["profiles"].get(profile_name, core.DEFAULT_CONFIG)
@@ -318,6 +319,7 @@ elif selected_page == "🚀 全市場智慧掃描":
     if st.button("🚀 開始智慧區間掃描", type="primary"):
         status_text, progress_bar = st.empty(), st.progress(0)
         stock_dict = get_all_tw_stocks()
+        st.session_state.upload_msg = "" 
         
         if not stock_dict:
             status_text.empty()
@@ -573,8 +575,47 @@ elif selected_page == "🚀 全市場智慧掃描":
         st.session_state.scan_res_df, st.session_state.scan_algo_mode, st.session_state.market_info = res_df, algo_mode, market_info
         st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔標的。"
 
+        # === Google Drive 自動上傳邏輯 ===
+        if config_dict.get("auto_upload_gdrive", False) and not res_df.empty:
+            webhook_url = ""
+            token = ""
+            try:
+                webhook_url = st.secrets.get("GAS_WEBHOOK_URL", os.environ.get("GAS_WEBHOOK_URL", "")).strip()
+                token = st.secrets.get("GAS_SECRET_TOKEN", os.environ.get("GAS_SECRET_TOKEN", "")).strip()
+            except Exception:
+                webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
+                token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
+            
+            if webhook_url and token:
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H%M')
+                try:
+                    buffer = io.BytesIO()
+                    res_df.to_excel(buffer, index=False, engine='openpyxl')
+                    file_name = f"auto_scan_all_{timestamp}.xlsx"
+                    success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=buffer.getvalue())
+                    if success:
+                        st.session_state.upload_msg = f"✅ 報表已自動上傳至 Google Drive ({file_name})"
+                    else:
+                        st.session_state.upload_msg = f"⚠️ Google Drive 上傳失敗：{msg}"
+                except ImportError:
+                    csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
+                    file_name = f"auto_scan_all_{timestamp}.csv"
+                    success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=csv_bytes)
+                    if success:
+                        st.session_state.upload_msg = f"✅ 報表已自動上傳至 Google Drive ({file_name})"
+                    else:
+                        st.session_state.upload_msg = f"⚠️ Google Drive 上傳失敗：{msg}"
+            else:
+                st.session_state.upload_msg = "⚠️ 尚未設定 Google Drive Webhook 網址或 Token (請檢查 secrets.toml)，略過上傳。"
+
     if "scan_res_df" in st.session_state:
         st.success(st.session_state.scan_msg)
+        if "upload_msg" in st.session_state and st.session_state.upload_msg:
+            if "✅" in st.session_state.upload_msg:
+                st.success(st.session_state.upload_msg)
+            else:
+                st.warning(st.session_state.upload_msg)
+
         if st.session_state.market_info:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("加權指數收盤", st.session_state.market_info["加權指數收盤"])
