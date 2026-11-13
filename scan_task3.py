@@ -257,7 +257,7 @@ def run_full_scan():
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
-                # 透過 openpyxl 輸出標準二進位 Excel 格式
+                # 強制採用 openpyxl 輸出，保證產生現代化的標準 .xlsx 檔，避免相容性錯誤
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     res_df.to_excel(writer, index=False)
