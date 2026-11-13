@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import warnings
 import datetime
@@ -378,7 +379,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                         df['KD_Cross_Recent'] = df['KD_Cross'].rolling(window=config_dict["reso_cross_days"], min_periods=1).max() >= 1
                         df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=config_dict["reso_cross_days"], min_periods=1).max() >= 1
 
-                        # 解耦：呼叫統一方法
                         df = core.ScanEngine.calculate_all_phase1_scores(df, config_dict)
                         if scan_target_mode == "指定個股測試":
                             st.session_state.test_stock_df = pd.concat([df, expert_res_df], axis=1)
@@ -394,7 +394,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                             vol_mult = (t_row['Volume_Lots'] / prev_vol) if pd.notna(prev_vol) and prev_vol > 0 else 0.0
 
                             if t_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"] or force_pass:
-                                # 解耦：委派給 ScanEngine
                                 is_pass, combo = core.ScanEngine.check_algo_pass(t_row, config_dict, algo_mode, force_pass)
                                 if is_pass and (combo > best_combined_score or best_row is None):
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
@@ -449,7 +448,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                             rec_status = "✅ 建議參考" if float(best_row['K']) < config_dict.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
                             adv_src = adv_60m_data if pass_60m_adv and adv_60m_data is not None else best_row
 
-                            # 建構基礎報告結構
                             base_info = {
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                 "_Pass_60m_Adv": pass_60m_adv, "_Adv_60m_Data": adv_60m_data,
@@ -466,7 +464,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 "多週期KD": core.ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
                             }
                             
-                            # 解耦：動態整合所有演算法的專屬評估指標與分數
                             dynamic_metrics = core.ScanEngine.get_all_metrics(best_row, adv_src)
                             base_info.update(dynamic_metrics)
                             
@@ -549,14 +546,12 @@ elif selected_page == "🚀 全市場智慧掃描":
         status_text.empty(); progress_bar.empty()
         res_df = pd.DataFrame(final_results)
 
-        # 解耦：動態串接欄位，不再寫死所有的指標名稱
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
         base_cols.extend([
             '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '當日KD(K值)'
         ])
         
-        # 加入所有註冊演算法的動態欄位
         base_cols.extend(core.ScanEngine.get_all_metric_keys())
         
         base_cols.extend([
@@ -570,7 +565,6 @@ elif selected_page == "🚀 全市場智慧掃描":
         if not res_df.empty:
             res_df = res_df[[c for c in cols if c in res_df.columns]]
             
-            # 使用存在的欄位作為排序條件，避免 KeyError
             sort_keys = [k for k in ["*年線回測分數", "共振分數", "反轉分數", "VCP分數"] if k in res_df.columns]
             if sort_keys:
                 res_df = res_df.sort_values(by=sort_keys, ascending=False).reset_index(drop=True)
@@ -591,8 +585,10 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         if not st.session_state.scan_res_df.empty:
             st.dataframe(st.session_state.scan_res_df, use_container_width=True)
-            csv = st.session_state.scan_res_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(label="📥 下載建議清單 (CSV)", data=csv, file_name='stock_scan_results.csv', mime='text/csv')
+            buffer = io.BytesIO()
+            st.session_state.scan_res_df.to_excel(buffer, index=False, engine='openpyxl')
+            file_name = f"stock_scan_results_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.xlsx"
+            st.download_button(label="📥 下載建議清單 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
             def transfer_to_audit():
                 tickers_str = ", ".join(st.session_state.scan_res_df['股票代號'].astype(str).tolist())
@@ -730,8 +726,10 @@ elif selected_page == "📑 財報三表地雷掃描":
                     batch_df = batch_df.sort_values(by=["體質分數", "風險分數"], ascending=[False, True]).reset_index(drop=True)
                     batch_df.index = batch_df.index + 1
                     st.dataframe(batch_df, use_container_width=True)
-                    csv = batch_df.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(label="📥 下載三表交叉財報健檢報告 (CSV)", data=csv, file_name=f'financial_cross_audit_{datetime.date.today()}.csv', mime='text/csv')
+                    buffer = io.BytesIO()
+                    batch_df.to_excel(buffer, index=False, engine='openpyxl')
+                    file_name = f"financial_cross_audit_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.xlsx"
+                    st.download_button(label="📥 下載三表交叉財報健檢報告 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 # ----------------------------------------------------
 # 頁籤 4：幾何型態滿足點測距 
