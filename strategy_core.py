@@ -62,8 +62,6 @@ DEFAULT_CONFIG = {
     "backtest_date": str(datetime.date.today())
 }
 
-SCAN_ALGO_CHOICES = ['全部', '底部翻轉', 'VCP', '指標共振', '量價雙背離', '長下引突破', '*回測走揚年線', '低位長下引量縮突破', '雙底正背離與右肩回測']
-
 # ==========================================
 # 網路與工具模組
 # ==========================================
@@ -851,13 +849,58 @@ class AdvancedBottomStrategy:
 
         return res
 
-class ScanEngine:
-    @staticmethod
-    def calculate_all_phase1_scores(df, config):
+# ==========================================
+# 鬆散耦合架構：Scan 演算法註冊中心 (Registry)
+# ==========================================
+class IScanAlgorithm:
+    @property
+    def name(self) -> str:
+        raise NotImplementedError
+    def calculate(self, df, config) -> pd.DataFrame:
+        return df
+    def check_pass(self, row, config) -> tuple[bool, float]:
+        return False, 0.0
+    def get_tags(self, row, config) -> list[str]:
+        return []
+    def get_metrics(self, row, adv_src=None) -> dict:
+        return {}
+
+class AlgoBottomReversal(IScanAlgorithm):
+    @property
+    def name(self): return '底部翻轉'
+    def calculate(self, df, config):
         df['Candle_Score'] = BottomReversalStrategy.evaluate(df)
+        return df
+    def check_pass(self, row, config):
+        score = row.get('Candle_Score', 0)
+        return score >= config.get("min_score", 8.0), score
+    def get_tags(self, row, config):
+        val = row.get('Candle_Score', 0) if isinstance(row, pd.Series) else row.get('反轉分數', 0)
+        return ["底部翻轉"] if val >= config.get("min_score", 8.0) else []
+    def get_metrics(self, row, adv_src=None):
+        val = row.get('Candle_Score', 0) if isinstance(row, pd.Series) else row.get('反轉分數', 0)
+        return {"反轉分數": round(float(val), 2) if pd.notna(val) else 0.0}
+
+class AlgoVCP(IScanAlgorithm):
+    @property
+    def name(self): return 'VCP'
+    def calculate(self, df, config):
         df['VCP_Score'] = VCPStrategy.evaluate(df)
-        price_col = 'Low' if config.get("reso_price_basis") == "最低價 (Low)" else 'Close'
-        
+        return df
+    def check_pass(self, row, config):
+        score = row.get('VCP_Score', 0)
+        return score >= config.get("min_vcp_score", 10.0), score
+    def get_tags(self, row, config):
+        val = row.get('VCP_Score', 0) if isinstance(row, pd.Series) else row.get('VCP分數', 0)
+        return ["VCP收斂"] if val >= config.get("min_vcp_score", 10.0) else []
+    def get_metrics(self, row, adv_src=None):
+        val = row.get('VCP_Score', 0) if isinstance(row, pd.Series) else row.get('VCP分數', 0)
+        return {"VCP分數": round(float(val), 2) if pd.notna(val) else 0.0}
+
+class AlgoIndicatorResonance(IScanAlgorithm):
+    @property
+    def name(self): return '指標共振'
+    def calculate(self, df, config):
         df['Reso_Score'] = IndicatorResonanceStrategy.evaluate(
             df, recent_w=config.get("div_recent_w"), older_w=config.get("div_older_w"),
             kd_older_low_th=config.get("reso_kd_older_low"), kd_older_high_th=config.get("reso_kd_older_high"),
@@ -867,73 +910,177 @@ class ScanEngine:
             require_macd_cross_zero=config.get("reso_macd_cross_zero"), reso_price_basis=config.get("reso_price_basis"),
             use_macd_wave_logic=config.get("reso_macd_wave_logic"), require_cross_confirm=config.get("require_cross_confirm")
         )
-        
+        return df
+    def check_pass(self, row, config):
+        score = row.get('Reso_Score', 0)
+        return score >= config.get("min_reso_score", 10.0), score
+    def get_tags(self, row, config):
+        val = row.get('Reso_Score', 0) if isinstance(row, pd.Series) else row.get('共振分數', 0)
+        return ["指標共振"] if val >= config.get("min_reso_score", 10.0) else []
+    def get_metrics(self, row, adv_src=None):
+        val = row.get('Reso_Score', 0) if isinstance(row, pd.Series) else row.get('共振分數', 0)
+        return {"共振分數": round(float(val), 2) if pd.notna(val) else 0.0}
+
+class AlgoPriceVolDiv(IScanAlgorithm):
+    @property
+    def name(self): return '量價雙背離'
+    def calculate(self, df, config):
+        price_col = 'Low' if config.get("reso_price_basis") == "最低價 (Low)" else 'Close'
         df['PriceVol_Div_Pass'] = PriceVolDivergenceStrategy.evaluate(
             df, recent_w=config.get("div_recent_w"), older_w=config.get("div_older_w"),
             rl_cnt=config.get("recent_lows_cnt"), ol_cnt=config.get("older_lows_cnt"),
             p_left=config.get("pivot_left"), p_right=config.get("pivot_right"),
             req_cross=config.get("require_cross_confirm"), c_days=config.get("reso_cross_days"), price_col=price_col
         )
-        
+        return df
+    def check_pass(self, row, config):
+        passed = bool(row.get('PriceVol_Div_Pass', False))
+        return passed, 20.0 if passed else 0.0
+    def get_tags(self, row, config):
+        val = row.get('PriceVol_Div_Pass', False) if isinstance(row, pd.Series) else (row.get('量價雙背離') == '✅ 是')
+        return ["量價雙背離"] if val else []
+    def get_metrics(self, row, adv_src=None):
+        val = row.get('PriceVol_Div_Pass', False) if isinstance(row, pd.Series) else (row.get('量價雙背離') == '✅ 是')
+        return {"量價雙背離": "✅ 是" if val else "❌ 否"}
+
+class AlgoLongLowerShadowBreakout(IScanAlgorithm):
+    @property
+    def name(self): return '長下引突破'
+    def calculate(self, df, config):
         df['Breakout_Signal'] = LongLowerShadowBreakoutStrategy.evaluate(df)
+        return df
+    def check_pass(self, row, config):
+        passed = bool(row.get('Breakout_Signal', False))
+        return passed, 10.0 if passed else 0.0
+    def get_tags(self, row, config):
+        val = row.get('Breakout_Signal', False) if isinstance(row, pd.Series) else (row.get('長下引突破') == '✅ 是')
+        return ["長下引突破"] if val else []
+    def get_metrics(self, row, adv_src=None):
+        val = row.get('Breakout_Signal', False) if isinstance(row, pd.Series) else (row.get('長下引突破') == '✅ 是')
+        return {"長下引突破": "✅ 是" if val else "❌ 否"}
+
+class AlgoMA240Pullback(IScanAlgorithm):
+    @property
+    def name(self): return '*回測走揚年線'
+    def calculate(self, df, config):
         df['MA240_P1_Pass'] = MA240PullbackRightSideStrategy.evaluate_phase1(df)
+        return df
+    def check_pass(self, row, config):
+        passed = bool(row.get('MA240_P1_Pass', False))
+        return passed, 12.0 if passed else 0.0
+    def get_tags(self, row, config):
+        return ["*回測走揚年線"] if row.get("*回測走揚年線") == "✅ 是" else []
+    def get_metrics(self, row, adv_src=None):
+        return {"*回測走揚年線": "❌ 否", "*年線回測分數": 0.0}
+
+class AlgoLowPosBreakout(IScanAlgorithm):
+    @property
+    def name(self): return '低位長下引量縮突破'
+    def calculate(self, df, config):
         df['LowPos_Breakout_Pass'] = LowPositionShrinkVolumeBreakoutStrategy.evaluate(df)
-        
+        return df
+    def check_pass(self, row, config):
+        passed = bool(row.get('LowPos_Breakout_Pass', False))
+        return passed, 15.0 if passed else 0.0
+    def get_tags(self, row, config):
+        val = row.get('LowPos_Breakout_Pass', False) if isinstance(row, pd.Series) else (row.get('低位量縮突破') == '✅ 是')
+        return ["低位量縮突破"] if val else []
+    def get_metrics(self, row, adv_src=None):
+        val = row.get('LowPos_Breakout_Pass', False) if isinstance(row, pd.Series) else (row.get('低位量縮突破') == '✅ 是')
+        return {"低位量縮突破": "✅ 是" if val else "❌ 否"}
+
+class AlgoAdvancedBottom(IScanAlgorithm):
+    @property
+    def name(self): return '雙底正背離與右肩回測'
+    def calculate(self, df, config):
         adv_res = AdvancedBottomStrategy.evaluate(df)
         for col in adv_res.columns:
             df[col] = adv_res[col]
-            
+        return df
+    def check_pass(self, row, config):
+        sig_a = bool(row.get('Adv_Signal_A', False))
+        sig_b = bool(row.get('Adv_Signal_B', False))
+        combo = 0.0
+        if sig_a: combo += 25.0
+        if sig_b: combo += 30.0
+        return (sig_a or sig_b), combo
+    def get_tags(self, row, config):
+        tags = []
+        a_val = row.get("Adv_Signal_A")
+        b_val = row.get("Adv_Signal_B")
+        if a_val == "✅ 是" or (isinstance(a_val, bool) and a_val):
+            tags.append("雙底突破(底倉)")
+        if b_val == "✅ 是" or (isinstance(b_val, bool) and b_val):
+            tags.append("右肩回測(加碼)")
+        return tags
+    def get_metrics(self, row, adv_src=None):
+        src = adv_src if adv_src is not None else row
+        def safe_round(val):
+            return round(float(val), 2) if pd.notna(val) else "-"
+        return {
+            "左腳(Low1)": safe_round(src.get('Adv_Low_1', np.nan)),
+            "破底(Low2/停損)": safe_round(src.get('Adv_Low_2', np.nan)),
+            "上影線頸線": safe_round(src.get('Adv_Neckline_1', np.nan)),
+            "右肩回測價": safe_round(src.get('Adv_Support_RS', np.nan)),
+            "預估1段目標": safe_round(src.get('Adv_Target_1x', np.nan)),
+            "預估3段目標": safe_round(src.get('Adv_Target_3x', np.nan))
+        }
+
+ALGO_REGISTRY = [
+    AlgoBottomReversal(),
+    AlgoVCP(),
+    AlgoIndicatorResonance(),
+    AlgoPriceVolDiv(),
+    AlgoLongLowerShadowBreakout(),
+    AlgoMA240Pullback(),
+    AlgoLowPosBreakout(),
+    AlgoAdvancedBottom()
+]
+
+# 動態輸出掃描選項給前端介面使用
+SCAN_ALGO_CHOICES = ['全部'] + [algo.name for algo in ALGO_REGISTRY]
+
+class ScanEngine:
+    @staticmethod
+    def calculate_all_phase1_scores(df, config):
+        for algo in ALGO_REGISTRY:
+            df = algo.calculate(df, config)
         return df
 
     @staticmethod
     def check_algo_pass(row, config, algo_mode, force_pass=False):
-        is_r = (algo_mode in ['全部', '底部翻轉']) and (row.get('Candle_Score', 0) >= config.get("min_score", 8.0))
-        is_v = (algo_mode in ['全部', 'VCP']) and (row.get('VCP_Score', 0) >= config.get("min_vcp_score", 10.0))
-        is_reso = (algo_mode in ['全部', '指標共振']) and (row.get('Reso_Score', 0) >= config.get("min_reso_score", 10.0))
-        is_pv = (algo_mode in ['全部', '量價雙背離']) and row.get('PriceVol_Div_Pass', False)
-        is_brk = (algo_mode in ['全部', '長下引突破']) and row.get('Breakout_Signal', False)
-        is_ma240 = (algo_mode in ['全部', '*回測走揚年線']) and row.get('MA240_P1_Pass', False)
-        is_lowpos_brk = (algo_mode in ['全部', '低位長下引量縮突破']) and row.get('LowPos_Breakout_Pass', False)
-        is_adv = (algo_mode in ['全部', '雙底正背離與右肩回測']) and (row.get('Adv_Signal_A', False) or row.get('Adv_Signal_B', False))
-        
-        passed = is_r or is_v or is_reso or is_pv or is_brk or is_ma240 or is_lowpos_brk or is_adv or force_pass
-        
+        passed = force_pass
         combo_score = 0
-        combo_score += row.get('Candle_Score', 0)
-        combo_score += row.get('VCP_Score', 0)
-        combo_score += row.get('Reso_Score', 0)
-        combo_score += 20 if row.get('PriceVol_Div_Pass', False) else 0
-        combo_score += 10 if row.get('Breakout_Signal', False) else 0
-        combo_score += 12 if row.get('MA240_P1_Pass', False) else 0
-        combo_score += 15 if row.get('LowPos_Breakout_Pass', False) else 0
-        combo_score += 25 if row.get('Adv_Signal_A', False) else 0
-        combo_score += 30 if row.get('Adv_Signal_B', False) else 0
-        
+        for algo in ALGO_REGISTRY:
+            is_pass, score = algo.check_pass(row, config)
+            combo_score += score
+            if (algo_mode == '全部' or algo_mode == algo.name) and is_pass:
+                passed = True
         return passed, combo_score
 
     @staticmethod
     def generate_base_tags(item, config):
         base_tags = []
-        if item.get("Adv_Signal_A") == "✅ 是" or (isinstance(item.get("Adv_Signal_A"), bool) and item.get("Adv_Signal_A")):
-            base_tags.append("雙底突破(底倉)")
-        if item.get("Adv_Signal_B") == "✅ 是" or (isinstance(item.get("Adv_Signal_B"), bool) and item.get("Adv_Signal_B")):
-            base_tags.append("右肩回測(加碼)")
-            
-        if item.get("量價雙背離") == "✅ 是":
-            base_tags.append("量價雙背離")
-        if item.get("長下引突破") == "✅ 是":
-            base_tags.append("長下引突破")
-        if item.get("*回測走揚年線") == "✅ 是":
-            base_tags.append("*回測走揚年線")
-        if item.get("低位長下引量縮突破") == "✅ 是" or item.get("LowPos_Breakout_Pass", False):
-            base_tags.append("低位量縮突破")
-        if item.get("反轉分數", 0) >= config.get("min_score", 8.0):
-            base_tags.append("底部翻轉")
-        if item.get("VCP分數", 0) >= config.get("min_vcp_score", 10.0):
-            base_tags.append("VCP收斂")
-        if item.get("共振分數", 0) >= config.get("min_reso_score", 10.0):
-            base_tags.append("指標共振")
+        for algo in ALGO_REGISTRY:
+            base_tags.extend(algo.get_tags(item, config))
         return base_tags
+        
+    @staticmethod
+    def get_all_metrics(row, adv_src=None):
+        metrics = {}
+        for algo in ALGO_REGISTRY:
+            metrics.update(algo.get_metrics(row, adv_src))
+        return metrics
+        
+    @staticmethod
+    def get_all_metric_keys():
+        keys = []
+        dummy_row = pd.Series(dtype=float)
+        for algo in ALGO_REGISTRY:
+            keys.extend(algo.get_metrics(dummy_row, dummy_row).keys())
+        # 移除重複但保持順序
+        return list(dict.fromkeys(keys))
+
 
 class FinancialAuditStrategy:
     @staticmethod
