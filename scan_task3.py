@@ -2,6 +2,8 @@ import os
 import io
 import time
 import datetime
+import base64
+import requests
 import numpy as np
 import pandas as pd
 import strategy_core as core
@@ -255,19 +257,56 @@ def run_full_scan():
 
         webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
         token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
+        
         if webhook_url and token:
-            # 轉換為 XLSX 格式
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H%M')
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
-            buffer = io.BytesIO()
-            res_df.to_excel(buffer, index=False, engine='openpyxl')
-            xlsx_bytes = buffer.getvalue()
-            
-            print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
-            success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=xlsx_bytes)
-            print(f"✅ 上傳結果: {msg}")
-        else: print("⚠️ 未檢測到 GAS_WEBHOOK_URL，略過上傳。")
+            try:
+                # 產出 XLSX 二進位資料
+                buffer = io.BytesIO()
+                res_df.to_excel(buffer, index=False, engine='openpyxl')
+                xlsx_bytes = buffer.getvalue()
+                
+                # 備份一份至本地目錄
+                with open(file_name, "wb") as f:
+                    f.write(xlsx_bytes)
+                print(f"💾 已儲存本地檔案備份: {file_name}")
+
+                print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
+                
+                # 優化：為避免 GAS 將上傳的 Excel 檔案預設識別為純文字 CSV，明確指定試算表的 MIME Type
+                encoded_data = base64.b64encode(xlsx_bytes).decode('utf-8')
+                payload = {
+                    "token": token,
+                    "fileName": file_name,
+                    "fileData": encoded_data,
+                    "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                }
+                
+                # 繞過舊版的 core.GoogleDriveUploader，直接發送帶有 MIME Type 的新結構請求
+                response = requests.post(webhook_url, data=payload, timeout=30, verify=False)
+                
+                try:
+                    res_json = response.json()
+                    success_msg = res_json.get("fileUrl", "成功") if res_json.get("status") == "success" else res_json.get("message", "未知錯誤")
+                    print(f"✅ 上傳結果: {success_msg}")
+                except Exception:
+                    print(f"✅ 上傳結果: 請求已發送 (但伺服器未回傳標準 JSON)")
+
+            except ImportError:
+                print("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)，將自動降級為 CSV 格式進行上傳。")
+                file_name_csv = f"auto_scan_all_{timestamp}.csv"
+                csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
+                
+                with open(file_name_csv, "wb") as f:
+                    f.write(csv_bytes)
+                print(f"💾 已儲存本地檔案備份: {file_name_csv}")
+                
+                success, msg = core.GoogleDriveUploader.upload(file_name_csv, webhook_url, token, csv_bytes=csv_bytes)
+                print(f"✅ 上傳結果: {msg}")
+        else: 
+            print("⚠️ 未檢測到 GAS_WEBHOOK_URL，略過上傳。")
     else:
         print("💡 第一階段入選標的，在經過第二階段條件篩選後無一達標。")
 
