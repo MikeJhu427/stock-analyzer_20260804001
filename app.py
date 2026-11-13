@@ -585,10 +585,16 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         if not st.session_state.scan_res_df.empty:
             st.dataframe(st.session_state.scan_res_df, use_container_width=True)
-            buffer = io.BytesIO()
-            st.session_state.scan_res_df.to_excel(buffer, index=False, engine='openpyxl')
-            file_name = f"stock_scan_results_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.xlsx"
-            st.download_button(label="📥 下載建議清單 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            try:
+                buffer = io.BytesIO()
+                st.session_state.scan_res_df.to_excel(buffer, index=False, engine='openpyxl')
+                file_name = f"stock_scan_results_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.xlsx"
+                st.download_button(label="📥 下載建議清單 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            except ImportError:
+                st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。請於環境配置或 requirements.txt 中加入 `openpyxl` 以啟用 Excel 匯出功能。")
+                csv = st.session_state.scan_res_df.to_csv(index=False).encode('utf-8-sig')
+                file_name_csv = f"stock_scan_results_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.csv"
+                st.download_button(label="📥 下載建議清單 (CSV 備用)", data=csv, file_name=file_name_csv, mime='text/csv')
 
             def transfer_to_audit():
                 tickers_str = ", ".join(st.session_state.scan_res_df['股票代號'].astype(str).tolist())
@@ -726,10 +732,16 @@ elif selected_page == "📑 財報三表地雷掃描":
                     batch_df = batch_df.sort_values(by=["體質分數", "風險分數"], ascending=[False, True]).reset_index(drop=True)
                     batch_df.index = batch_df.index + 1
                     st.dataframe(batch_df, use_container_width=True)
-                    buffer = io.BytesIO()
-                    batch_df.to_excel(buffer, index=False, engine='openpyxl')
-                    file_name = f"financial_cross_audit_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.xlsx"
-                    st.download_button(label="📥 下載三表交叉財報健檢報告 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    try:
+                        buffer = io.BytesIO()
+                        batch_df.to_excel(buffer, index=False, engine='openpyxl')
+                        file_name = f"financial_cross_audit_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.xlsx"
+                        st.download_button(label="📥 下載三表交叉財報健檢報告 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    except ImportError:
+                        st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。請於環境配置或 requirements.txt 中加入 `openpyxl` 以啟用 Excel 匯出功能。")
+                        csv = batch_df.to_csv(index=False).encode('utf-8-sig')
+                        file_name_csv = f"financial_cross_audit_{datetime.datetime.now().strftime('%Y-%m-%d %H%M')}.csv"
+                        st.download_button(label="📥 下載三表交叉財報健檢報告 (CSV 備用)", data=csv, file_name=file_name_csv, mime='text/csv')
 
 # ----------------------------------------------------
 # 頁籤 4：幾何型態滿足點測距 
