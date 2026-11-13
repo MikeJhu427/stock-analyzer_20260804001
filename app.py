@@ -593,12 +593,16 @@ elif selected_page == "🚀 全市場智慧掃描":
                 timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
                 
                 try:
+                    # 嚴格的 Excel 記憶體封裝寫法，確保 ZIP 結構完整 Close
                     buffer = io.BytesIO()
-                    res_df.to_excel(buffer, index=False, engine='openpyxl')
-                    xlsx_bytes = buffer.getvalue()
-                    file_name = f"auto_scan_all_{timestamp}.xlsx"
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        res_df.to_excel(writer, index=False)
+                    buffer.seek(0)
+                    xlsx_bytes = buffer.read()
                     
+                    file_name = f"auto_scan_all_{timestamp}.xlsx"
                     encoded_data = base64.b64encode(xlsx_bytes).decode('utf-8')
+                    
                     payload = {
                         "token": token,
                         "fileName": file_name,
@@ -646,8 +650,12 @@ elif selected_page == "🚀 全市場智慧掃描":
             tw_tz = datetime.timezone(datetime.timedelta(hours=8))
             timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
             try:
+                # 前端介面按鈕下載也採用嚴格封裝
                 buffer = io.BytesIO()
-                st.session_state.scan_res_df.to_excel(buffer, index=False, engine='openpyxl')
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    st.session_state.scan_res_df.to_excel(writer, index=False)
+                buffer.seek(0)
+                
                 file_name = f"stock_scan_results_{timestamp}.xlsx"
                 st.download_button(label="📥 下載建議清單 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
             except ImportError:
@@ -797,7 +805,10 @@ elif selected_page == "📑 財報三表地雷掃描":
                     timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
                     try:
                         buffer = io.BytesIO()
-                        batch_df.to_excel(buffer, index=False, engine='openpyxl')
+                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                            batch_df.to_excel(writer, index=False)
+                        buffer.seek(0)
+                        
                         file_name = f"financial_cross_audit_{timestamp}.xlsx"
                         st.download_button(label="📥 下載三表交叉財報健檢報告 (Excel)", data=buffer.getvalue(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                     except ImportError:
