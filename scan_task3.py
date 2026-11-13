@@ -1,4 +1,5 @@
 import os
+import io
 import time
 import datetime
 import numpy as np
@@ -255,10 +256,16 @@ def run_full_scan():
         webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
         token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
         if webhook_url and token:
-            file_name = f"auto_scan_all_{datetime.date.today().strftime('%Y-%m-%d')}.csv"
-            csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
+            # 轉換為 XLSX 格式
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H%M')
+            file_name = f"auto_scan_all_{timestamp}.xlsx"
+            
+            buffer = io.BytesIO()
+            res_df.to_excel(buffer, index=False, engine='openpyxl')
+            xlsx_bytes = buffer.getvalue()
+            
             print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
-            success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=csv_bytes)
+            success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=xlsx_bytes)
             print(f"✅ 上傳結果: {msg}")
         else: print("⚠️ 未檢測到 GAS_WEBHOOK_URL，略過上傳。")
     else:
