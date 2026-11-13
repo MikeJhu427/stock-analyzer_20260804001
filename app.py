@@ -637,6 +637,7 @@ elif selected_page == "🚀 全市場智慧掃描":
             tw_tz = datetime.timezone(datetime.timedelta(hours=8))
             timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
             try:
+                # 前端介面按鈕下載也採用嚴格封裝
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     st.session_state.scan_res_df.to_excel(writer, index=False)
