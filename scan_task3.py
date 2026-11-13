@@ -254,7 +254,9 @@ def run_full_scan():
         token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
         
         if webhook_url and token:
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H%M')
+            # 指定為台灣時間 (UTC+8) 產出檔名
+            tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+            timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
