@@ -51,6 +51,7 @@ def run_full_scan():
                     df['MA60'] = df['Close'].rolling(60).mean()
                     df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
 
+                    # 解耦：統一呼叫計算所有指標
                     df = core.ScanEngine.calculate_all_phase1_scores(df, CONFIG)
                     best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
 
@@ -61,6 +62,7 @@ def run_full_scan():
                         vol_mult = (t_row['Volume_Lots'] / prev_vol) if pd.notna(prev_vol) and prev_vol > 0 else 0.0
 
                         if t_row.get('Vol_MA20', 0) >= CONFIG["min_vol_ma20"]:
+                            # 解耦：委派給 ScanEngine
                             is_pass, combo_score = core.ScanEngine.check_algo_pass(t_row, CONFIG, CONFIG['algo_mode'])
                             if is_pass and (combo_score > best_combined_score or best_row is None):
                                 best_combined_score, best_row, best_offset, best_vol_mult = combo_score, t_row, offset, vol_mult
@@ -110,7 +112,7 @@ def run_full_scan():
                         rec_status = "✅ 建議參考" if float(best_row['K']) < CONFIG.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
                         adv_src = adv_60m_data if pass_60m_adv and adv_60m_data is not None else best_row
 
-                        reversal_candidates[ticker] = {
+                        base_info = {
                             "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                             "_Pass_60m_Adv": pass_60m_adv, "_Adv_60m_Data": adv_60m_data,
                             "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
@@ -123,23 +125,17 @@ def run_full_scan():
                             "月均量(張)": int(best_row['Vol_MA20']),
                             "DIF": round(float(best_row['MACD']), 3),
                             "當日KD(K值)": round(float(best_row['K']), 2),
-                            "反轉分數": round(float(best_row['Candle_Score']), 2),
-                            "VCP分數": round(float(best_row['VCP_Score']), 2),
-                            "共振分數": round(float(best_row['Reso_Score']), 2),
-                            "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否",
-                            "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
-                            "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
-                            "左腳(Low1)": round(float(adv_src['Adv_Low_1']), 2) if pd.notna(adv_src.get('Adv_Low_1')) else "-",
-                            "破底(Low2/停損)": round(float(adv_src['Adv_Low_2']), 2) if pd.notna(adv_src.get('Adv_Low_2')) else "-",
-                            "上影線頸線": round(float(adv_src['Adv_Neckline_1']), 2) if pd.notna(adv_src.get('Adv_Neckline_1')) else "-",
-                            "右肩回測價": round(float(adv_src['Adv_Support_RS']), 2) if pd.notna(adv_src.get('Adv_Support_RS')) else "-",
-                            "預估1段目標": round(float(adv_src['Adv_Target_1x']), 2) if pd.notna(adv_src.get('Adv_Target_1x')) else "-",
-                            "預估3段目標": round(float(adv_src['Adv_Target_3x']), 2) if pd.notna(adv_src.get('Adv_Target_3x')) else "-",
                             "進場位置建議": rec_status,
                             "盤整過濾": "✅ 盤整中(建議停用指標)" if last_expert['RSI盤整'] else "趨勢盤",
                             "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
                             "多週期KD": core.ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
                         }
+                        
+                        # 解耦：動態載入各個註冊演算法的評估欄位
+                        dynamic_metrics = core.ScanEngine.get_all_metrics(best_row, adv_src)
+                        base_info.update(dynamic_metrics)
+                        
+                        reversal_candidates[ticker] = base_info
                 except Exception: continue
         except Exception: pass
         time.sleep(1.0)
@@ -223,12 +219,18 @@ def run_full_scan():
 
     res_df = pd.DataFrame(final_results)
     
+    # 解耦：動態產生 DataFrame 欄位順序，不依賴寫死名稱
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
     base_cols.extend([
-        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '*回測走揚年線', '*年線回測分數', '長下引突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
-        '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
-        '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
+        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態'
+    ])
+    
+    base_cols.extend(core.ScanEngine.get_all_metric_keys())
+    
+    base_cols.extend([
+        '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+        '當日KD(K值)', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', '當日收盤', '月均量(張)'
     ])
     if CONFIG["use_weekly_filter"]:
         insert_idx = base_cols.index('盤整過濾') + 1
@@ -239,21 +241,28 @@ def run_full_scan():
     if CONFIG["show_ma120_slope"]: base_cols.append('半年線斜率(%)')
 
     cols = base_cols + [c for c in res_df.columns if '背離' in c and c not in base_cols]
-    res_df = res_df[[c for c in cols if c in res_df.columns]].sort_values(by=["*年線回測分數", "共振分數", "反轉分數", "VCP分數"], ascending=[False, False, False, False]).reset_index(drop=True)
-    res_df.index = res_df.index + 1
+    if not res_df.empty:
+        res_df = res_df[[c for c in cols if c in res_df.columns]]
+        # 避免排序欄位缺失報錯
+        sort_keys = [k for k in ["*年線回測分數", "共振分數", "反轉分數", "VCP分數"] if k in res_df.columns]
+        if sort_keys:
+            res_df = res_df.sort_values(by=sort_keys, ascending=[False]*len(sort_keys)).reset_index(drop=True)
+        res_df.index = res_df.index + 1
 
-    print("📊 掃描完成！最終報表標的預覽：")
-    print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態']].to_string())
+        print("📊 掃描完成！最終報表標的預覽：")
+        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態']].to_string())
 
-    webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
-    token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
-    if webhook_url and token:
-        file_name = f"auto_scan_all_{datetime.date.today().strftime('%Y-%m-%d')}.csv"
-        csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
-        print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
-        success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=csv_bytes)
-        print(f"✅ 上傳結果: {msg}")
-    else: print("⚠️ 未檢測到 GAS_WEBHOOK_URL，略過上傳。")
+        webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
+        token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
+        if webhook_url and token:
+            file_name = f"auto_scan_all_{datetime.date.today().strftime('%Y-%m-%d')}.csv"
+            csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
+            print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
+            success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, csv_bytes=csv_bytes)
+            print(f"✅ 上傳結果: {msg}")
+        else: print("⚠️ 未檢測到 GAS_WEBHOOK_URL，略過上傳。")
+    else:
+        print("💡 第一階段入選標的，在經過第二階段條件篩選後無一達標。")
 
 if __name__ == "__main__":
     run_full_scan()
