@@ -164,15 +164,15 @@ if selected_page == "📊 單檔深度解析":
                 st.subheader(f"📊 【{stock_name} ({real_ticker})】 深度解析與策略判定")
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
-                    rev_score = round(last_row['Candle_Score'], 2)
+                    rev_score = round(last_row.get('Candle_Score', 0), 2)
                     rev_status = "✅ 達標入選" if rev_score >= st.session_state.min_score else "❌ 未達標"
                     st.info(f"**底部翻轉分數：{rev_score}** ({rev_status})\n\n*(門檻：{st.session_state.min_score} 分)*")
                 with col_b:
-                    vcp_score = round(last_row['VCP_Score'], 2)
+                    vcp_score = round(last_row.get('VCP_Score', 0), 2)
                     vcp_status = "✅ 達標入選" if vcp_score >= st.session_state.min_vcp_score else "❌ 未達標"
                     st.success(f"**VCP 收斂分數：{vcp_score}** ({vcp_status})\n\n*(門檻：{st.session_state.min_vcp_score} 分)*")
                 with col_c:
-                    reso_score = round(last_row['Reso_Score'], 2)
+                    reso_score = round(last_row.get('Reso_Score', 0), 2)
                     reso_status = "✅ 達標入選" if reso_score >= st.session_state.min_reso_score else "❌ 未達標"
                     st.warning(f"**指標共振分數：{reso_score}** ({reso_status})\n\n*(門檻：{st.session_state.min_reso_score} 分)*")
                 st.markdown("---")
@@ -226,8 +226,9 @@ if selected_page == "📊 單檔深度解析":
                 ax2.set_ylabel('Momentum', fontsize=12)
                 ax2.grid(True, linestyle='--', alpha=0.5); ax2.legend(loc='upper left')
 
-                cps_colors = ['#d62728' if val > 0 else '#2ca02c' for val in plot_df['Candle_Score']]
-                ax3.bar(plot_df.index, plot_df['Candle_Score'], color=cps_colors, alpha=0.7, label='Rev Score')
+                cps_colors = ['#d62728' if val > 0 else '#2ca02c' for val in plot_df.get('Candle_Score', [0]*len(plot_df))]
+                if 'Candle_Score' in plot_df:
+                    ax3.bar(plot_df.index, plot_df['Candle_Score'], color=cps_colors, alpha=0.7, label='Rev Score')
                 ax3.axhline(0, color='black', linestyle='-', linewidth=1.0)
                 ax3.axhline(st.session_state.min_score, color='red', linestyle=':', alpha=0.6, linewidth=1.5, label='Min Rev Threshold')
                 ax3.set_ylabel('Algorithm Score', fontsize=12)
@@ -377,6 +378,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                         df['KD_Cross_Recent'] = df['KD_Cross'].rolling(window=config_dict["reso_cross_days"], min_periods=1).max() >= 1
                         df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=config_dict["reso_cross_days"], min_periods=1).max() >= 1
 
+                        # 解耦：呼叫統一方法
                         df = core.ScanEngine.calculate_all_phase1_scores(df, config_dict)
                         if scan_target_mode == "指定個股測試":
                             st.session_state.test_stock_df = pd.concat([df, expert_res_df], axis=1)
@@ -392,6 +394,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                             vol_mult = (t_row['Volume_Lots'] / prev_vol) if pd.notna(prev_vol) and prev_vol > 0 else 0.0
 
                             if t_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"] or force_pass:
+                                # 解耦：委派給 ScanEngine
                                 is_pass, combo = core.ScanEngine.check_algo_pass(t_row, config_dict, algo_mode, force_pass)
                                 if is_pass and (combo > best_combined_score or best_row is None):
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
@@ -446,7 +449,8 @@ elif selected_page == "🚀 全市場智慧掃描":
                             rec_status = "✅ 建議參考" if float(best_row['K']) < config_dict.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
                             adv_src = adv_60m_data if pass_60m_adv and adv_60m_data is not None else best_row
 
-                            reversal_candidates[ticker] = {
+                            # 建構基礎報告結構
+                            base_info = {
                                 "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                 "_Pass_60m_Adv": pass_60m_adv, "_Adv_60m_Data": adv_60m_data,
                                 "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
@@ -457,20 +461,16 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 "DIF": round(float(best_row['MACD']), 3), "當日KD(K值)": round(float(best_row['K']), 2),
                                 "KD金叉判定": "✅ 是" if best_row['KD_Cross_Recent'] else "❌ 否",
                                 "MACD金叉判定": "✅ 是" if best_row['MACD_Cross_Recent'] else "❌ 否",
-                                "反轉分數": round(float(best_row['Candle_Score']), 2), "VCP分數": round(float(best_row['VCP_Score']), 2), "共振分數": round(float(best_row['Reso_Score']), 2),
-                                "量價雙背離": "✅ 是" if best_row.get('PriceVol_Div_Pass') else "❌ 否", "長下引突破": "✅ 是" if best_row.get('Breakout_Signal') else "❌ 否",
-                                "低位量縮突破": "✅ 是" if best_row.get('LowPos_Breakout_Pass') else "❌ 否",
-                                "*回測走揚年線": "❌ 否", "*年線回測分數": 0.0,
-                                "左腳(Low1)": round(float(adv_src['Adv_Low_1']), 2) if pd.notna(adv_src.get('Adv_Low_1')) else "-",
-                                "破底(Low2/停損)": round(float(adv_src['Adv_Low_2']), 2) if pd.notna(adv_src.get('Adv_Low_2')) else "-",
-                                "上影線頸線": round(float(adv_src['Adv_Neckline_1']), 2) if pd.notna(adv_src.get('Adv_Neckline_1')) else "-",
-                                "右肩回測價": round(float(adv_src['Adv_Support_RS']), 2) if pd.notna(adv_src.get('Adv_Support_RS')) else "-",
-                                "預估1段目標": round(float(adv_src['Adv_Target_1x']), 2) if pd.notna(adv_src.get('Adv_Target_1x')) else "-",
-                                "預估3段目標": round(float(adv_src['Adv_Target_3x']), 2) if pd.notna(adv_src.get('Adv_Target_3x')) else "-",
                                 "進場位置建議": rec_status, "盤整過濾": "✅ 盤整中" if last_expert['RSI盤整'] else "趨勢盤",
                                 "建議水位": core.ExpertTradingStrategy.get_position_advice(last_expert['多空指標數']),
                                 "多週期KD": core.ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
                             }
+                            
+                            # 解耦：動態整合所有演算法的專屬評估指標與分數
+                            dynamic_metrics = core.ScanEngine.get_all_metrics(best_row, adv_src)
+                            base_info.update(dynamic_metrics)
+                            
+                            reversal_candidates[ticker] = base_info
                     except Exception: pass
             except Exception: pass
             progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
@@ -549,19 +549,31 @@ elif selected_page == "🚀 全市場智慧掃描":
         status_text.empty(); progress_bar.empty()
         res_df = pd.DataFrame(final_results)
 
+        # 解耦：動態串接欄位，不再寫死所有的指標名稱
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
         base_cols.extend([
-            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '當日KD(K值)', '左腳(Low1)', '破底(Low2/停損)', '上影線頸線', '右肩回測價', '預估1段目標', '預估3段目標',
-            '*回測走揚年線', '*年線回測分數', '長下引突破', '低位量縮突破', '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
-            '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '反轉分數', 'VCP分數', '共振分數', '當日收盤', '月均量(張)'
+            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '當日KD(K值)'
+        ])
+        
+        # 加入所有註冊演算法的動態欄位
+        base_cols.extend(core.ScanEngine.get_all_metric_keys())
+        
+        base_cols.extend([
+            '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+            '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '當日收盤', '月均量(張)'
         ])
         if config_dict["use_weekly_filter"]: base_cols.extend(['週K共振', '週K背離'])
         base_cols.extend(['年線/半年線空排', '年線斜率(%)', '半年線斜率(%)'])
 
         cols = base_cols + [c for c in res_df.columns if '背離' in c and c not in base_cols]
         if not res_df.empty:
-            res_df = res_df[[c for c in cols if c in res_df.columns]].sort_values(by=["*年線回測分數", "共振分數", "反轉分數", "VCP分數"], ascending=False).reset_index(drop=True)
+            res_df = res_df[[c for c in cols if c in res_df.columns]]
+            
+            # 使用存在的欄位作為排序條件，避免 KeyError
+            sort_keys = [k for k in ["*年線回測分數", "共振分數", "反轉分數", "VCP分數"] if k in res_df.columns]
+            if sort_keys:
+                res_df = res_df.sort_values(by=sort_keys, ascending=False).reset_index(drop=True)
             res_df.index = res_df.index + 1
 
         st.session_state.scan_res_df, st.session_state.scan_algo_mode, st.session_state.market_info = res_df, algo_mode, market_info
