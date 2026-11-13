@@ -575,7 +575,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         st.session_state.scan_res_df, st.session_state.scan_algo_mode, st.session_state.market_info = res_df, algo_mode, market_info
         st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔標的。"
 
-        # === Google Drive 自動上傳邏輯 (嚴格使用 Excel 格式) ===
+        # === Google Drive 自動上傳邏輯 (強制使用 xlsx 標準寫入) ===
         if config_dict.get("auto_upload_gdrive", False) and not res_df.empty:
             webhook_url = ""
             token = ""
@@ -591,7 +591,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
                 
                 try:
-                    # 透過 openpyxl 輸出標準二進位 Excel 格式
+                    # 強制採用 openpyxl 輸出，保證產生現代化的標準 .xlsx 檔，避免相容性錯誤
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                         res_df.to_excel(writer, index=False)
@@ -601,7 +601,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                     file_name = f"auto_scan_all_{timestamp}.xlsx"
                     success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, file_bytes=xlsx_bytes)
                     if success:
-                        st.session_state.upload_msg = f"✅ 報表已自動上傳至 Google Drive: {msg} (請確保 GAS 已更新接收設定)"
+                        st.session_state.upload_msg = f"✅ 報表已自動上傳至 Google Drive: {msg} (請確保 GAS 已正確部署新版)"
                     else:
                         st.session_state.upload_msg = f"⚠️ Google Drive 上傳失敗：{msg}"
                 except ImportError:
