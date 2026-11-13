@@ -575,7 +575,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         st.session_state.scan_res_df, st.session_state.scan_algo_mode, st.session_state.market_info = res_df, algo_mode, market_info
         st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔標的。"
 
-        # === Google Drive 自動上傳邏輯 (本地不存，記憶體直接上傳) ===
+        # === Google Drive 自動上傳邏輯 (嚴格使用 Excel 格式) ===
         if config_dict.get("auto_upload_gdrive", False) and not res_df.empty:
             webhook_url = ""
             token = ""
@@ -591,7 +591,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
                 
                 try:
-                    # 嚴格封裝 Excel 寫入，確保結構完整
+                    # 透過 openpyxl 輸出標準二進位 Excel 格式
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                         res_df.to_excel(writer, index=False)
@@ -601,7 +601,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                     file_name = f"auto_scan_all_{timestamp}.xlsx"
                     success, msg = core.GoogleDriveUploader.upload(file_name, webhook_url, token, file_bytes=xlsx_bytes)
                     if success:
-                        st.session_state.upload_msg = f"✅ 報表已自動上傳至 Google Drive: {msg}"
+                        st.session_state.upload_msg = f"✅ 報表已自動上傳至 Google Drive: {msg} (請確保 GAS 已更新接收設定)"
                     else:
                         st.session_state.upload_msg = f"⚠️ Google Drive 上傳失敗：{msg}"
                 except ImportError:
@@ -637,7 +637,6 @@ elif selected_page == "🚀 全市場智慧掃描":
             tw_tz = datetime.timezone(datetime.timedelta(hours=8))
             timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
             try:
-                # 前端介面按鈕下載也採用嚴格封裝
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     st.session_state.scan_res_df.to_excel(writer, index=False)
@@ -646,7 +645,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 file_name = f"stock_scan_results_{timestamp}.xlsx"
                 st.download_button(label="📥 下載建議清單 (Excel)", data=buffer.read(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
             except ImportError:
-                st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。請於環境配置或 requirements.txt 中加入 `openpyxl` 以啟用 Excel 匯出功能。")
+                st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。")
                 csv = st.session_state.scan_res_df.to_csv(index=False).encode('utf-8-sig')
                 file_name_csv = f"stock_scan_results_{timestamp}.csv"
                 st.download_button(label="📥 下載建議清單 (CSV 備用)", data=csv, file_name=file_name_csv, mime='text/csv')
@@ -799,7 +798,7 @@ elif selected_page == "📑 財報三表地雷掃描":
                         file_name = f"financial_cross_audit_{timestamp}.xlsx"
                         st.download_button(label="📥 下載三表交叉財報健檢報告 (Excel)", data=buffer.read(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                     except ImportError:
-                        st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。請於環境配置或 requirements.txt 中加入 `openpyxl` 以啟用 Excel 匯出功能。")
+                        st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。")
                         csv = batch_df.to_csv(index=False).encode('utf-8-sig')
                         file_name_csv = f"financial_cross_audit_{timestamp}.csv"
                         st.download_button(label="📥 下載三表交叉財報健檢報告 (CSV 備用)", data=csv, file_name=file_name_csv, mime='text/csv')
