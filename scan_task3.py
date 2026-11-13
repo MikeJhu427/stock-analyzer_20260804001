@@ -54,7 +54,6 @@ def run_full_scan():
                     df['MA60'] = df['Close'].rolling(60).mean()
                     df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
 
-                    # 解耦：統一呼叫計算所有指標
                     df = core.ScanEngine.calculate_all_phase1_scores(df, CONFIG)
                     best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
 
@@ -65,7 +64,6 @@ def run_full_scan():
                         vol_mult = (t_row['Volume_Lots'] / prev_vol) if pd.notna(prev_vol) and prev_vol > 0 else 0.0
 
                         if t_row.get('Vol_MA20', 0) >= CONFIG["min_vol_ma20"]:
-                            # 解耦：委派給 ScanEngine
                             is_pass, combo_score = core.ScanEngine.check_algo_pass(t_row, CONFIG, CONFIG['algo_mode'])
                             if is_pass and (combo_score > best_combined_score or best_row is None):
                                 best_combined_score, best_row, best_offset, best_vol_mult = combo_score, t_row, offset, vol_mult
@@ -134,7 +132,6 @@ def run_full_scan():
                             "多週期KD": core.ExpertTradingStrategy.get_multi_tf_advice(last_expert['週KD多'], last_expert['日KD多'])
                         }
                         
-                        # 解耦：動態載入各個註冊演算法的評估欄位
                         dynamic_metrics = core.ScanEngine.get_all_metrics(best_row, adv_src)
                         base_info.update(dynamic_metrics)
                         
@@ -222,7 +219,6 @@ def run_full_scan():
 
     res_df = pd.DataFrame(final_results)
     
-    # 解耦：動態產生 DataFrame 欄位順序，不依賴寫死名稱
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
     base_cols.extend([
@@ -246,7 +242,6 @@ def run_full_scan():
     cols = base_cols + [c for c in res_df.columns if '背離' in c and c not in base_cols]
     if not res_df.empty:
         res_df = res_df[[c for c in cols if c in res_df.columns]]
-        # 避免排序欄位缺失報錯
         sort_keys = [k for k in ["*年線回測分數", "共振分數", "反轉分數", "VCP分數"] if k in res_df.columns]
         if sort_keys:
             res_df = res_df.sort_values(by=sort_keys, ascending=[False]*len(sort_keys)).reset_index(drop=True)
@@ -263,19 +258,12 @@ def run_full_scan():
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
-                # 產出 XLSX 二進位資料
                 buffer = io.BytesIO()
                 res_df.to_excel(buffer, index=False, engine='openpyxl')
                 xlsx_bytes = buffer.getvalue()
                 
-                # 備份一份至本地目錄
-                with open(file_name, "wb") as f:
-                    f.write(xlsx_bytes)
-                print(f"💾 已儲存本地檔案備份: {file_name}")
-
                 print(f"☁️ 正在將報表上傳至 Google Drive: {file_name} ...")
                 
-                # 優化：為避免 GAS 將上傳的 Excel 檔案預設識別為純文字 CSV，明確指定試算表的 MIME Type
                 encoded_data = base64.b64encode(xlsx_bytes).decode('utf-8')
                 payload = {
                     "token": token,
@@ -284,7 +272,6 @@ def run_full_scan():
                     "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 }
                 
-                # 繞過舊版的 core.GoogleDriveUploader，直接發送帶有 MIME Type 的新結構請求
                 response = requests.post(webhook_url, data=payload, timeout=30, verify=False)
                 
                 try:
@@ -298,10 +285,6 @@ def run_full_scan():
                 print("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)，將自動降級為 CSV 格式進行上傳。")
                 file_name_csv = f"auto_scan_all_{timestamp}.csv"
                 csv_bytes = res_df.to_csv(index=False).encode('utf-8-sig')
-                
-                with open(file_name_csv, "wb") as f:
-                    f.write(csv_bytes)
-                print(f"💾 已儲存本地檔案備份: {file_name_csv}")
                 
                 success, msg = core.GoogleDriveUploader.upload(file_name_csv, webhook_url, token, csv_bytes=csv_bytes)
                 print(f"✅ 上傳結果: {msg}")
