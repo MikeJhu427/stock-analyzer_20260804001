@@ -408,7 +408,7 @@ class VCPStrategy:
 class DivergenceStrategy:
     @staticmethod
     def check_bottom_divergence(df, price_col='Low', ind_col='K', cross_col1='K', cross_col2='D',
-        recent_w=5, older_w=20, recent_lows_cnt=0, older_lows_cnt=0, pivot_left=0, pivot_right=0, require_cross_confirm=True, cross_days=3, require_higher_low=False):
+        recent_w=5, older_w=20, recent_lows_cnt=0, older_lows_cnt=0, pivot_left=0, pivot_right=0, require_cross_confirm=True, cross_days=3):
         if len(df) < recent_w + older_w:
             return False
             
@@ -423,11 +423,7 @@ class DivergenceStrategy:
         prices, inds = df[price_col].values, df[ind_col].values
         
         if recent_lows_cnt == 0 and older_lows_cnt == 0 and pivot_left == 0 and pivot_right == 0:
-            if require_higher_low:
-                cond_price = (np.min(prices[recent_start:]) >= np.min(prices[older_start:older_end]) * 0.98) and (np.min(prices[recent_start:]) <= np.min(prices[older_start:older_end]) * 1.05)
-            else:
-                cond_price = (np.min(prices[recent_start:]) <= np.min(prices[older_start:older_end]) * 1.02)
-            return cond_price and (np.min(inds[recent_start:]) > np.min(inds[older_start:older_end]))
+            return (np.min(prices[recent_start:]) <= np.min(prices[older_start:older_end]) * 1.02) and (np.min(inds[recent_start:]) > np.min(inds[older_start:older_end]))
             
         def get_valid_pivots_iloc(start_loc, end_loc):
             pivots = []
@@ -455,13 +451,7 @@ class DivergenceStrategy:
             for o_idx in o_pivots:
                 r_i_val = np.min(inds[max(recent_start, r_idx-2) : min(len(inds), r_idx+3)])
                 o_i_val = np.min(inds[max(older_start, o_idx-2) : min(older_end, o_idx+3)])
-                
-                if require_higher_low:
-                    cond_price_match = (prices[r_idx] >= prices[o_idx] * 0.98) and (prices[r_idx] <= prices[o_idx] * 1.05)
-                else:
-                    cond_price_match = prices[r_idx] <= prices[o_idx] * 1.02
-                    
-                if cond_price_match and r_i_val > o_i_val:
+                if prices[r_idx] <= prices[o_idx] * 1.02 and r_i_val > o_i_val:
                     return True
                     
         return False
@@ -535,7 +525,7 @@ class IndicatorResonanceStrategy:
 
 class PriceVolDivergenceStrategy:
     @staticmethod
-    def evaluate(df, recent_w=5, older_w=20, rl_cnt=0, ol_cnt=0, p_left=0, p_right=0, req_cross=True, c_days=3, price_col='Low', advanced_mode=False):
+    def evaluate(df, recent_w=5, older_w=20, rl_cnt=0, ol_cnt=0, p_left=0, p_right=0, req_cross=True, c_days=3, price_col='Low'):
         res = pd.Series(False, index=df.index)
         if len(df) < recent_w + older_w + 5:
             return res
@@ -547,20 +537,18 @@ class PriceVolDivergenceStrategy:
         
         valid_idx = np.where(cond_pct & cond_vol_abs & cond_vol_mult)[0]
         
-        max_buffer = 12 if advanced_mode else 25
-        
         for idx in valid_idx:
             d_kd = False
             d_macd = False
-            for buffer in range(0, max_buffer):
+            for buffer in range(0, 25):
                 check_idx = idx - buffer
                 if check_idx < recent_w + older_w:
                     continue
                 sub_df = df.iloc[:check_idx+1]
                 if not d_kd:
-                    d_kd = DivergenceStrategy.check_bottom_divergence(sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, require_higher_low=advanced_mode)
+                    d_kd = DivergenceStrategy.check_bottom_divergence(sub_df, price_col, 'K', 'K', 'D', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days)
                 if not d_macd:
-                    d_macd = DivergenceStrategy.check_bottom_divergence(sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days, require_higher_low=advanced_mode)
+                    d_macd = DivergenceStrategy.check_bottom_divergence(sub_df, price_col, 'MACD_Hist', 'MACD', 'MACD_Signal', recent_w, older_w, rl_cnt, ol_cnt, p_left, p_right, req_cross, c_days)
                 if d_kd and d_macd:
                     break
             if d_kd and d_macd:
@@ -692,9 +680,14 @@ class MA240PullbackRightSideStrategy:
     @staticmethod
     def evaluate_ma_entanglement(long_df):
         if long_df is None or len(long_df) < 240:
-            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
+            return {
+                "ma_diff_pct": np.nan, "ma_tangled": "無資料",
+                "ma_short_diff_pct": np.nan, "ma_short_tangled": "無資料"
+            }
         
         close = long_df['Close']
+        ma5 = close.rolling(5).mean().iloc[-1]
+        ma10 = close.rolling(10).mean().iloc[-1]
         ma20 = close.rolling(20).mean().iloc[-1]
         ma60 = close.rolling(60).mean().iloc[-1]
         ma120 = close.rolling(120).mean().iloc[-1]
@@ -706,20 +699,36 @@ class MA240PullbackRightSideStrategy:
         ma120_slope = (ma120 - ma120_prev) / (ma120_prev + 1e-8) * 100
         ma240_slope = (ma240 - ma240_prev) / (ma240_prev + 1e-8) * 100
         
-        mas = [ma20, ma60, ma120, ma240]
-        if any(pd.isna(mas)):
-            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
+        # 第一組 (60, 120, 240)
+        mas_long = [ma60, ma120, ma240]
+        if any(pd.isna(mas_long)):
+            diff_pct_long = np.nan
+            tangled_long = "無資料"
+        else:
+            ma_long_max = max(mas_long)
+            ma_long_min = min(mas_long)
+            diff_pct_long = (ma_long_max - ma_long_min) / (ma_long_min + 1e-8) * 100
+            is_120_flat = abs(ma120_slope) < 0.05
+            is_240_flat = abs(ma240_slope) < 0.05
+            tangled_long = "均線糾結" if (diff_pct_long < 6.0 and is_120_flat and is_240_flat) else "否"
+
+        # 第二組 (5, 10, 20)
+        mas_short = [ma5, ma10, ma20]
+        if any(pd.isna(mas_short)):
+            diff_pct_short = np.nan
+            tangled_short = "無資料"
+        else:
+            ma_short_max = max(mas_short)
+            ma_short_min = min(mas_short)
+            diff_pct_short = (ma_short_max - ma_short_min) / (ma_short_min + 1e-8) * 100
+            tangled_short = "短均線糾結" if diff_pct_short < 6.0 else "否"
             
-        ma_max = max(mas)
-        ma_min = min(mas)
-        diff_pct = (ma_max - ma_min) / (ma_min + 1e-8) * 100
-        
-        is_120_flat = abs(ma120_slope) < 0.05
-        is_240_flat = abs(ma240_slope) < 0.05
-        
-        tangled = "均線糾結" if (diff_pct < 6.0 and is_120_flat and is_240_flat) else "否"
-        
-        return {"ma_diff_pct": round(diff_pct, 2), "ma_tangled": tangled}
+        return {
+            "ma_diff_pct": round(diff_pct_long, 2) if pd.notna(diff_pct_long) else np.nan, 
+            "ma_tangled": tangled_long,
+            "ma_short_diff_pct": round(diff_pct_short, 2) if pd.notna(diff_pct_short) else np.nan,
+            "ma_short_tangled": tangled_short
+        }
 
 class LowPositionShrinkVolumeBreakoutStrategy:
     @staticmethod
@@ -958,7 +967,7 @@ class AlgoPriceVolDiv(IScanAlgorithm):
             df, recent_w=config.get("div_recent_w"), older_w=config.get("div_older_w"),
             rl_cnt=config.get("recent_lows_cnt"), ol_cnt=config.get("older_lows_cnt"),
             p_left=config.get("pivot_left"), p_right=config.get("pivot_right"),
-            req_cross=config.get("require_cross_confirm"), c_days=config.get("reso_cross_days"), price_col=price_col, advanced_mode=False
+            req_cross=config.get("require_cross_confirm"), c_days=config.get("reso_cross_days"), price_col=price_col
         )
         return df
     def check_pass(self, row, config):
@@ -970,28 +979,6 @@ class AlgoPriceVolDiv(IScanAlgorithm):
     def get_metrics(self, row, adv_src=None):
         val = row.get('PriceVol_Div_Pass', False) if isinstance(row, pd.Series) else (row.get('量價雙背離') == '✅ 是')
         return {"量價雙背離": "✅ 是" if val else "❌ 否"}
-
-class AlgoPriceVolDivAdvanced(IScanAlgorithm):
-    @property
-    def name(self): return '量價雙背離(進階1)'
-    def calculate(self, df, config):
-        price_col = 'Low' if config.get("reso_price_basis") == "最低價 (Low)" else 'Close'
-        df['PriceVol_Div_Adv_Pass'] = PriceVolDivergenceStrategy.evaluate(
-            df, recent_w=config.get("div_recent_w"), older_w=config.get("div_older_w"),
-            rl_cnt=config.get("recent_lows_cnt"), ol_cnt=config.get("older_lows_cnt"),
-            p_left=config.get("pivot_left"), p_right=config.get("pivot_right"),
-            req_cross=config.get("require_cross_confirm"), c_days=config.get("reso_cross_days"), price_col=price_col, advanced_mode=True
-        )
-        return df
-    def check_pass(self, row, config):
-        passed = bool(row.get('PriceVol_Div_Adv_Pass', False))
-        return passed, 25.0 if passed else 0.0
-    def get_tags(self, row, config):
-        val = row.get('PriceVol_Div_Adv_Pass', False) if isinstance(row, pd.Series) else (row.get('量價雙背離(進階1)') == '✅ 是')
-        return ["量價雙背離(進階1)"] if val else []
-    def get_metrics(self, row, adv_src=None):
-        val = row.get('PriceVol_Div_Adv_Pass', False) if isinstance(row, pd.Series) else (row.get('量價雙背離(進階1)') == '✅ 是')
-        return {"量價雙背離(進階1)": "✅ 是" if val else "❌ 否"}
 
 class AlgoLongLowerShadowBreakout(IScanAlgorithm):
     @property
@@ -1081,7 +1068,6 @@ ALGO_REGISTRY = [
     AlgoVCP(),
     AlgoIndicatorResonance(),
     AlgoPriceVolDiv(),
-    AlgoPriceVolDivAdvanced(),
     AlgoLongLowerShadowBreakout(),
     AlgoMA240Pullback(),
     AlgoLowPosBreakout(),
@@ -1823,4 +1809,3 @@ class QuantPatternEngine:
         active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
         
         return {'W': active_w[-1] if active_w else None, 'M': active_m[-1] if active_m else None}
-
