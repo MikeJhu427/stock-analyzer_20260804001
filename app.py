@@ -441,8 +441,8 @@ elif selected_page == "🚀 全市場智慧掃描":
                             if config_dict["enable_30d_backtest"]:
                                 for b_offset in range(best_offset + 1, min(len(df)-1, best_offset + 31)):
                                     c_row = df.iloc[-1 - b_offset]
-                                    if c_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"] or force_pass:
-                                        c_pass, _ = core.ScanEngine.check_algo_pass(c_row, config_dict, algo_mode, force_pass)
+                                    if c_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"]:
+                                        c_pass, _ = core.ScanEngine.check_algo_pass(c_row, config_dict, algo_mode, False)
                                         if c_pass:
                                             count_30d += 1
 
