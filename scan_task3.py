@@ -156,6 +156,8 @@ def run_full_scan():
             item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
             item['均線最大最小差異百分比(%)'] = "-"
             item['均線糾結狀態'] = "-"
+            item['短均線最大最小差異百分比(%)'] = "-"
+            item['短均線糾結狀態'] = "-"
 
             try:
                 if isinstance(long_data.columns, pd.MultiIndex):
@@ -171,6 +173,8 @@ def run_full_scan():
                         ent_res = core.MA240PullbackRightSideStrategy.evaluate_ma_entanglement(long_df)
                         item['均線最大最小差異百分比(%)'] = ent_res['ma_diff_pct']
                         item['均線糾結狀態'] = ent_res['ma_tangled']
+                        item['短均線最大最小差異百分比(%)'] = ent_res['ma_short_diff_pct']
+                        item['短均線糾結狀態'] = ent_res['ma_short_tangled']
 
                     if len(long_df) >= 120:
                         ma120 = long_df['Close'].rolling(120).mean()
@@ -219,8 +223,12 @@ def run_full_scan():
     
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
+    
+    # === 更新兩組均線糾結狀態 ===
     base_cols.extend([
-        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態'
+        '演算法建議結果', 
+        '均線最大最小差異百分比(%)', '均線糾結狀態', 
+        '短均線最大最小差異百分比(%)', '短均線糾結狀態'
     ])
     
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
@@ -246,7 +254,7 @@ def run_full_scan():
         res_df.index = res_df.index + 1
 
         print("📊 掃描完成！最終報表標的預覽：")
-        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態']].to_string())
+        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線最大最小差異百分比(%)', '短均線最大最小差異百分比(%)']].to_string())
 
         webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
         token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
@@ -257,7 +265,7 @@ def run_full_scan():
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
-                # 強制採用 openpyxl 輸出，保證產生現代化的標準 .xlsx 檔，避免相容性錯誤
+                # 透過 openpyxl 輸出標準二進位 Excel 格式
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     res_df.to_excel(writer, index=False)
