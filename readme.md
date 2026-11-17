@@ -26,7 +26,7 @@
 - 各類量化選股策略 (包含最新雙底正背離模組)
 - 量化狀態機
 - 三級備援爬蟲
-- **雲端上傳整合 (支援 JSON Base64 封裝與 .xlsx 二進位防亂碼傳輸)**
+- 雲端上傳整合
 
 ### 2) app.py（展示層 / Web UI）
 提供直覺式操作介面，包含：
@@ -39,7 +39,7 @@
 
 ### 3) scan_task3.py（排程層 / CLI）
 負責全市場兩階段快速初篩與長天期深度複審，支援：
-- **Excel (.xlsx) 標準輸出**
+- CSV 輸出
 - 定時掃描任務
 - Webhook 自動備份
 
@@ -91,15 +91,16 @@
 - Phase 2：深度複審
   - 下載 2 年長天期資料。
   - 驗證 240MA 斜率、年線支撐回測能力、週K 共振、日/60分K 雙級別背離。
+  - 分別判定「長天期 (60/120/240)」與「短天期 (5/10/20)」均線糾結狀態。
 
 #### 其他功能
 - 近 30 日觸發統計
 - 時光機回測（指定歷史基準日）
 - 設定檔管理（params_config.json）
 - 跨頁連動
-- Excel (.xlsx) / CSV 匯出
+- CSV 匯出
 - 一鍵傳送至基本面模組
-- Google Drive 自動備份 (JSON 封裝防亂碼傳輸)
+- Google Drive 自動備份
 
 ### 📑 Tab 3: 財報三表交叉健檢 V5（Fundamental Audit）
 超越傳統「紅燈數量 = 地雷」的固定邏輯，建立動態防誤判機制。
@@ -171,7 +172,7 @@
 
 ### 2) 安裝套件
 
-請將以下內容存為 `requirements.txt`（註：`openpyxl` 為產出 `.xlsx` 格式之必要套件）：
+請將以下內容存為 `requirements.txt`：
 
 ```txt
 streamlit>=1.30.0
@@ -183,7 +184,6 @@ matplotlib>=3.7.0
 beautifulsoup4>=4.12.0
 requests>=2.31.0
 urllib3>=2.0.0
-openpyxl>=3.0.10
 ```
 
 執行安裝：
@@ -217,8 +217,7 @@ python scan_task3.py
 
 ## 🔒 雲端自動備份設定（選填）
 
-若需將每日掃描產生的 Excel 報表自動上傳至 Google Drive，請設定 Google Apps Script（GAS）Webhook。
-*注意：GAS 接收端程式必須設定為接收 `application/json` 封包並解析 `e.postData.contents`，以防止 `.xlsx` 二進位傳輸亂碼。*
+若需將每日掃描產生的 CSV 報表自動上傳至 Google Drive，請設定 Google Apps Script（GAS）Webhook。
 
 ### Streamlit 應用（app.py）
 在 `.streamlit/secrets.toml` 中加入：
@@ -228,8 +227,8 @@ GAS_WEBHOOK_URL = "https://script.google.com/macros/s/你的GAS發佈ID/exec"
 GAS_SECRET_TOKEN = "你的自訂安全性Token"
 ```
 
-### GitHub Actions / 批次掃描腳本（scan_task3.py）
-設定系統（或 GitHub Secrets）環境變數：
+### 批次掃描腳本（scan_task3.py）
+設定系統環境變數：
 
 ```bash
 export GAS_WEBHOOK_URL="https://script.google.com/macros/s/你的GAS發佈ID/exec"
@@ -245,6 +244,6 @@ export GAS_SECRET_TOKEN="你的自訂安全性Token"
 - 全市場自動掃描 (結合 60分K)
 - 基本面財報診斷
 - 幾何型態與狀態機分析
-- 自動化排程與雲端備份 (穩定的 Excel 二進位傳輸架構)
+- 自動化排程與雲端備份
 
 為台股愛好者與量化交易研究者提供一套完整的分析與策略驗證框架。
