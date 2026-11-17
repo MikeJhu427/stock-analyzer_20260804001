@@ -9,3 +9,4 @@ scipy
 html5lib
 lxml
 openpyxl
+plotly
