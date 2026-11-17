@@ -141,17 +141,55 @@ with tab1:
 with tab2:
     st.markdown(f"### 🚀 全市場智慧區間掃描 (目前策略：**{st.session_state.config['algo_mode']}**)")
     
+    # === 恢復遺失的：指定個股與回測日期 UI ===
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        scan_target = st.radio("掃描範圍", ["全市場掃描", "自訂標的清單"], horizontal=True)
+        custom_tickers = ""
+        if scan_target == "自訂標的清單":
+            custom_tickers = st.text_input("輸入股票代號 (多檔以逗號分隔，如 2330, 2454)", value="2330, 2454")
+    
+    with col_s2:
+        use_backtest = st.checkbox("啟用時光機回測 (指定基準日)", value=st.session_state.config.get("use_backtest_date", False))
+        st.session_state.config["use_backtest_date"] = use_backtest
+        backtest_date = st.date_input("回測基準日", value=pd.to_datetime(st.session_state.config.get("backtest_date", datetime.date.today())))
+        st.session_state.config["backtest_date"] = str(backtest_date)
+    # ==========================================
+
     if st.button("🚀 開始智慧區間掃描", type="primary"):
         with st.spinner("正在執行全市場兩階段掃描與多級別運算，請稍候... (約需 1-3 分鐘)"):
-            stock_dict = get_all_stocks()
-            tickers = list(stock_dict.keys())
             cfg = st.session_state.config
+            
+            # 處理自訂標的
+            if scan_target == "自訂標的清單" and custom_tickers.strip():
+                raw_tickers = [x.strip() for x in custom_tickers.split(",") if x.strip()]
+                tickers = [core.resolve_ticker(t, stock_dict) for t in raw_tickers]
+            else:
+                tickers = list(stock_dict.keys())
             
             div_pairs = [(cfg["div_recent_w"], cfg["div_older_w"])] if cfg["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
             max_older_w = max(pair[1] for pair in div_pairs)
             extra_buffer_days = 30 if cfg["enable_30d_backtest"] else 0
             total_needed = cfg["lookback_start"] + max_older_w + cfg["pivot_left"] + 70 + extra_buffer_days
             dl_period = "3mo" if total_needed <= 60 else "6mo" if total_needed <= 120 else "1y"
+            
+            # 處理 yfinance 下載參數 (支援回測基準日截斷)
+            dl_kwargs = {"threads": False, "progress": False, "session": st.session_state.yf_session}
+            dl_kwargs_60m = {"interval": "60m", "threads": False, "progress": False, "session": st.session_state.yf_session}
+            
+            if use_backtest:
+                end_dt = pd.to_datetime(backtest_date) + datetime.timedelta(days=1)
+                dl_kwargs["end"] = end_dt.strftime('%Y-%m-%d')
+                dl_kwargs_60m["end"] = end_dt.strftime('%Y-%m-%d')
+                
+                start_dt = end_dt - datetime.timedelta(days=total_needed + 60) # 寬放交易日
+                dl_kwargs["start"] = start_dt.strftime('%Y-%m-%d')
+                
+                start_60m = end_dt - datetime.timedelta(days=30)
+                dl_kwargs_60m["start"] = start_60m.strftime('%Y-%m-%d')
+            else:
+                dl_kwargs["period"] = dl_period
+                dl_kwargs_60m["period"] = "1mo"
             
             reversal_candidates = {}
             chunk_size = 40
@@ -165,8 +203,8 @@ with tab2:
                 progress_bar.progress(min(1.0, i / len(tickers)))
                 
                 try:
-                    data = yf.download(chunk, period=dl_period, threads=False, progress=False, session=st.session_state.yf_session)
-                    data_60m = yf.download(chunk, period="1mo", interval="60m", threads=False, progress=False, session=st.session_state.yf_session)
+                    data = yf.download(chunk, **dl_kwargs)
+                    data_60m = yf.download(chunk, **dl_kwargs_60m)
                     
                     for ticker in chunk:
                         try:
@@ -251,7 +289,7 @@ with tab2:
                                 b_info = {
                                     "_Full_Ticker": ticker, "_Offset": best_offset, "_Daily_DF": df.copy(),
                                     "_Pass_60m_Adv": pass_60m_adv, "_Adv_60m_Data": adv_60m_data,
-                                    "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
+                                    "股票代號": ticker.split('.')[0], "股票名稱": stock_dict.get(ticker, ticker),
                                     "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                                     "近30日觸發次數": count_30d if cfg["enable_30d_backtest"] else "-",
                                     "當日收盤": round(float(best_row['Close']), 2),
@@ -278,7 +316,16 @@ with tab2:
             
             if reversal_list:
                 c_tickers = [item["_Full_Ticker"] for item in reversal_list]
-                long_data = yf.download(c_tickers, period="2y", threads=False, progress=False, session=st.session_state.yf_session)
+                
+                long_dl_kwargs = {"threads": False, "progress": False, "session": st.session_state.yf_session}
+                if use_backtest:
+                    end_dt = pd.to_datetime(backtest_date) + datetime.timedelta(days=1)
+                    long_dl_kwargs["start"] = (end_dt - datetime.timedelta(days=750)).strftime('%Y-%m-%d')
+                    long_dl_kwargs["end"] = end_dt.strftime('%Y-%m-%d')
+                else:
+                    long_dl_kwargs["period"] = "2y"
+                    
+                long_data = yf.download(c_tickers, **long_dl_kwargs)
                 
                 final_results = []
                 for item in reversal_list:
@@ -358,7 +405,6 @@ with tab2:
                 b_cols = ['股票代號', '股票名稱', '觸發日期']
                 if cfg["enable_30d_backtest"]: b_cols.append('近30日觸發次數')
                 
-                # === 兩組均線糾結狀態欄位排列 ===
                 b_cols.extend([
                     '演算法建議結果', 
                     '均線最大最小差異百分比(%)', '均線糾結狀態', 
@@ -389,7 +435,7 @@ with tab2:
                 st.session_state.scan_res_df = res_df
                 st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔標的。"
                 
-                # 執行 Google Drive 自動上傳 (JSON / Base64 / XLSX)
+                # 執行 Google Drive 自動上傳
                 if cfg.get("auto_upload_gdrive", False) and not res_df.empty:
                     webhook_url = ""
                     token = ""
