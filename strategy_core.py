@@ -680,9 +680,14 @@ class MA240PullbackRightSideStrategy:
     @staticmethod
     def evaluate_ma_entanglement(long_df):
         if long_df is None or len(long_df) < 240:
-            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
+            return {
+                "ma_long_diff_pct": np.nan, "ma_long_tangled": "無資料",
+                "ma_short_diff_pct": np.nan, "ma_short_tangled": "無資料"
+            }
         
         close = long_df['Close']
+        ma5 = close.rolling(5).mean().iloc[-1]
+        ma10 = close.rolling(10).mean().iloc[-1]
         ma20 = close.rolling(20).mean().iloc[-1]
         ma60 = close.rolling(60).mean().iloc[-1]
         ma120 = close.rolling(120).mean().iloc[-1]
@@ -694,20 +699,40 @@ class MA240PullbackRightSideStrategy:
         ma120_slope = (ma120 - ma120_prev) / (ma120_prev + 1e-8) * 100
         ma240_slope = (ma240 - ma240_prev) / (ma240_prev + 1e-8) * 100
         
-        mas = [ma20, ma60, ma120, ma240]
-        if any(pd.isna(mas)):
-            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
+        # 第一組：長天期 (60, 120, 240)
+        long_mas = [ma60, ma120, ma240]
+        if any(pd.isna(long_mas)):
+            long_diff_pct = np.nan
+            long_tangled = "無資料"
+        else:
+            long_max = max(long_mas)
+            long_min = min(long_mas)
+            long_diff_pct = (long_max - long_min) / (long_min + 1e-8) * 100
             
-        ma_max = max(mas)
-        ma_min = min(mas)
-        diff_pct = (ma_max - ma_min) / (ma_min + 1e-8) * 100
-        
-        is_120_flat = abs(ma120_slope) < 0.05
-        is_240_flat = abs(ma240_slope) < 0.05
-        
-        tangled = "均線糾結" if (diff_pct < 6.0 and is_120_flat and is_240_flat) else "否"
-        
-        return {"ma_diff_pct": round(diff_pct, 2), "ma_tangled": tangled}
+            is_120_flat = abs(ma120_slope) < 0.05
+            is_240_flat = abs(ma240_slope) < 0.05
+            
+            # 原始糾結判定邏輯移轉至此，參考長天期均線
+            long_tangled = "均線糾結" if (long_diff_pct < 6.0 and is_120_flat and is_240_flat) else "否"
+
+        # 第二組：短天期 (5, 10, 20)
+        short_mas = [ma5, ma10, ma20]
+        if any(pd.isna(short_mas)):
+            short_diff_pct = np.nan
+            short_tangled = "無資料"
+        else:
+            short_max = max(short_mas)
+            short_min = min(short_mas)
+            short_diff_pct = (short_max - short_min) / (short_min + 1e-8) * 100
+            # 短天期糾結判定 (條件放寬為單純差異小於 4%)
+            short_tangled = "均線糾結" if short_diff_pct < 4.0 else "否"
+            
+        return {
+            "ma_long_diff_pct": round(long_diff_pct, 2) if pd.notna(long_diff_pct) else np.nan,
+            "ma_long_tangled": long_tangled,
+            "ma_short_diff_pct": round(short_diff_pct, 2) if pd.notna(short_diff_pct) else np.nan,
+            "ma_short_tangled": short_tangled
+        }
 
 class LowPositionShrinkVolumeBreakoutStrategy:
     @staticmethod
