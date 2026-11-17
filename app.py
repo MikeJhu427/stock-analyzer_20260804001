@@ -487,6 +487,8 @@ elif selected_page == "🚀 全市場智慧掃描":
                     item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
                     item['均線最大最小差異百分比(%)'] = "-"
                     item['均線糾結狀態'] = "-"
+                    item['短天期均線差異(%)'] = "-"
+                    item['短均線糾結狀態'] = "-"
 
                     try:
                         if isinstance(long_data.columns, pd.MultiIndex):
@@ -501,8 +503,10 @@ elif selected_page == "🚀 全市場智慧掃描":
 
                             if len(long_df) >= 240:
                                 ent_res = core.MA240PullbackRightSideStrategy.evaluate_ma_entanglement(long_df)
-                                item['均線最大最小差異百分比(%)'] = ent_res['ma_diff_pct']
-                                item['均線糾結狀態'] = ent_res['ma_tangled']
+                                item['均線最大最小差異百分比(%)'] = ent_res['ma_long_diff_pct']
+                                item['均線糾結狀態'] = ent_res['ma_long_tangled']
+                                item['短天期均線差異(%)'] = ent_res['ma_short_diff_pct']
+                                item['短均線糾結狀態'] = ent_res['ma_short_tangled']
 
                             if len(long_df) >= 120: item['半年線斜率(%)'] = round((long_df['Close'].rolling(120).mean().iloc[-1] - long_df['Close'].rolling(120).mean().iloc[-2]) / long_df['Close'].rolling(120).mean().iloc[-2] * 100, 3)
                             if len(long_df) >= 240:
@@ -551,7 +555,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
         base_cols.extend([
-            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '當日KD(K值)'
+            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
         ])
         
         base_cols.extend(core.ScanEngine.get_all_metric_keys())
