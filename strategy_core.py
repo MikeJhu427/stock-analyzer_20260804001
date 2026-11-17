@@ -680,14 +680,9 @@ class MA240PullbackRightSideStrategy:
     @staticmethod
     def evaluate_ma_entanglement(long_df):
         if long_df is None or len(long_df) < 240:
-            return {
-                "ma_diff_pct": np.nan, "ma_tangled": "無資料",
-                "ma_short_diff_pct": np.nan, "ma_short_tangled": "無資料"
-            }
+            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
         
         close = long_df['Close']
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
         ma20 = close.rolling(20).mean().iloc[-1]
         ma60 = close.rolling(60).mean().iloc[-1]
         ma120 = close.rolling(120).mean().iloc[-1]
@@ -699,36 +694,20 @@ class MA240PullbackRightSideStrategy:
         ma120_slope = (ma120 - ma120_prev) / (ma120_prev + 1e-8) * 100
         ma240_slope = (ma240 - ma240_prev) / (ma240_prev + 1e-8) * 100
         
-        # 第一組 (60, 120, 240)
-        mas_long = [ma60, ma120, ma240]
-        if any(pd.isna(mas_long)):
-            diff_pct_long = np.nan
-            tangled_long = "無資料"
-        else:
-            ma_long_max = max(mas_long)
-            ma_long_min = min(mas_long)
-            diff_pct_long = (ma_long_max - ma_long_min) / (ma_long_min + 1e-8) * 100
-            is_120_flat = abs(ma120_slope) < 0.05
-            is_240_flat = abs(ma240_slope) < 0.05
-            tangled_long = "均線糾結" if (diff_pct_long < 6.0 and is_120_flat and is_240_flat) else "否"
-
-        # 第二組 (5, 10, 20)
-        mas_short = [ma5, ma10, ma20]
-        if any(pd.isna(mas_short)):
-            diff_pct_short = np.nan
-            tangled_short = "無資料"
-        else:
-            ma_short_max = max(mas_short)
-            ma_short_min = min(mas_short)
-            diff_pct_short = (ma_short_max - ma_short_min) / (ma_short_min + 1e-8) * 100
-            tangled_short = "短均線糾結" if diff_pct_short < 6.0 else "否"
+        mas = [ma20, ma60, ma120, ma240]
+        if any(pd.isna(mas)):
+            return {"ma_diff_pct": np.nan, "ma_tangled": "無資料"}
             
-        return {
-            "ma_diff_pct": round(diff_pct_long, 2) if pd.notna(diff_pct_long) else np.nan, 
-            "ma_tangled": tangled_long,
-            "ma_short_diff_pct": round(diff_pct_short, 2) if pd.notna(diff_pct_short) else np.nan,
-            "ma_short_tangled": tangled_short
-        }
+        ma_max = max(mas)
+        ma_min = min(mas)
+        diff_pct = (ma_max - ma_min) / (ma_min + 1e-8) * 100
+        
+        is_120_flat = abs(ma120_slope) < 0.05
+        is_240_flat = abs(ma240_slope) < 0.05
+        
+        tangled = "均線糾結" if (diff_pct < 6.0 and is_120_flat and is_240_flat) else "否"
+        
+        return {"ma_diff_pct": round(diff_pct, 2), "ma_tangled": tangled}
 
 class LowPositionShrinkVolumeBreakoutStrategy:
     @staticmethod
