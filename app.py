@@ -58,6 +58,13 @@ def get_tw_stock_name(ticker):
 def get_stock_data(symbol):
     return core.fetch_stock_data(symbol)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_volatility_monitor_report():
+    res = core.CrossMarketVolatilityMonitor.evaluate(core.get_yf_session())
+    if not res or res.get("status") != "success":
+        get_volatility_monitor_report.clear()
+    return res
+
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
 if "audit_mode" not in st.session_state: st.session_state.audit_mode = "單檔查詢"
@@ -92,6 +99,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 page_options = [
+    "🛡️ 跨市場波動率監控",
     "📊 單檔深度解析", 
     "🚀 全市場智慧掃描", 
     "📑 財報三表地雷掃描", 
@@ -101,9 +109,205 @@ page_options = [
 selected_page = st.radio("📌 快速切換功能分頁：", page_options, horizontal=True)
 
 # ----------------------------------------------------
-# 頁籤 1：單檔深度解析
+# 頁籤 1：跨市場波動率體制與避險/反彈監控
 # ----------------------------------------------------
-if selected_page == "📊 單檔深度解析":
+if selected_page == "🛡️ 跨市場波動率監控":
+    col_h1, col_h2 = st.columns([4, 1])
+    with col_h1:
+        st.write("透過純 `yfinance` 監控 `^VIX`、`^VVIX`、`^VXN` 與 `^TWII`（HV20 / ATR14% 本地波動替代指標），自動判定「戰時恐慌警戒」與「平時常態震盪」體制，提供避險預警與止跌反彈濾網。")
+    with col_h2:
+        if st.button("🔄 重新整理最新數據", type="primary", use_container_width=True):
+            get_volatility_monitor_report.clear()
+            st.rerun()
+
+    with st.spinner("⏳ 正在透過 yfinance 抓取跨市場波動率與加權指數資料..."):
+        vol_res = get_volatility_monitor_report()
+
+    if not vol_res or vol_res.get("status") != "success":
+        st.error(f"❌ {vol_res.get('msg', '無法取得波動率監控資料，請稍後再試。') if isinstance(vol_res, dict) else '資料載入失敗。'}")
+    else:
+        st.caption(f"資料更新時間：{vol_res['eval_time']} ｜ 時間戳標準：台北時間 (UTC+8) ｜ 資料來源：Yahoo Finance")
+
+        # 體制與交易訊號燈號看板
+        sev = vol_res.get("severity", "info")
+        banner_md = (
+            f"### {vol_res['regime']} ── {vol_res['state_label']}\n\n"
+            f"- **觸發依據**：{' ； '.join(vol_res['trigger_reasons']) if vol_res['trigger_reasons'] else '-'}\n"
+            f"- **操作與避險建議**：**{vol_res['advice']}**"
+        )
+        if sev == "error":
+            st.error(banner_md)
+        elif sev == "warning":
+            st.warning(banner_md)
+        elif sev == "success":
+            st.success(banner_md)
+        else:
+            st.info(banner_md)
+
+        # 關鍵觸發提醒區塊（含狀態 C HV20/ATR14% 觸發提醒、VVIX、恐慌高點下移背離、科技股高危）
+        if vol_res.get("alert_reminders"):
+            for rem in vol_res["alert_reminders"]:
+                if "🚨" in rem:
+                    st.error(rem)
+                elif "⚠️" in rem:
+                    st.warning(rem)
+                else:
+                    st.success(rem)
+
+        st.markdown("---")
+        snap = vol_res["snapshot"]
+
+        # 核心指標卡片
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "^VIX (美股大盤恐慌)",
+            f"{snap['vix']:.2f}",
+            delta=f"距5MA {snap['vix'] - snap['vix_ma5']:+.2f} | 乖離 {snap['vix_bias20']:+.1f}%",
+            delta_color="inverse"
+        )
+        m2.metric(
+            "^VXN (那斯達克科技恐慌)",
+            f"{snap['vxn']:.2f}",
+            delta=f"距5MA {snap['vxn'] - snap['vxn_ma5']:+.2f} | 乖離 {snap['vxn_bias20']:+.1f}%",
+            delta_color="inverse"
+        )
+        m3.metric(
+            "^VVIX (二階波動 / 尾部保險)",
+            f"{snap['vvix']:.2f}" if pd.notna(snap['vvix']) else "-",
+            delta=(f"距20MA {snap['vvix'] - snap['vvix_ma20']:+.2f}" if pd.notna(snap['vvix']) and pd.notna(snap['vvix_ma20']) else None),
+            delta_color="inverse"
+        )
+        m4.metric(
+            "科技股風險溢價 (VXN - VIX)",
+            f"{snap['spread']:.2f}",
+            delta=(f"日變動 {snap['spread_diff']:+.2f}" if pd.notna(snap['spread_diff']) else None),
+            delta_color="inverse"
+        )
+
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric(
+            "^TWII (台灣加權指數)",
+            f"{snap['twii']:,.2f}",
+            delta=f"距20MA {snap['twii'] - snap['twii_ma20']:+.2f}"
+        )
+        n2.metric(
+            "台股本地波動 HV20 (%)",
+            f"{snap['hv20']:.2f}%" if pd.notna(snap['hv20']) else "-",
+            delta=(f"60日百分位 {snap['hv20_pct60']:.1f}%" if pd.notna(snap['hv20_pct60']) else None),
+            delta_color="off"
+        )
+        n3.metric(
+            "台股本地波動 ATR14 (%)",
+            f"{snap['atr14_pct']:.2f}%" if pd.notna(snap['atr14_pct']) else "-",
+            delta=(f"60日百分位 {snap['atr14_pct_pct60']:.1f}%" if pd.notna(snap['atr14_pct_pct60']) else None),
+            delta_color="off"
+        )
+        c_trig = vol_res.get("c_triggers", {})
+        active_c_tags = [lbl for k, lbl in [("vvix", "VVIX"), ("hv20", "HV20"), ("atr14", "ATR14%")] if c_trig.get(k)]
+        n4.metric(
+            "避險前兆觸發源 (狀態C)",
+            " + ".join(active_c_tags) if active_c_tags else "無觸發",
+            delta="恐慌背離: 是" if vol_res.get("panic_divergence") else "恐慌背離: 否",
+            delta_color="off"
+        )
+
+        st.markdown("---")
+        st.subheader("📋 跨市場波動率與衍生指標明細")
+        metrics_df = pd.DataFrame(vol_res["metrics_table"])
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("📈 近 3 個月跨市場波動率與台股本地波動走勢")
+        hist = vol_res.get("history", {})
+
+        def _strip_tz(df_in):
+            if df_in is None or df_in.empty:
+                return pd.DataFrame()
+            d = df_in.copy()
+            if getattr(d.index, "tz", None) is not None:
+                d.index = d.index.tz_localize(None)
+            return d
+
+        twii_h = _strip_tz(hist.get("^TWII"))
+        vix_h = _strip_tz(hist.get("^VIX"))
+        vxn_h = _strip_tz(hist.get("^VXN"))
+        vvix_h = _strip_tz(hist.get("^VVIX"))
+        spread_h = _strip_tz(hist.get("SPREAD"))
+
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+            4, 1, figsize=(11, 14), sharex=False,
+            gridspec_kw={"height_ratios": [1.3, 1.4, 1.1, 1.2]}
+        )
+
+        # Panel 1: ^TWII & MAs
+        if not twii_h.empty:
+            ax1.plot(twii_h.index, twii_h["Close"], label="TWII Close", color="#1f77b4", linewidth=1.8)
+            ax1.plot(twii_h.index, twii_h["MA5"], label="5MA", color="purple", linestyle=":", linewidth=1.2)
+            ax1.plot(twii_h.index, twii_h["MA10"], label="10MA", color="green", linestyle="-.", linewidth=1.2)
+            ax1.plot(twii_h.index, twii_h["MA20"], label="20MA", color="orange", linestyle="--", linewidth=1.4)
+            ax1.set_title("Taiwan Weighted Index (^TWII) & Moving Averages (3M)", fontsize=12, fontweight="bold")
+            ax1.set_ylabel("Index")
+            ax1.grid(True, linestyle="--", alpha=0.45)
+            ax1.legend(loc="upper left", ncol=4, fontsize=9)
+
+        # Panel 2: ^VIX & ^VXN vs 5MA & 20D BB Upper
+        if not vix_h.empty:
+            ax2.plot(vix_h.index, vix_h["Close"], label="VIX", color="#d62728", linewidth=1.8)
+            ax2.plot(vix_h.index, vix_h["MA5"], label="VIX 5MA", color="#d62728", linestyle=":", alpha=0.8, linewidth=1.2)
+            ax2.plot(vix_h.index, vix_h["BB_Upper"], label="VIX BB Upper", color="#ff9896", linestyle="--", linewidth=1.2)
+        if not vxn_h.empty:
+            ax2.plot(vxn_h.index, vxn_h["Close"], label="VXN", color="#1f77b4", linewidth=1.8)
+            ax2.plot(vxn_h.index, vxn_h["MA5"], label="VXN 5MA", color="#1f77b4", linestyle=":", alpha=0.8, linewidth=1.2)
+            ax2.plot(vxn_h.index, vxn_h["BB_Upper"], label="VXN BB Upper", color="#aec7e8", linestyle="--", linewidth=1.2)
+        ax2.axhline(25, color="#d62728", linestyle="-.", alpha=0.5, linewidth=1.0, label="VIX Wartime (25)")
+        ax2.axhline(30, color="#1f77b4", linestyle="-.", alpha=0.5, linewidth=1.0, label="VXN Wartime (30)")
+        ax2.set_title("US Volatility Regime: ^VIX & ^VXN vs 5MA & 20D BB Upper", fontsize=12, fontweight="bold")
+        ax2.set_ylabel("Vol Index")
+        ax2.grid(True, linestyle="--", alpha=0.45)
+        ax2.legend(loc="upper left", ncol=4, fontsize=8)
+
+        # Panel 3: ^VVIX & Tech Spread (VXN - VIX)
+        if not vvix_h.empty:
+            ax3.plot(vvix_h.index, vvix_h["Close"], label="VVIX", color="#9467bd", linewidth=1.8)
+            ax3.plot(vvix_h.index, vvix_h["MA20"], label="VVIX 20MA", color="#c5b0d5", linestyle="--", linewidth=1.4)
+            ax3.axhline(95, color="red", linestyle=":", alpha=0.7, linewidth=1.2, label="VVIX Alert (95)")
+            ax3.set_ylabel("VVIX", color="#9467bd")
+            ax3.legend(loc="upper left", fontsize=9)
+        if not spread_h.empty:
+            ax3_r = ax3.twinx()
+            ax3_r.bar(spread_h.index, spread_h["Spread"], color="#ff7f0e", alpha=0.25, label="VXN - VIX Spread")
+            ax3_r.set_ylabel("VXN - VIX", color="#ff7f0e")
+            ax3_r.legend(loc="upper right", fontsize=9)
+        ax3.set_title("Tail Risk (^VVIX) & Tech Risk Premium (VXN - VIX)", fontsize=12, fontweight="bold")
+        ax3.grid(True, linestyle="--", alpha=0.45)
+
+        # Panel 4: ^TWII Local Volatility (HV20 & ATR14%)
+        if not twii_h.empty:
+            ax4.plot(twii_h.index, twii_h["HV20"], label="TWII HV20 (%)", color="#2ca02c", linewidth=1.8)
+            ax4.plot(twii_h.index, twii_h["HV20_MA20"], label="HV20 20MA", color="#2ca02c", linestyle="--", alpha=0.8, linewidth=1.3)
+            ax4.set_ylabel("HV20 (%)", color="#2ca02c")
+            ax4.legend(loc="upper left", fontsize=9)
+
+            ax4_r = ax4.twinx()
+            ax4_r.plot(twii_h.index, twii_h["ATR14_Pct"], label="TWII ATR14 (%)", color="#8c564b", linewidth=1.6)
+            ax4_r.plot(twii_h.index, twii_h["ATR14_Pct_MA20"], label="ATR14% 20MA", color="#8c564b", linestyle=":", alpha=0.85, linewidth=1.3)
+            ax4_r.set_ylabel("ATR14 (%)", color="#8c564b")
+            ax4_r.legend(loc="upper right", fontsize=9)
+        ax4.set_title("Taiwan Local Volatility Proxy: ^TWII HV20 (%) & ATR14 (%)", fontsize=12, fontweight="bold")
+        ax4.grid(True, linestyle="--", alpha=0.45)
+
+        for ax in (ax1, ax2, ax3, ax4):
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+# ----------------------------------------------------
+# 頁籤 2：單檔深度解析
+# ----------------------------------------------------
+elif selected_page == "📊 單檔深度解析":
     st.write("請在下方輸入股票代號（例如：`2495`、`00631L`），系統將自動抓取近兩年資料進行診斷。")
     col1, col2 = st.columns([4, 1])
     with col1: user_input = st.text_input("輸入股票代號", value="2495", placeholder="例如：2330").strip()
@@ -243,7 +447,7 @@ if selected_page == "📊 單檔深度解析":
                 st.pyplot(fig); plt.close(fig)
 
 # ----------------------------------------------------
-# 頁籤 2：全市場智慧掃描
+# 頁籤 3：全市場智慧掃描
 # ----------------------------------------------------
 elif selected_page == "🚀 全市場智慧掃描":
     st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的，並進行多級別背離與均線扣抵判定。")
@@ -665,7 +869,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 st.success("✅ **傳送成功！已自動載入標的。** 請切換至 **【📑 財報三表地雷掃描】** 分頁。")
 
 # ----------------------------------------------------
-# 頁籤 3：財報三表地雷掃描 
+# 頁籤 4：財報三表地雷掃描 
 # ----------------------------------------------------
 elif selected_page == "📑 財報三表地雷掃描":
     def render_trend_sparkline(trend_list):
@@ -808,7 +1012,7 @@ elif selected_page == "📑 財報三表地雷掃描":
                         st.download_button(label="📥 下載三表交叉財報健檢報告 (CSV 備用)", data=csv, file_name=file_name_csv, mime='text/csv')
 
 # ----------------------------------------------------
-# 頁籤 4：幾何型態滿足點測距 
+# 頁籤 5：幾何型態滿足點測距 
 # ----------------------------------------------------
 elif selected_page == "📐 幾何型態滿足點測距":
     st.write("利用量化演算法自動尋找波段轉折極值，並提供**「模式一：實體收盤價（過濾雜訊，對齊主力籌碼）」**與**「模式二：影線極值（包含極端恐慌斷頭與流動性插針）」**的雙重 1:1 及 1.618 幾何延伸測距。")
@@ -883,7 +1087,7 @@ elif selected_page == "📐 幾何型態滿足點測距":
                 render_pattern_result(res_mode2, "3. 模式二：影線極值模型（包含盤中插針、斷頭踩踏與極端低點）")
 
 # ----------------------------------------------------
-# 頁籤 5：量化型態狀態機 
+# 頁籤 6：量化型態狀態機 
 # ----------------------------------------------------
 elif selected_page == "🤖 量化型態狀態機 (程式A)":
     st.write("結合**「60日波段位階濾網」**、**「斜向收斂楔形/通道趨勢線引擎」**與**「首日破線即時預警狀態」**，徹底解決高檔橫盤誤判 W 底、頭頭高誤判 M 頭以及盤中長黑延遲反應等結構盲點。")
