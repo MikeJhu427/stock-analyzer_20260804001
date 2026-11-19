@@ -1813,3 +1813,582 @@ class QuantPatternEngine:
         active_m = [p for p in eval_m if p.state != PatternState.INVALIDATED and (len(df) - p.swing2.idx) < 120]
         
         return {'W': active_w[-1] if active_w else None, 'M': active_m[-1] if active_m else None}
+
+
+# ==========================================
+# 跨市場波動率體制與避險/反彈監控模組 (純 yfinance)
+# ==========================================
+@dataclass
+class VolatilityMonitorConfig:
+    vix_wartime_th: float = 25.0
+    vxn_wartime_th: float = 30.0
+    vvix_alert_th: float = 95.0
+    local_vol_low_pct: float = 20.0
+    local_vol_lookback: int = 60
+    compression_window: int = 10
+    download_period: str = "6mo"
+    display_months: int = 3
+
+
+class CrossMarketVolatilityMonitor:
+    TICKERS = {
+        "^VIX": "美股大盤恐慌指數 (VIX)",
+        "^VVIX": "美股二階波動率 (VVIX)",
+        "^VXN": "那斯達克科技恐慌 (VXN)",
+        "^TWII": "台灣加權指數 (TWII)"
+    }
+
+    @staticmethod
+    def _to_taipei_index(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        idx = pd.to_datetime(df.index)
+        try:
+            if idx.tz is None:
+                idx = idx.tz_localize("Asia/Taipei")
+            else:
+                idx = idx.tz_convert("Asia/Taipei")
+        except Exception:
+            tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+            if idx.tz is None:
+                idx = idx.tz_localize(tw_tz)
+            else:
+                idx = idx.tz_convert(tw_tz)
+        df.index = idx
+        return df[~df.index.duplicated(keep="last")].sort_index()
+
+    @staticmethod
+    def _extract_single_ohlcv(raw_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        if raw_df is None or raw_df.empty:
+            return pd.DataFrame()
+        df = raw_df.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            lv0 = df.columns.get_level_values(0)
+            lv1 = df.columns.get_level_values(1)
+            if ticker in lv0:
+                df = df.xs(ticker, axis=1, level=0)
+            elif ticker in lv1:
+                df = df.xs(ticker, axis=1, level=1)
+            elif "Close" in lv0:
+                df.columns = lv0
+            elif "Close" in lv1:
+                df.columns = lv1
+            else:
+                return pd.DataFrame()
+        df = df.loc[:, ~pd.Index(df.columns).duplicated()]
+        needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        if "Close" not in needed:
+            return pd.DataFrame()
+        df = df[needed].dropna(subset=["Close"])
+        return CrossMarketVolatilityMonitor._to_taipei_index(df)
+
+    @staticmethod
+    def _fetch_market_data(session, period: str = "6mo") -> Dict[str, pd.DataFrame]:
+        tickers = list(CrossMarketVolatilityMonitor.TICKERS.keys())
+        data_map = {}
+        try:
+            raw_all = yf.download(
+                tickers,
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                session=session
+            )
+            for t in tickers:
+                df_t = CrossMarketVolatilityMonitor._extract_single_ohlcv(raw_all, t)
+                if df_t.empty:
+                    single_raw = yf.download(
+                        t,
+                        period=period,
+                        interval="1d",
+                        auto_adjust=False,
+                        progress=False,
+                        threads=False,
+                        session=session
+                    )
+                    df_t = CrossMarketVolatilityMonitor._extract_single_ohlcv(single_raw, t)
+                data_map[t] = df_t
+        except Exception:
+            for t in tickers:
+                try:
+                    single_raw = yf.download(
+                        t,
+                        period=period,
+                        interval="1d",
+                        auto_adjust=False,
+                        progress=False,
+                        threads=False,
+                        session=session
+                    )
+                    data_map[t] = CrossMarketVolatilityMonitor._extract_single_ohlcv(single_raw, t)
+                except Exception:
+                    data_map[t] = pd.DataFrame()
+        return data_map
+
+    @staticmethod
+    def _rolling_percentile(series: pd.Series, window: int = 60) -> pd.Series:
+        def _pct(arr):
+            valid = arr[~np.isnan(arr)]
+            if len(valid) < 2:
+                return np.nan
+            return float(np.sum(valid <= valid[-1]) / len(valid) * 100.0)
+        return series.rolling(window=window, min_periods=20).apply(_pct, raw=True)
+
+    @staticmethod
+    def _compute_indicators(data_map: Dict[str, pd.DataFrame], cfg: VolatilityMonitorConfig) -> Dict[str, pd.DataFrame]:
+        enriched = {}
+        for ticker, raw_df in data_map.items():
+            if raw_df is None or raw_df.empty:
+                enriched[ticker] = pd.DataFrame()
+                continue
+            df = raw_df.copy()
+            close = df["Close"].astype(float)
+            df["Pct_Change"] = close.pct_change() * 100.0
+            df["MA5"] = close.rolling(5).mean()
+            df["MA10"] = close.rolling(10).mean()
+            df["MA20"] = close.rolling(20).mean()
+            df["Above_MA5"] = close > df["MA5"]
+            df["Above_MA20"] = close > df["MA20"]
+
+            if ticker in ("^VIX", "^VXN"):
+                std20 = close.rolling(20).std()
+                df["BB_Upper"] = df["MA20"] + 2.0 * std20
+                df["BIAS20"] = (close - df["MA20"]) / (df["MA20"] + 1e-8) * 100.0
+                df["Break_BB_Upper"] = close > df["BB_Upper"]
+
+            if ticker == "^TWII":
+                log_ret = np.log(close / close.shift(1))
+                df["HV20"] = log_ret.rolling(20).std() * np.sqrt(252) * 100.0
+                df["HV20_MA5"] = df["HV20"].rolling(5).mean()
+                df["HV20_MA20"] = df["HV20"].rolling(20).mean()
+                df["HV20_Pct60"] = CrossMarketVolatilityMonitor._rolling_percentile(df["HV20"], cfg.local_vol_lookback)
+
+                high = df["High"].astype(float) if "High" in df.columns else close
+                low = df["Low"].astype(float) if "Low" in df.columns else close
+                prev_c = close.shift(1)
+                tr = pd.concat([
+                    (high - low),
+                    (high - prev_c).abs(),
+                    (low - prev_c).abs()
+                ], axis=1).max(axis=1)
+                df["ATR14"] = tr.ewm(alpha=1 / 14.0, min_periods=14, adjust=False).mean()
+                df["ATR14_Pct"] = df["ATR14"] / (close + 1e-8) * 100.0
+                df["ATR14_Pct_MA5"] = df["ATR14_Pct"].rolling(5).mean()
+                df["ATR14_Pct_MA20"] = df["ATR14_Pct"].rolling(20).mean()
+                df["ATR14_Pct_Pct60"] = CrossMarketVolatilityMonitor._rolling_percentile(df["ATR14_Pct"], cfg.local_vol_lookback)
+
+            enriched[ticker] = df
+        return enriched
+
+    @staticmethod
+    def _slice_display_window(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        cutoff = df.index.max() - pd.DateOffset(months=months)
+        return df[df.index >= cutoff].copy()
+
+    @staticmethod
+    def _check_compression_breakout(val_s: pd.Series, ma20_s: pd.Series, pct60_s: pd.Series, cfg: VolatilityMonitorConfig) -> bool:
+        if len(val_s) < 3:
+            return False
+        cur_v, prev_v = val_s.iloc[-1], val_s.iloc[-2]
+        cur_ma, prev_ma = ma20_s.iloc[-1], ma20_s.iloc[-2]
+        if any(pd.isna([cur_v, prev_v, cur_ma, prev_ma])):
+            return False
+        cross_up = (cur_v > cur_ma) and (prev_v <= prev_ma)
+        if not cross_up:
+            return False
+        start_idx = max(0, len(pct60_s) - 1 - cfg.compression_window)
+        prior_window = pct60_s.iloc[start_idx:-1].dropna()
+        if prior_window.empty:
+            return False
+        return bool(float(prior_window.min()) < cfg.local_vol_low_pct)
+
+    @staticmethod
+    def evaluate(session=None, config: Optional[VolatilityMonitorConfig] = None) -> Dict:
+        cfg = config if config is not None else VolatilityMonitorConfig()
+        yf_sess = session if session is not None else get_yf_session()
+        tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+        eval_time_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+
+        raw_map = CrossMarketVolatilityMonitor._fetch_market_data(yf_sess, period=cfg.download_period)
+        missing_core = [t for t in ("^VIX", "^VXN", "^TWII") if raw_map.get(t) is None or raw_map[t].empty or len(raw_map[t]) < 25]
+        if missing_core:
+            return {
+                "status": "error",
+                "msg": f"無法取得完整波動率監控資料，缺少或筆數不足標的：{', '.join(missing_core)}",
+                "eval_time": eval_time_str
+            }
+
+        enriched = CrossMarketVolatilityMonitor._compute_indicators(raw_map, cfg)
+        vix_df = enriched["^VIX"]
+        vxn_df = enriched["^VXN"]
+        vvix_df = enriched.get("^VVIX", pd.DataFrame())
+        twii_df = enriched["^TWII"]
+
+        # 計算科技股風險溢價 (VXN - VIX)
+        vix_close_norm = vix_df["Close"].copy()
+        vix_close_norm.index = vix_close_norm.index.normalize()
+        vxn_close_norm = vxn_df["Close"].copy()
+        vxn_close_norm.index = vxn_close_norm.index.normalize()
+        spread_df = pd.concat([
+            vxn_close_norm.rename("VXN"),
+            vix_close_norm.rename("VIX")
+        ], axis=1).dropna()
+        spread_df["Spread"] = spread_df["VXN"] - spread_df["VIX"]
+        spread_df["Spread_MA5"] = spread_df["Spread"].rolling(5).mean()
+        spread_df["Spread_MA20"] = spread_df["Spread"].rolling(20).mean()
+        spread_df["Spread_Diff"] = spread_df["Spread"].diff()
+
+        vix_last = vix_df.iloc[-1]
+        vxn_last = vxn_df.iloc[-1]
+        twii_last = twii_df.iloc[-1]
+        vvix_available = not vvix_df.empty and len(vvix_df) >= 20
+        vvix_last = vvix_df.iloc[-1] if vvix_available else None
+
+        vix_c, vix_ma5, vix_ma20 = float(vix_last["Close"]), float(vix_last["MA5"]), float(vix_last["MA20"])
+        vix_bb_u, vix_bias20 = float(vix_last["BB_Upper"]), float(vix_last["BIAS20"])
+        vix_break_bb = bool(vix_last["Break_BB_Upper"])
+
+        vxn_c, vxn_ma5, vxn_ma20 = float(vxn_last["Close"]), float(vxn_last["MA5"]), float(vxn_last["MA20"])
+        vxn_bb_u, vxn_bias20 = float(vxn_last["BB_Upper"]), float(vxn_last["BIAS20"])
+        vxn_break_bb = bool(vxn_last["Break_BB_Upper"])
+
+        vvix_c = float(vvix_last["Close"]) if vvix_available else np.nan
+        vvix_ma5 = float(vvix_last["MA5"]) if vvix_available else np.nan
+        vvix_ma20 = float(vvix_last["MA20"]) if vvix_available else np.nan
+
+        twii_c = float(twii_last["Close"])
+        twii_ma5 = float(twii_last["MA5"])
+        twii_ma10 = float(twii_last["MA10"])
+        twii_ma20 = float(twii_last["MA20"])
+
+        spread_c = float(spread_df["Spread"].iloc[-1]) if not spread_df.empty else (vxn_c - vix_c)
+        spread_diff = float(spread_df["Spread_Diff"].iloc[-1]) if len(spread_df) >= 2 else np.nan
+        spread_ma5 = float(spread_df["Spread_MA5"].iloc[-1]) if not spread_df.empty else np.nan
+        spread_ma20 = float(spread_df["Spread_MA20"].iloc[-1]) if not spread_df.empty else np.nan
+        spread_expanding = bool(pd.notna(spread_diff) and spread_diff > 0)
+
+        hv20_c = float(twii_last["HV20"]) if pd.notna(twii_last["HV20"]) else np.nan
+        hv20_ma5 = float(twii_last["HV20_MA5"]) if pd.notna(twii_last["HV20_MA5"]) else np.nan
+        hv20_ma20 = float(twii_last["HV20_MA20"]) if pd.notna(twii_last["HV20_MA20"]) else np.nan
+        hv20_pct60 = float(twii_last["HV20_Pct60"]) if pd.notna(twii_last["HV20_Pct60"]) else np.nan
+
+        atr_c = float(twii_last["ATR14_Pct"]) if pd.notna(twii_last["ATR14_Pct"]) else np.nan
+        atr_ma5 = float(twii_last["ATR14_Pct_MA5"]) if pd.notna(twii_last["ATR14_Pct_MA5"]) else np.nan
+        atr_ma20 = float(twii_last["ATR14_Pct_MA20"]) if pd.notna(twii_last["ATR14_Pct_MA20"]) else np.nan
+        atr_pct60 = float(twii_last["ATR14_Pct_Pct60"]) if pd.notna(twii_last["ATR14_Pct_Pct60"]) else np.nan
+
+        # ==========================================
+        # 核心體制切換與四狀態判斷
+        # ==========================================
+        wartime_reasons = []
+        if vix_c > cfg.vix_wartime_th:
+            wartime_reasons.append(f"VIX={vix_c:.2f} > {cfg.vix_wartime_th:.0f}")
+        if vxn_c > cfg.vxn_wartime_th:
+            wartime_reasons.append(f"VXN={vxn_c:.2f} > {cfg.vxn_wartime_th:.0f}")
+        if vix_break_bb:
+            wartime_reasons.append(f"VIX({vix_c:.2f})突破20日布林上軌({vix_bb_u:.2f})")
+        if vxn_break_bb:
+            wartime_reasons.append(f"VXN({vxn_c:.2f})突破20日布林上軌({vxn_bb_u:.2f})")
+
+        is_wartime = len(wartime_reasons) > 0
+        panic_divergence = False
+        alert_reminders = []
+        trigger_reasons = []
+
+        # 檢查恐慌高點下移背離 (TWII 破底但 VIX/VXN 未過前高)
+        if len(twii_df) >= 25 and len(vix_df) >= 25 and len(vxn_df) >= 25:
+            twii_low_col = "Low" if "Low" in twii_df.columns else "Close"
+            vix_high_col = "High" if "High" in vix_df.columns else "Close"
+            vxn_high_col = "High" if "High" in vxn_df.columns else "Close"
+            twii_new_low = float(twii_df[twii_low_col].iloc[-5:].min()) < float(twii_df[twii_low_col].iloc[-25:-5].min())
+            vix_lower_high = float(vix_df[vix_high_col].iloc[-5:].max()) < float(vix_df[vix_high_col].iloc[-25:-5].max())
+            vxn_lower_high = float(vxn_df[vxn_high_col].iloc[-5:].max()) < float(vxn_df[vxn_high_col].iloc[-25:-5].max())
+            panic_divergence = bool(twii_new_low and (vix_lower_high or vxn_lower_high))
+
+        # 檢查平時本地波動與 VVIX 條件 (預先計算，供狀態判別與儀表板顯示)
+        c1_vvix = bool(vvix_available and pd.notna(vvix_c) and pd.notna(vvix_ma20) and (vvix_c > cfg.vvix_alert_th) and (vvix_c > vvix_ma20))
+        twii_below_ma = bool((twii_c < twii_ma10) or (twii_c < twii_ma20))
+        hv20_breakout = CrossMarketVolatilityMonitor._check_compression_breakout(
+            twii_df["HV20"], twii_df["HV20_MA20"], twii_df["HV20_Pct60"], cfg
+        )
+        atr_breakout = CrossMarketVolatilityMonitor._check_compression_breakout(
+            twii_df["ATR14_Pct"], twii_df["ATR14_Pct_MA20"], twii_df["ATR14_Pct_Pct60"], cfg
+        )
+        c2_hv20 = bool(hv20_breakout and twii_below_ma)
+        c2_atr = bool(atr_breakout and twii_below_ma)
+
+        if is_wartime:
+            regime = "【戰時恐慌警戒區】（系統性流動性殺盤）"
+            trigger_reasons.extend(wartime_reasons)
+            if (vix_c < vix_ma5) and (vxn_c < vxn_ma5):
+                state_code = "A"
+                state_label = "狀態 A（止跌反彈確認）"
+                severity = "success"
+                trigger_reasons.append(f"VIX({vix_c:.2f}) < 5MA({vix_ma5:.2f}) 且 VXN({vxn_c:.2f}) < 5MA({vxn_ma5:.2f})")
+                if panic_divergence:
+                    alert_reminders.append("🔥【恐慌高點下移背離】^TWII 破底但美股波動率未過前高，止跌反彈勝率顯著提升。")
+                advice = "恐慌退潮，可關注台股止跌反彈（現貨/期貨右側多單或選擇權 Bull Put Spread 賺 IV 收斂）。"
+            else:
+                state_code = "B"
+                state_label = "狀態 B（尚未止血警戒）"
+                severity = "error"
+                if vix_c >= vix_ma5:
+                    trigger_reasons.append(f"VIX({vix_c:.2f}) 仍在 5MA({vix_ma5:.2f}) 之上")
+                if vxn_c >= vxn_ma5:
+                    trigger_reasons.append(f"VXN({vxn_c:.2f}) 仍在 5MA({vxn_ma5:.2f}) 之上")
+                if (vxn_c > vxn_ma5) and spread_expanding:
+                    alert_reminders.append(f"🚨【科技股高危警示】VXN 壓在 5MA 之上且 VXN-VIX 風險溢價擴大至 {spread_c:.2f}（日變動 {spread_diff:+.2f}）。")
+                advice = "科技股系統性拋售未結束，切勿重倉接刀，忽略個股左側底背離訊號。"
+        else:
+            regime = "【平時常態震盪區】（非系統性環境）"
+            if c1_vvix:
+                trigger_reasons.append(f"VVIX({vvix_c:.2f}) > 95 且站上 20MA({vvix_ma20:.2f})")
+                alert_reminders.append(f"⚠️【VVIX 尾部避險提醒】美股聰明錢買進尾部保險（VVIX={vvix_c:.2f} > 20MA {vvix_ma20:.2f}）。")
+
+            if c2_hv20 and c2_atr:
+                trigger_reasons.append("HV20 與 ATR14% 同步自 60 日低分位(<20%)向上突破 20MA 且 ^TWII 跌破 10MA/20MA")
+                alert_reminders.append(
+                    f"🚨【台股本地波動雙指標觸發提醒】HV20({hv20_c:.2f}% > 20MA {hv20_ma20:.2f}%) 與 "
+                    f"ATR14%({atr_c:.2f}% > 20MA {atr_ma20:.2f}%) 同步由 60 日低分位(<20%)向上突破，且加權指數跌破均線！"
+                )
+            elif c2_hv20:
+                trigger_reasons.append(f"HV20({hv20_c:.2f}%) 自 60 日低分位(<20%)向上突破 20MA({hv20_ma20:.2f}%) 且 ^TWII 跌破 10MA/20MA")
+                alert_reminders.append(
+                    f"🚨【台股本地波動觸發提醒：HV20】20 日年化已實現波動率 HV20({hv20_c:.2f}%) "
+                    f"自 60 日低分位(<20%)由下往上突破 20MA({hv20_ma20:.2f}%)，且加權指數跌破 10MA/20MA！"
+                )
+            elif c2_atr:
+                trigger_reasons.append(f"ATR14%({atr_c:.2f}%) 自 60 日低分位(<20%)向上突破 20MA({atr_ma20:.2f}%) 且 ^TWII 跌破 10MA/20MA")
+                alert_reminders.append(
+                    f"🚨【台股本地波動觸發提醒：ATR14%】ATR14 百分比({atr_c:.2f}%) "
+                    f"自 60 日低分位(<20%)由下往上突破 20MA({atr_ma20:.2f}%)，且加權指數跌破 10MA/20MA！"
+                )
+
+            if c1_vvix or c2_hv20 or c2_atr:
+                state_code = "C"
+                state_label = "狀態 C（大跌前避險預警）"
+                severity = "warning"
+                advice = "大盤高檔波動率壓縮突破，建議提前買進低成本價外 Put（次週選/近月）或破月線啟動微台指（TMF）動態對沖。"
+            else:
+                state_code = "D"
+                state_label = "狀態 D（結構正常）"
+                severity = "info"
+                trigger_reasons.append("VIX <= 25、VXN <= 30 且無 VVIX 或台股低波動突破預警")
+                advice = "無系統性風險，關閉波動率雜訊干擾，回歸個股均線與籌碼操作。"
+
+        def _fmt_bool(flag):
+            if pd.isna(flag):
+                return "-"
+            return "✅ 是" if bool(flag) else "❌ 否"
+
+        def _fmt_num(val, digits=2, suffix=""):
+            return f"{val:.{digits}f}{suffix}" if pd.notna(val) else "-"
+
+        metrics_rows = [
+            {
+                "標的 / 指標": "^VIX (美股大盤恐慌)",
+                "資料日期 (UTC+8)": vix_df.index[-1].strftime("%Y-%m-%d"),
+                "最新數值": round(vix_c, 2),
+                "日漲跌幅(%)": round(float(vix_last["Pct_Change"]), 2) if pd.notna(vix_last["Pct_Change"]) else np.nan,
+                "5MA": round(vix_ma5, 2),
+                "20MA": round(vix_ma20, 2),
+                "站上5MA": _fmt_bool(vix_last["Above_MA5"]),
+                "站上20MA": _fmt_bool(vix_last["Above_MA20"]),
+                "進階位階 / 備註": f"20日布林上軌: {vix_bb_u:.2f} ({'⚠️突破' if vix_break_bb else '軌內'}) | 20MA乖離: {vix_bias20:+.2f}%"
+            },
+            {
+                "標的 / 指標": "^VXN (科技股恐慌)",
+                "資料日期 (UTC+8)": vxn_df.index[-1].strftime("%Y-%m-%d"),
+                "最新數值": round(vxn_c, 2),
+                "日漲跌幅(%)": round(float(vxn_last["Pct_Change"]), 2) if pd.notna(vxn_last["Pct_Change"]) else np.nan,
+                "5MA": round(vxn_ma5, 2),
+                "20MA": round(vxn_ma20, 2),
+                "站上5MA": _fmt_bool(vxn_last["Above_MA5"]),
+                "站上20MA": _fmt_bool(vxn_last["Above_MA20"]),
+                "進階位階 / 備註": f"20日布林上軌: {vxn_bb_u:.2f} ({'⚠️突破' if vxn_break_bb else '軌內'}) | 20MA乖離: {vxn_bias20:+.2f}%"
+            },
+            {
+                "標的 / 指標": "^VVIX (美股二階波動)",
+                "資料日期 (UTC+8)": vvix_df.index[-1].strftime("%Y-%m-%d") if vvix_available else "-",
+                "最新數值": round(vvix_c, 2) if pd.notna(vvix_c) else np.nan,
+                "日漲跌幅(%)": round(float(vvix_last["Pct_Change"]), 2) if (vvix_available and pd.notna(vvix_last["Pct_Change"])) else np.nan,
+                "5MA": round(vvix_ma5, 2) if pd.notna(vvix_ma5) else np.nan,
+                "20MA": round(vvix_ma20, 2) if pd.notna(vvix_ma20) else np.nan,
+                "站上5MA": _fmt_bool(vvix_last["Above_MA5"]) if vvix_available else "-",
+                "站上20MA": _fmt_bool(vvix_last["Above_MA20"]) if vvix_available else "-",
+                "進階位階 / 備註": f"警戒門檻: >{cfg.vvix_alert_th:.0f} 且 >20MA ({'🚨觸發' if c1_vvix else '正常'})" if vvix_available else "資料暫缺"
+            },
+            {
+                "標的 / 指標": "^TWII (台灣加權指數)",
+                "資料日期 (UTC+8)": twii_df.index[-1].strftime("%Y-%m-%d"),
+                "最新數值": round(twii_c, 2),
+                "日漲跌幅(%)": round(float(twii_last["Pct_Change"]), 2) if pd.notna(twii_last["Pct_Change"]) else np.nan,
+                "5MA": round(twii_ma5, 2),
+                "20MA": round(twii_ma20, 2),
+                "站上5MA": _fmt_bool(twii_last["Above_MA5"]),
+                "站上20MA": _fmt_bool(twii_last["Above_MA20"]),
+                "進階位階 / 備註": f"10MA: {twii_ma10:.2f} | 跌破10MA或20MA: {'⚠️是' if twii_below_ma else '否'}"
+            },
+            {
+                "標的 / 指標": "科技股風險溢價 (VXN-VIX)",
+                "資料日期 (UTC+8)": spread_df.index[-1].strftime("%Y-%m-%d") if not spread_df.empty else "-",
+                "最新數值": round(spread_c, 2),
+                "日漲跌幅(%)": np.nan,
+                "5MA": round(spread_ma5, 2) if pd.notna(spread_ma5) else np.nan,
+                "20MA": round(spread_ma20, 2) if pd.notna(spread_ma20) else np.nan,
+                "站上5MA": _fmt_bool(spread_c > spread_ma5) if pd.notna(spread_ma5) else "-",
+                "站上20MA": _fmt_bool(spread_c > spread_ma20) if pd.notna(spread_ma20) else "-",
+                "進階位階 / 備註": f"單日變動: {_fmt_num(spread_diff, 2)} ({'⚠️利差擴大' if spread_expanding else '利差收斂/持平'})"
+            },
+            {
+                "標的 / 指標": "台股本地波動 HV20(%)",
+                "資料日期 (UTC+8)": twii_df.index[-1].strftime("%Y-%m-%d"),
+                "最新數值": round(hv20_c, 2) if pd.notna(hv20_c) else np.nan,
+                "日漲跌幅(%)": np.nan,
+                "5MA": round(hv20_ma5, 2) if pd.notna(hv20_ma5) else np.nan,
+                "20MA": round(hv20_ma20, 2) if pd.notna(hv20_ma20) else np.nan,
+                "站上5MA": _fmt_bool(hv20_c > hv20_ma5) if pd.notna(hv20_c) and pd.notna(hv20_ma5) else "-",
+                "站上20MA": _fmt_bool(hv20_c > hv20_ma20) if pd.notna(hv20_c) and pd.notna(hv20_ma20) else "-",
+                "進階位階 / 備註": f"60日百分位: {_fmt_num(hv20_pct60, 1, '%')} | 低分位突破狀態C: {'🚨觸發(HV20)' if c2_hv20 else '無'}"
+            },
+            {
+                "標的 / 指標": "台股本地波動 ATR14(%)",
+                "資料日期 (UTC+8)": twii_df.index[-1].strftime("%Y-%m-%d"),
+                "最新數值": round(atr_c, 2) if pd.notna(atr_c) else np.nan,
+                "日漲跌幅(%)": np.nan,
+                "5MA": round(atr_ma5, 2) if pd.notna(atr_ma5) else np.nan,
+                "20MA": round(atr_ma20, 2) if pd.notna(atr_ma20) else np.nan,
+                "站上5MA": _fmt_bool(atr_c > atr_ma5) if pd.notna(atr_c) and pd.notna(atr_ma5) else "-",
+                "站上20MA": _fmt_bool(atr_c > atr_ma20) if pd.notna(atr_c) and pd.notna(atr_ma20) else "-",
+                "進階位階 / 備註": f"60日百分位: {_fmt_num(atr_pct60, 1, '%')} | 低分位突破狀態C: {'🚨觸發(ATR14%)' if c2_atr else '無'}"
+            }
+        ]
+
+        history_3m = {
+            "^VIX": CrossMarketVolatilityMonitor._slice_display_window(vix_df, cfg.display_months),
+            "^VXN": CrossMarketVolatilityMonitor._slice_display_window(vxn_df, cfg.display_months),
+            "^VVIX": CrossMarketVolatilityMonitor._slice_display_window(vvix_df, cfg.display_months),
+            "^TWII": CrossMarketVolatilityMonitor._slice_display_window(twii_df, cfg.display_months),
+            "SPREAD": CrossMarketVolatilityMonitor._slice_display_window(spread_df, cfg.display_months)
+        }
+
+        return {
+            "status": "success",
+            "eval_time": eval_time_str,
+            "regime": regime,
+            "is_wartime": is_wartime,
+            "state_code": state_code,
+            "state_label": state_label,
+            "severity": severity,
+            "panic_divergence": panic_divergence,
+            "c_triggers": {
+                "vvix": c1_vvix,
+                "hv20": c2_hv20,
+                "atr14": c2_atr
+            },
+            "trigger_reasons": trigger_reasons,
+            "alert_reminders": alert_reminders,
+            "advice": advice,
+            "snapshot": {
+                "vix": vix_c, "vix_ma5": vix_ma5, "vix_ma20": vix_ma20, "vix_bb_u": vix_bb_u, "vix_bias20": vix_bias20,
+                "vxn": vxn_c, "vxn_ma5": vxn_ma5, "vxn_ma20": vxn_ma20, "vxn_bb_u": vxn_bb_u, "vxn_bias20": vxn_bias20,
+                "vvix": vvix_c, "vvix_ma5": vvix_ma5, "vvix_ma20": vvix_ma20,
+                "twii": twii_c, "twii_ma5": twii_ma5, "twii_ma10": twii_ma10, "twii_ma20": twii_ma20,
+                "spread": spread_c, "spread_diff": spread_diff, "spread_expanding": spread_expanding,
+                "hv20": hv20_c, "hv20_ma20": hv20_ma20, "hv20_pct60": hv20_pct60,
+                "atr14_pct": atr_c, "atr14_pct_ma20": atr_ma20, "atr14_pct_pct60": atr_pct60
+            },
+            "metrics_table": metrics_rows,
+            "history": history_3m
+        }
+
+    @staticmethod
+    def to_report_dataframe(result: Dict) -> pd.DataFrame:
+        if not result or result.get("status") != "success":
+            err_msg = result.get("msg", "監控執行失敗") if isinstance(result, dict) else "無資料"
+            return pd.DataFrame([{"分類": "錯誤", "標的 / 指標": "跨市場波動率監控", "最新數值 / 狀態": err_msg}])
+
+        summary_rows = [
+            {
+                "分類": "體制總覽",
+                "標的 / 指標": "更新時間 (UTC+8)",
+                "資料日期 (UTC+8)": "-",
+                "最新數值 / 狀態": result["eval_time"],
+                "日漲跌幅(%)": "-",
+                "5MA": "-",
+                "20MA": "-",
+                "站上5MA": "-",
+                "站上20MA": "-",
+                "進階位階 / 說明": "資料源：純 yfinance (無 VIXTWN 爬蟲)"
+            },
+            {
+                "分類": "體制總覽",
+                "標的 / 指標": "當前市場體制",
+                "資料日期 (UTC+8)": "-",
+                "最新數值 / 狀態": result["regime"],
+                "日漲跌幅(%)": "-",
+                "5MA": "-",
+                "20MA": "-",
+                "站上5MA": "-",
+                "站上20MA": "-",
+                "進階位階 / 說明": " ； ".join(result["trigger_reasons"]) if result["trigger_reasons"] else "-"
+            },
+            {
+                "分類": "體制總覽",
+                "標的 / 指標": "交易訊號狀態",
+                "資料日期 (UTC+8)": "-",
+                "最新數值 / 狀態": result["state_label"],
+                "日漲跌幅(%)": "-",
+                "5MA": "-",
+                "20MA": "-",
+                "站上5MA": "-",
+                "站上20MA": "-",
+                "進階位階 / 說明": "恐慌高點下移背離" if result.get("panic_divergence") else "-"
+            },
+            {
+                "分類": "體制總覽",
+                "標的 / 指標": "關鍵提醒事項",
+                "資料日期 (UTC+8)": "-",
+                "最新數值 / 狀態": " | ".join(result["alert_reminders"]) if result["alert_reminders"] else "無額外特別提醒",
+                "日漲跌幅(%)": "-",
+                "5MA": "-",
+                "20MA": "-",
+                "站上5MA": "-",
+                "站上20MA": "-",
+                "進階位階 / 說明": "-"
+            },
+            {
+                "分類": "體制總覽",
+                "標的 / 指標": "操作與避險建議",
+                "資料日期 (UTC+8)": "-",
+                "最新數值 / 狀態": result["advice"],
+                "日漲跌幅(%)": "-",
+                "5MA": "-",
+                "20MA": "-",
+                "站上5MA": "-",
+                "站上20MA": "-",
+                "進階位階 / 說明": "-"
+            }
+        ]
+
+        detail_rows = []
+        for row in result.get("metrics_table", []):
+            detail_rows.append({
+                "分類": "指標明細",
+                "標的 / 指標": row["標的 / 指標"],
+                "資料日期 (UTC+8)": row["資料日期 (UTC+8)"],
+                "最新數值 / 狀態": row["最新數值"] if pd.notna(row["最新數值"]) else "-",
+                "日漲跌幅(%)": row["日漲跌幅(%)"] if pd.notna(row["日漲跌幅(%)"]) else "-",
+                "5MA": row["5MA"] if pd.notna(row["5MA"]) else "-",
+                "20MA": row["20MA"] if pd.notna(row["20MA"]) else "-",
+                "站上5MA": row["站上5MA"],
+                "站上20MA": row["站上20MA"],
+                "進階位階 / 說明": row["進階位階 / 備註"]
+            })
+
+        return pd.DataFrame(summary_rows + detail_rows)
