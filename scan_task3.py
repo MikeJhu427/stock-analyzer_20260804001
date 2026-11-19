@@ -9,8 +9,24 @@ import strategy_core as core
 CONFIG = core.DEFAULT_CONFIG.copy()
 
 def run_full_scan():
-    print("🚀 [Step 1] 初始化：正在獲取台股上市櫃清單...")
+    print("🚀 [Step 0] 執行跨市場波動率體制與避險/反彈監控...")
     yf_session = core.get_yf_session()
+    try:
+        vol_res = core.CrossMarketVolatilityMonitor.evaluate(yf_session)
+    except Exception as e:
+        vol_res = {"status": "error", "msg": f"波動率監控執行異常：{str(e)}"}
+
+    vol_report_df = core.CrossMarketVolatilityMonitor.to_report_dataframe(vol_res)
+    if vol_res.get("status") == "success":
+        print(f"🛡️ 市場體制：{vol_res['regime']} | 訊號狀態：{vol_res['state_label']}")
+        if vol_res.get("alert_reminders"):
+            for rem in vol_res["alert_reminders"]:
+                print(f"   {rem}")
+        print(f"💡 操作建議：{vol_res['advice']}")
+    else:
+        print(f"⚠️ 跨市場波動率監控警告：{vol_res.get('msg', '資料取得失敗')}")
+
+    print("🚀 [Step 1] 初始化：正在獲取台股上市櫃清單...")
     stock_dict = core.fetch_all_tw_stocks()
     tickers = list(stock_dict.keys())
     print(f"✅ 成功獲取 {len(tickers)} 檔標的，開始執行第一階段篩選...")
@@ -261,10 +277,11 @@ def run_full_scan():
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
-                # 強制採用 openpyxl 輸出，保證產生現代化的標準 .xlsx 檔，避免相容性錯誤
+                # 強制採用 openpyxl 輸出雙工作表 .xlsx（掃描結果 + 波動率體制監控）
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    res_df.to_excel(writer, index=False)
+                    res_df.to_excel(writer, sheet_name="全市場掃描結果", index=False)
+                    vol_report_df.to_excel(writer, sheet_name="波動率體制監控", index=False)
                 buffer.seek(0)
                 xlsx_bytes = buffer.read()
                 
