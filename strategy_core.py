@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 import datetime
 import base64
@@ -2392,3 +2393,358 @@ class CrossMarketVolatilityMonitor:
             })
 
         return pd.DataFrame(summary_rows + detail_rows)
+
+
+# ==========================================
+# 外資實質資金流向（匯率＋現貨買賣超連動）監控模組
+# ==========================================
+FOREIGN_FUND_FLOW_COLUMNS = [
+    "日期",
+    "外資單日買進(億)",
+    "外資單日賣出(億)",
+    "外資單日買賣超(億)",
+    "當月累計買賣超(億)",
+    "USD/TWD匯率",
+    "匯率單日變動(%)",
+    "外資資金流向判定"
+]
+
+
+def _parse_twse_bfi82u_foreign(payload: dict) -> Optional[Dict]:
+    """從證交所 BFI82U JSON 解析「外資及陸資(不含外資自營商)」買進、賣出與買賣差額（億元）。"""
+    if not isinstance(payload, dict) or payload.get("stat") != "OK":
+        return None
+    rows = payload.get("data") or []
+    if not rows:
+        return None
+
+    target_row = None
+    for row in rows:
+        if not row or len(row) < 4:
+            continue
+        name = str(row[0]).replace(" ", "").replace("（", "(").replace("）", ")")
+        if "外資及陸資" in name and "不含外資自營商" in name:
+            target_row = row
+            break
+
+    if target_row is None:
+        return None
+
+    try:
+        buy_val = float(str(target_row[1]).replace(",", "").strip())
+        sell_val = float(str(target_row[2]).replace(",", "").strip())
+        net_val = float(str(target_row[3]).replace(",", "").strip())
+    except Exception:
+        return None
+
+    date_compact = str(payload.get("date", "")).strip()
+    return {
+        "date_compact": date_compact,
+        "buy_yi": round(buy_val / 1e8, 2),
+        "sell_yi": round(sell_val / 1e8, 2),
+        "net_yi": round(net_val / 1e8, 2)
+    }
+
+
+def _request_twse_bfi82u(session: requests.Session, params: dict) -> Optional[dict]:
+    url = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://www.twse.com.tw/zh/trading/foreign/bfi82u.html"
+    }
+    try:
+        resp = session.get(url, params=params, headers=headers, timeout=15, verify=False)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _normalize_target_date(target_date) -> Optional[datetime.date]:
+    if target_date is None or str(target_date).strip() == "":
+        return None
+    if isinstance(target_date, datetime.datetime):
+        return target_date.date()
+    if isinstance(target_date, datetime.date):
+        return target_date
+    raw = str(target_date).strip().replace("/", "-")
+    if len(raw) == 8 and raw.isdigit():
+        return datetime.datetime.strptime(raw, "%Y%m%d").date()
+    return pd.to_datetime(raw).date()
+
+
+def fetch_foreign_fund_flow(target_date=None) -> Dict:
+    """
+    取得「外資及陸資(不含外資自營商)」現貨買賣超（含當月累計）與 USD/TWD 匯率變動，
+    並依連動規則判定外資實質資金流向狀態。
+    """
+    tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+    now_tw = datetime.datetime.now(tw_tz)
+    eval_time_str = now_tw.strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+
+    try:
+        session = get_yf_session()
+        parsed_target = _normalize_target_date(target_date)
+
+        # ------------------------------------------
+        # 1. 抓取證交所 BFI82U 單日外資買賣超（週末/休市自動回退）
+        # ------------------------------------------
+        daily_parsed = None
+        resolved_date = None
+        latest_twse_compact = None
+
+        if parsed_target is None:
+            latest_json = _request_twse_bfi82u(session, {"response": "json"})
+            daily_parsed = _parse_twse_bfi82u_foreign(latest_json)
+            if daily_parsed and len(daily_parsed["date_compact"]) == 8:
+                latest_twse_compact = daily_parsed["date_compact"]
+                resolved_date = datetime.datetime.strptime(latest_twse_compact, "%Y%m%d").date()
+
+        if daily_parsed is None:
+            base_dt = parsed_target if parsed_target is not None else now_tw.date()
+            for back_days in range(0, 11):
+                cand_dt = base_dt - datetime.timedelta(days=back_days)
+                if cand_dt.weekday() >= 5:
+                    continue
+                cand_str = cand_dt.strftime("%Y%m%d")
+                day_json = _request_twse_bfi82u(
+                    session,
+                    {"response": "json", "type": "day", "dayDate": cand_str, "date": cand_str}
+                )
+                parsed = _parse_twse_bfi82u_foreign(day_json)
+                if parsed:
+                    daily_parsed = parsed
+                    if len(parsed["date_compact"]) == 8:
+                        resolved_date = datetime.datetime.strptime(parsed["date_compact"], "%Y%m%d").date()
+                    else:
+                        resolved_date = cand_dt
+                        daily_parsed["date_compact"] = cand_str
+                    break
+                time.sleep(0.25)
+
+        if daily_parsed is None or resolved_date is None:
+            return {
+                "status": "error",
+                "msg": "無法從台灣證交所 BFI82U 取得近期有效交易日的外資買賣超資料。",
+                "eval_time": eval_time_str
+            }
+
+        resolved_compact = resolved_date.strftime("%Y%m%d")
+        resolved_date_str = resolved_date.strftime("%Y-%m-%d")
+
+        # ------------------------------------------
+        # 2. 計算「當月截至該日之累計外資買賣超（億元）」
+        # ------------------------------------------
+        month_cum_net_yi = np.nan
+        use_month_endpoint = False
+
+        if parsed_target is None:
+            use_month_endpoint = True
+        else:
+            if latest_twse_compact is None:
+                latest_probe = _request_twse_bfi82u(session, {"response": "json"})
+                probe_parsed = _parse_twse_bfi82u_foreign(latest_probe)
+                if probe_parsed and len(probe_parsed["date_compact"]) == 8:
+                    latest_twse_compact = probe_parsed["date_compact"]
+            if latest_twse_compact and resolved_compact == latest_twse_compact:
+                use_month_endpoint = True
+            else:
+                # 若查詢歷史月份的最後一個營業日，同樣可直接用月統計端點
+                next_day = resolved_date + datetime.timedelta(days=1)
+                while next_day.weekday() >= 5:
+                    next_day += datetime.timedelta(days=1)
+                if next_day.month != resolved_date.month:
+                    use_month_endpoint = True
+
+        if use_month_endpoint:
+            month_json = _request_twse_bfi82u(
+                session,
+                {"response": "json", "type": "month", "monthDate": resolved_compact}
+            )
+            month_parsed = _parse_twse_bfi82u_foreign(month_json)
+            if month_parsed:
+                month_cum_net_yi = month_parsed["net_yi"]
+        else:
+            # 指定歷史月中日期：自該月 1 日逐日加總至 resolved_date（遇限流則回退月端點）
+            cum_sum = 0.0
+            valid_days = 0
+            cur_d = resolved_date.replace(day=1)
+            while cur_d <= resolved_date:
+                if cur_d.weekday() < 5:
+                    if cur_d == resolved_date:
+                        cum_sum += daily_parsed["net_yi"]
+                        valid_days += 1
+                    else:
+                        d_str = cur_d.strftime("%Y%m%d")
+                        d_json = _request_twse_bfi82u(
+                            session,
+                            {"response": "json", "type": "day", "dayDate": d_str, "date": d_str}
+                        )
+                        d_parsed = _parse_twse_bfi82u_foreign(d_json)
+                        if d_parsed:
+                            cum_sum += d_parsed["net_yi"]
+                            valid_days += 1
+                        time.sleep(0.25)
+                cur_d += datetime.timedelta(days=1)
+
+            if valid_days > 0:
+                month_cum_net_yi = round(cum_sum, 2)
+            else:
+                month_json = _request_twse_bfi82u(
+                    session,
+                    {"response": "json", "type": "month", "monthDate": resolved_compact}
+                )
+                month_parsed = _parse_twse_bfi82u_foreign(month_json)
+                if month_parsed:
+                    month_cum_net_yi = month_parsed["net_yi"]
+
+        # ------------------------------------------
+        # 3. 使用 yfinance 抓取 TWD=X 近 5 個交易日匯率並計算變動
+        # ------------------------------------------
+        fx_df = pd.DataFrame()
+        fx_dl_kwargs = {"interval": "1d", "auto_adjust": False, "progress": False, "threads": False}
+        if parsed_target is None:
+            fx_dl_kwargs["period"] = "1mo"
+        else:
+            fx_dl_kwargs["start"] = (resolved_date - datetime.timedelta(days=25)).strftime("%Y-%m-%d")
+            fx_dl_kwargs["end"] = (resolved_date + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+
+        for use_custom_sess in (False, True):
+            try:
+                kw = fx_dl_kwargs.copy()
+                if use_custom_sess:
+                    kw["session"] = session
+                raw_fx = yf.download("TWD=X", **kw)
+                fx_df = CrossMarketVolatilityMonitor._extract_single_ohlcv(raw_fx, "TWD=X")
+                if not fx_df.empty and len(fx_df) >= 2:
+                    break
+            except Exception:
+                continue
+
+        if fx_df.empty or len(fx_df) < 2:
+            try:
+                hist_fx = yf.Ticker("TWD=X").history(period="1mo", auto_adjust=False)
+                fx_df = CrossMarketVolatilityMonitor._extract_single_ohlcv(hist_fx, "TWD=X")
+            except Exception:
+                fx_df = pd.DataFrame()
+
+        if fx_df.empty or len(fx_df) < 2:
+            return {
+                "status": "error",
+                "msg": "無法透過 yfinance 取得足夠的 USD/TWD (TWD=X) 匯率資料。",
+                "eval_time": eval_time_str
+            }
+
+        # 對齊至 resolved_date（若 TWD=X 延遲則自動回退至最近有效交易日）
+        fx_aligned = fx_df[fx_df.index.date <= resolved_date]
+        if len(fx_aligned) < 2:
+            fx_aligned = fx_df
+
+        fx_5d = fx_aligned.tail(5).copy()
+        fx_5d["Pct_Change"] = fx_5d["Close"].pct_change() * 100.0
+        fx_5d["Diff_Yuan"] = fx_5d["Close"].diff()
+
+        fx_rate = round(float(fx_5d["Close"].iloc[-1]), 4)
+        fx_prev_rate = round(float(fx_5d["Close"].iloc[-2]), 4)
+        fx_date_str = fx_5d.index[-1].strftime("%Y-%m-%d")
+
+        fx_change_yuan = round(fx_rate - fx_prev_rate, 4)
+        fx_change_jiao = round(fx_change_yuan * 10.0, 2)
+        fx_change_ratio = (fx_rate - fx_prev_rate) / fx_prev_rate if fx_prev_rate > 0 else 0.0
+        fx_change_pct = round(fx_change_ratio * 100.0, 2)
+
+        fx_recent_5d_list = []
+        for idx_dt, r in fx_5d.iterrows():
+            fx_recent_5d_list.append({
+                "日期": idx_dt.strftime("%Y-%m-%d"),
+                "USD/TWD收盤": round(float(r["Close"]), 4),
+                "單日變動(元)": round(float(r["Diff_Yuan"]), 4) if pd.notna(r["Diff_Yuan"]) else np.nan,
+                "單日變動(角)": round(float(r["Diff_Yuan"]) * 10.0, 2) if pd.notna(r["Diff_Yuan"]) else np.nan,
+                "單日變動(%)": round(float(r["Pct_Change"]), 2) if pd.notna(r["Pct_Change"]) else np.nan
+            })
+
+        # ------------------------------------------
+        # 4. 外資實質匯出入狀態判定標籤 (flow_signal)
+        # ------------------------------------------
+        net_yi = daily_parsed["net_yi"]
+        if (net_yi <= -200.0) and (fx_change_pct >= 0.35):
+            flow_signal = "實質撤資匯出警報"
+            severity = "error"
+            signal_desc = f"外資單日大賣 {abs(net_yi):.2f} 億元且台幣單日貶值 {fx_change_pct:+.2f}%（{fx_change_jiao:+.2f} 角），呈現股匯雙殺實質匯出。"
+        elif (net_yi <= -100.0) and (fx_change_pct <= 0.0):
+            flow_signal = "帳上換股停泊（未匯出）"
+            severity = "warning"
+            signal_desc = f"外資單日賣超 {abs(net_yi):.2f} 億元但台幣持平或升值（{fx_change_pct:+.2f}%／{fx_change_jiao:+.2f} 角），資金偏向留滯帳上換股。"
+        elif (net_yi >= 150.0) and (fx_change_pct <= -0.30):
+            flow_signal = "實質資金匯入偏多"
+            severity = "success"
+            signal_desc = f"外資單日大買 {net_yi:.2f} 億元且台幣升值 {abs(fx_change_pct):.2f}%（{fx_change_jiao:+.2f} 角），具實質熱錢匯入支撐。"
+        else:
+            flow_signal = "中性常態波動"
+            severity = "info"
+            signal_desc = f"外資單日買賣超 {net_yi:+.2f} 億元、匯率變動 {fx_change_pct:+.2f}%（{fx_change_jiao:+.2f} 角），落於常態波動區間。"
+
+        record_excel = {
+            "日期": resolved_date_str,
+            "外資單日買進(億)": daily_parsed["buy_yi"],
+            "外資單日賣出(億)": daily_parsed["sell_yi"],
+            "外資單日買賣超(億)": net_yi,
+            "當月累計買賣超(億)": month_cum_net_yi if pd.notna(month_cum_net_yi) else np.nan,
+            "USD/TWD匯率": fx_rate,
+            "匯率單日變動(%)": round(fx_change_ratio, 6),
+            "外資資金流向判定": flow_signal
+        }
+
+        return {
+            "status": "success",
+            "msg": "",
+            "eval_time": eval_time_str,
+            "date": resolved_date_str,
+            "date_compact": resolved_compact,
+            "fx_date": fx_date_str,
+            "foreign_buy_yi": daily_parsed["buy_yi"],
+            "foreign_sell_yi": daily_parsed["sell_yi"],
+            "foreign_net_yi": net_yi,
+            "month_cum_net_yi": month_cum_net_yi if pd.notna(month_cum_net_yi) else np.nan,
+            "fx_rate": fx_rate,
+            "fx_prev_rate": fx_prev_rate,
+            "fx_change_pct": fx_change_pct,
+            "fx_change_ratio": round(fx_change_ratio, 6),
+            "fx_change_yuan": fx_change_yuan,
+            "fx_change_jiao": fx_change_jiao,
+            "flow_signal": flow_signal,
+            "severity": severity,
+            "signal_desc": signal_desc,
+            "fx_recent_5d": fx_recent_5d_list,
+            "record": record_excel
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "msg": f"外資實質資金流向監控執行異常：{str(e)}",
+            "eval_time": eval_time_str
+        }
+
+
+def build_foreign_fund_flow_df(flow_res: Dict, for_excel: bool = False) -> pd.DataFrame:
+    """將 fetch_foreign_fund_flow() 結果轉為標準 8 欄 DataFrame。"""
+    if not isinstance(flow_res, dict) or flow_res.get("status") != "success":
+        err_msg = flow_res.get("msg", "資料取得失敗") if isinstance(flow_res, dict) else "無資料"
+        return pd.DataFrame([{
+            "日期": "-",
+            "外資單日買進(億)": np.nan,
+            "外資單日賣出(億)": np.nan,
+            "外資單日買賣超(億)": np.nan,
+            "當月累計買賣超(億)": np.nan,
+            "USD/TWD匯率": np.nan,
+            "匯率單日變動(%)": np.nan if for_excel else "-",
+            "外資資金流向判定": f"資料異常：{err_msg}"
+        }], columns=FOREIGN_FUND_FLOW_COLUMNS)
+
+    rec = flow_res["record"].copy()
+    if not for_excel:
+        rec["匯率單日變動(%)"] = f"{flow_res['fx_change_pct']:+.2f}%"
+    return pd.DataFrame([rec], columns=FOREIGN_FUND_FLOW_COLUMNS)
