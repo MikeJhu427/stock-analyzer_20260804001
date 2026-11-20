@@ -25,6 +25,8 @@ OUTPUT_COLUMN_CONFIG = {
     "show_ma120_slope": True
 }
 PARAMS_FILE = "params_config.json"
+FOREIGN_FLOW_SHEET_NAME = "外資資金流向監控"
+FOREIGN_FLOW_HISTORY_FILE = "foreign_fund_flow_history.xlsx"
 
 def load_config():
     if os.path.exists(PARAMS_FILE):
@@ -64,6 +66,70 @@ def get_volatility_monitor_report():
     if not res or res.get("status") != "success":
         get_volatility_monitor_report.clear()
     return res
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_foreign_fund_flow_report():
+    try:
+        res = core.fetch_foreign_fund_flow()
+        if not res or res.get("status") != "success":
+            get_foreign_fund_flow_report.clear()
+        return res
+    except Exception as e:
+        get_foreign_fund_flow_report.clear()
+        return {"status": "error", "msg": f"外資資金流向監控載入異常：{str(e)}"}
+
+def _format_pct_display(val):
+    if pd.isna(val) or val is None:
+        return "-"
+    if isinstance(val, str):
+        s = val.strip()
+        if s in ("", "-"):
+            return "-"
+        if s.endswith("%"):
+            return s
+        try:
+            num = float(s)
+            pct = num * 100.0 if abs(num) <= 0.2 else num
+            return f"{pct:+.2f}%"
+        except Exception:
+            return s
+    try:
+        num = float(val)
+        pct = num * 100.0 if abs(num) <= 0.2 else num
+        return f"{pct:+.2f}%"
+    except Exception:
+        return "-"
+
+def _build_display_foreign_flow_table(flow_res: dict) -> pd.DataFrame:
+    """組合最新一筆外資資金流向與既有本地歷史紀錄（若有），供前端表格檢視。"""
+    try:
+        latest_df = core.build_foreign_fund_flow_df(flow_res, for_excel=False)
+        if not os.path.exists(FOREIGN_FLOW_HISTORY_FILE):
+            return latest_df
+
+        hist_df = pd.read_excel(FOREIGN_FLOW_HISTORY_FILE, sheet_name=FOREIGN_FLOW_SHEET_NAME, engine="openpyxl")
+        if hist_df is None or hist_df.empty or "日期" not in hist_df.columns:
+            return latest_df
+
+        for col in core.FOREIGN_FUND_FLOW_COLUMNS:
+            if col not in hist_df.columns:
+                hist_df[col] = np.nan
+        hist_df = hist_df[core.FOREIGN_FUND_FLOW_COLUMNS].copy()
+        hist_df["日期"] = hist_df["日期"].astype(str).str.strip()
+        hist_df = hist_df[hist_df["日期"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)]
+        hist_df["匯率單日變動(%)"] = hist_df["匯率單日變動(%)"].apply(_format_pct_display)
+
+        if isinstance(flow_res, dict) and flow_res.get("status") == "success":
+            merged = pd.concat([hist_df, latest_df], ignore_index=True)
+            merged["日期"] = merged["日期"].astype(str).str.strip()
+            merged = merged.drop_duplicates(subset=["日期"], keep="last")
+            merged = merged.sort_values(by="日期", ascending=False).reset_index(drop=True)
+            return merged[core.FOREIGN_FUND_FLOW_COLUMNS]
+
+        hist_df = hist_df.sort_values(by="日期", ascending=False).reset_index(drop=True)
+        return hist_df[core.FOREIGN_FUND_FLOW_COLUMNS]
+    except Exception:
+        return core.build_foreign_fund_flow_df(flow_res, for_excel=False)
 
 st.set_page_config(page_title="台股 K線型態與位階深度解析系統", layout="wide")
 
@@ -114,10 +180,11 @@ selected_page = st.radio("📌 快速切換功能分頁：", page_options, horiz
 if selected_page == "🛡️ 跨市場波動率監控":
     col_h1, col_h2 = st.columns([4, 1])
     with col_h1:
-        st.write("透過純 `yfinance` 監控 `^VIX`、`^VVIX`、`^VXN` 與 `^TWII`（HV20 / ATR14% 本地波動替代指標），自動判定「戰時恐慌警戒」與「平時常態震盪」體制，提供避險預警與止跌反彈濾網。")
+        st.write("透過純 `yfinance` 監控 `^VIX`、`^VVIX`、`^VXN` 與 `^TWII`（HV20 / ATR14% 本地波動替代指標），自動判定「戰時恐慌警戒」與「平時常態震盪」體制，並整合外資實質資金流向（匯率＋現貨買賣超連動）監控。")
     with col_h2:
         if st.button("🔄 重新整理最新數據", type="primary", use_container_width=True):
             get_volatility_monitor_report.clear()
+            get_foreign_fund_flow_report.clear()
             st.rerun()
 
     with st.spinner("⏳ 正在透過 yfinance 抓取跨市場波動率與加權指數資料..."):
@@ -216,6 +283,67 @@ if selected_page == "🛡️ 跨市場波動率監控":
         metrics_df = pd.DataFrame(vol_res["metrics_table"])
         st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
+    # ------------------------------------------------
+    # 外資實質資金流向（匯率＋現貨買賣超連動）監控區塊
+    # ------------------------------------------------
+    st.markdown("---")
+    st.subheader("💱 外資資金流向監控（匯率＋現貨買賣超連動）")
+    try:
+        with st.spinner("⏳ 正在同步抓取證交所外資買賣超與 USD/TWD 匯率數據..."):
+            flow_res = get_foreign_fund_flow_report()
+
+        if not isinstance(flow_res, dict) or flow_res.get("status") != "success":
+            err_msg = flow_res.get("msg", "無法取得外資資金流向資料，請稍後再試。") if isinstance(flow_res, dict) else "資料載入失敗。"
+            st.warning(f"⚠️ {err_msg}")
+        else:
+            f_sev = flow_res.get("severity", "info")
+            flow_banner = (
+                f"#### 【{flow_res['flow_signal']}】\n\n"
+                f"- **最新交易日**：證交所現貨 `{flow_res['date']}` ｜ 匯率 `TWD=X` `{flow_res['fx_date']}`\n"
+                f"- **連動判讀**：{flow_res['signal_desc']}"
+            )
+            if f_sev == "error":
+                st.error(flow_banner)
+            elif f_sev == "warning":
+                st.warning(flow_banner)
+            elif f_sev == "success":
+                st.success(flow_banner)
+            else:
+                st.info(flow_banner)
+
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            fc1.metric(
+                "外資單日買賣超 (億)",
+                f"{flow_res['foreign_net_yi']:+,.2f}",
+                delta=f"買 {flow_res['foreign_buy_yi']:,.2f} / 賣 {flow_res['foreign_sell_yi']:,.2f}",
+                delta_color="off"
+            )
+            cum_val = flow_res.get("month_cum_net_yi", np.nan)
+            fc2.metric(
+                "當月累計買賣超 (億)",
+                f"{cum_val:+,.2f}" if pd.notna(cum_val) else "-",
+                delta=f"截至 {flow_res['date']}",
+                delta_color="off"
+            )
+            fc3.metric(
+                "USD/TWD 收盤匯率",
+                f"{flow_res['fx_rate']:.4f}",
+                delta=f"{flow_res['fx_change_pct']:+.2f}% ({flow_res['fx_change_jiao']:+.2f} 角)",
+                delta_color="inverse"
+            )
+            fc4.metric(
+                "外資資金流向判定",
+                flow_res["flow_signal"],
+                delta="正值=台幣貶值 / 負值=升值",
+                delta_color="off"
+            )
+
+            flow_table_df = _build_display_foreign_flow_table(flow_res)
+            st.dataframe(flow_table_df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"⚠️ 外資資金流向監控區塊顯示異常：{str(e)}")
+
+    if vol_res and vol_res.get("status") == "success":
         st.markdown("---")
         st.subheader("📈 近 3 個月跨市場波動率與台股本地波動走勢")
         hist = vol_res.get("history", {})
