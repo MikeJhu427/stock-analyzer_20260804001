@@ -1,12 +1,178 @@
 import os
 import io
+import glob
 import time
 import datetime
+from copy import copy
 import numpy as np
 import pandas as pd
 import strategy_core as core
 
 CONFIG = core.DEFAULT_CONFIG.copy()
+FOREIGN_FLOW_SHEET_NAME = "外資資金流向監控"
+FOREIGN_FLOW_HISTORY_FILE = "foreign_fund_flow_history.xlsx"
+
+
+def _calc_display_width(text) -> int:
+    """估算儲存格文字顯示寬度（中文字／全形字計 2，其餘計 1）。"""
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return 0
+    s = str(text)
+    width = 0
+    for ch in s:
+        width += 2 if ord(ch) > 127 else 1
+    return width
+
+
+def _normalize_pct_ratio(val):
+    """將歷史紀錄中的百分比欄位統一正規化為小數比例（例如 -0.35% -> -0.0035）。"""
+    if pd.isna(val) or val is None:
+        return np.nan
+    if isinstance(val, str):
+        s = val.strip().replace(",", "")
+        if s in ("", "-"):
+            return np.nan
+        if s.endswith("%"):
+            try:
+                return float(s[:-1]) / 100.0
+            except Exception:
+                return np.nan
+        try:
+            num = float(s)
+            return num / 100.0 if abs(num) > 0.2 else num
+        except Exception:
+            return np.nan
+    try:
+        return float(val)
+    except Exception:
+        return np.nan
+
+
+def _load_existing_foreign_flow_history() -> pd.DataFrame:
+    """讀取既有 Excel 活頁簿中的「外資資金流向監控」歷史紀錄（若不存在則回傳空表）。"""
+    candidates = []
+    if os.path.exists(FOREIGN_FLOW_HISTORY_FILE):
+        candidates.append(FOREIGN_FLOW_HISTORY_FILE)
+
+    existing_scans = sorted(
+        glob.glob("auto_scan_all_*.xlsx"),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True
+    )
+    candidates.extend(existing_scans)
+
+    for path in candidates:
+        try:
+            hist_df = pd.read_excel(path, sheet_name=FOREIGN_FLOW_SHEET_NAME, engine="openpyxl")
+            if hist_df is not None and not hist_df.empty and "日期" in hist_df.columns:
+                for col in core.FOREIGN_FUND_FLOW_COLUMNS:
+                    if col not in hist_df.columns:
+                        hist_df[col] = np.nan
+                hist_df = hist_df[core.FOREIGN_FUND_FLOW_COLUMNS].copy()
+                hist_df["日期"] = hist_df["日期"].astype(str).str.strip()
+                hist_df = hist_df[hist_df["日期"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)]
+                for col in ["外資單日買進(億)", "外資單日賣出(億)", "外資單日買賣超(億)", "當月累計買賣超(億)", "USD/TWD匯率"]:
+                    hist_df[col] = pd.to_numeric(hist_df[col], errors="coerce")
+                hist_df["匯率單日變動(%)"] = hist_df["匯率單日變動(%)"].apply(_normalize_pct_ratio)
+                if not hist_df.empty:
+                    return hist_df
+        except Exception:
+            continue
+
+    return pd.DataFrame(columns=core.FOREIGN_FUND_FLOW_COLUMNS)
+
+
+def _merge_foreign_flow_history(flow_res: dict) -> pd.DataFrame:
+    """依日期去重後附加（Append & Deduplicate by 日期）保留歷史趨勢。"""
+    hist_df = _load_existing_foreign_flow_history()
+    new_df = core.build_foreign_fund_flow_df(flow_res, for_excel=True)
+
+    if flow_res.get("status") != "success":
+        return hist_df if not hist_df.empty else new_df
+
+    try:
+        new_df["日期"] = new_df["日期"].astype(str).str.strip()
+        if hist_df.empty:
+            merged_df = new_df.copy()
+        else:
+            merged_df = pd.concat([hist_df, new_df], ignore_index=True)
+            merged_df["日期"] = merged_df["日期"].astype(str).str.strip()
+            merged_df = merged_df.drop_duplicates(subset=["日期"], keep="last")
+            merged_df = merged_df.sort_values(by="日期", ascending=True).reset_index(drop=True)
+        return merged_df[core.FOREIGN_FUND_FLOW_COLUMNS]
+    except Exception:
+        return new_df
+
+
+def _format_foreign_flow_sheet(writer, sheet_name: str, ref_sheet_name: str = "全市場掃描結果"):
+    """維持與原本 Excel 相同字型，並套用數值格式（金額兩位小數、百分比 0.00%）與自動欄寬。"""
+    try:
+        ws = writer.sheets.get(sheet_name)
+        if ws is None:
+            return
+
+        ref_ws = writer.sheets.get(ref_sheet_name)
+        header_font = copy(ref_ws["A1"].font) if (ref_ws is not None and ref_ws.max_row >= 1) else None
+        data_font = copy(ref_ws["A2"].font) if (ref_ws is not None and ref_ws.max_row >= 2) else None
+
+        amount_cols = {
+            "外資單日買進(億)",
+            "外資單日賣出(億)",
+            "外資單日買賣超(億)",
+            "當月累計買賣超(億)"
+        }
+        fx_cols = {"USD/TWD匯率"}
+        pct_cols = {"匯率單日變動(%)"}
+
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+
+        for col_idx, col_name in enumerate(headers, start=1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_len = _calc_display_width(col_name)
+
+            if header_font is not None:
+                ws.cell(row=1, column=col_idx).font = copy(header_font)
+
+            for row_idx in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if data_font is not None:
+                    cell.font = copy(data_font)
+
+                val = cell.value
+                display_str = ""
+                if col_name in amount_cols and isinstance(val, (int, float)) and pd.notna(val):
+                    cell.number_format = "#,##0.00"
+                    display_str = f"{val:,.2f}"
+                elif col_name in fx_cols and isinstance(val, (int, float)) and pd.notna(val):
+                    cell.number_format = "0.0000"
+                    display_str = f"{val:.4f}"
+                elif col_name in pct_cols and isinstance(val, (int, float)) and pd.notna(val):
+                    cell.number_format = "0.00%"
+                    display_str = f"{val * 100:.2f}%"
+                elif val is not None:
+                    display_str = str(val)
+
+                max_len = max(max_len, _calc_display_width(display_str))
+
+            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 45)
+    except Exception:
+        pass
+
+
+def _persist_foreign_flow_history(flow_df: pd.DataFrame):
+    """將去重後的歷史紀錄同步保存於本地檔案，供後續排程延續趨勢。"""
+    try:
+        if flow_df is None or flow_df.empty:
+            return
+        valid_df = flow_df[flow_df["日期"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)]
+        if valid_df.empty:
+            return
+        with pd.ExcelWriter(FOREIGN_FLOW_HISTORY_FILE, engine="openpyxl") as writer:
+            valid_df.to_excel(writer, sheet_name=FOREIGN_FLOW_SHEET_NAME, index=False)
+            _format_foreign_flow_sheet(writer, FOREIGN_FLOW_SHEET_NAME, ref_sheet_name=FOREIGN_FLOW_SHEET_NAME)
+    except Exception:
+        pass
+
 
 def run_full_scan():
     print("🚀 [Step 0] 執行跨市場波動率體制與避險/反彈監控...")
@@ -25,6 +191,29 @@ def run_full_scan():
         print(f"💡 操作建議：{vol_res['advice']}")
     else:
         print(f"⚠️ 跨市場波動率監控警告：{vol_res.get('msg', '資料取得失敗')}")
+
+    print("🚀 [Step 0.5] 執行外資實質資金流向（匯率＋現貨買賣超連動）監控...")
+    try:
+        flow_res = core.fetch_foreign_fund_flow()
+    except Exception as e:
+        flow_res = {"status": "error", "msg": f"外資資金流向監控異常：{str(e)}"}
+
+    try:
+        foreign_flow_df = _merge_foreign_flow_history(flow_res)
+    except Exception:
+        foreign_flow_df = core.build_foreign_fund_flow_df(flow_res, for_excel=True)
+
+    if flow_res.get("status") == "success":
+        cum_val = flow_res.get("month_cum_net_yi", np.nan)
+        cum_str = f"{cum_val:+.2f} 億" if pd.notna(cum_val) else "-"
+        print(
+            f"💱 [{flow_res['date']}] 外資單日買賣超：{flow_res['foreign_net_yi']:+.2f} 億 "
+            f"(當月累計：{cum_str}) | USD/TWD：{flow_res['fx_rate']:.4f} "
+            f"({flow_res['fx_change_pct']:+.2f}% / {flow_res['fx_change_jiao']:+.2f} 角) | "
+            f"判定：【{flow_res['flow_signal']}】"
+        )
+    else:
+        print(f"⚠️ 外資資金流向監控警告：{flow_res.get('msg', '資料取得失敗')}")
 
     print("🚀 [Step 1] 初始化：正在獲取台股上市櫃清單...")
     stock_dict = core.fetch_all_tw_stocks()
@@ -268,6 +457,9 @@ def run_full_scan():
         print("📊 掃描完成！最終報表標的預覽：")
         print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線糾結狀態', '短均線糾結狀態']].to_string())
 
+        # 本地同步保留外資資金流向歷史紀錄（供下次執行去重附加）
+        _persist_foreign_flow_history(foreign_flow_df)
+
         webhook_url = os.environ.get("GAS_WEBHOOK_URL", "").strip()
         token = os.environ.get("GAS_SECRET_TOKEN", "").strip()
         
@@ -277,11 +469,16 @@ def run_full_scan():
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
-                # 強制採用 openpyxl 輸出雙工作表 .xlsx（掃描結果 + 波動率體制監控）
+                # 強制採用 openpyxl 輸出三工作表 .xlsx（掃描結果 + 波動率體制監控 + 外資資金流向監控）
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     res_df.to_excel(writer, sheet_name="全市場掃描結果", index=False)
                     vol_report_df.to_excel(writer, sheet_name="波動率體制監控", index=False)
+                    try:
+                        foreign_flow_df.to_excel(writer, sheet_name=FOREIGN_FLOW_SHEET_NAME, index=False)
+                        _format_foreign_flow_sheet(writer, FOREIGN_FLOW_SHEET_NAME, ref_sheet_name="全市場掃描結果")
+                    except Exception as fe:
+                        print(f"⚠️ 寫入「{FOREIGN_FLOW_SHEET_NAME}」工作表失敗，維持主報表匯出：{fe}")
                 buffer.seek(0)
                 xlsx_bytes = buffer.read()
                 
