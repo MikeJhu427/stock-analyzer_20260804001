@@ -4,11 +4,12 @@ import time
 import requests
 import datetime
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from scipy.signal import argrelextrema
@@ -2748,3 +2749,565 @@ def build_foreign_fund_flow_df(flow_res: Dict, for_excel: bool = False) -> pd.Da
     if not for_excel:
         rec["匯率單日變動(%)"] = f"{flow_res['fx_change_pct']:+.2f}%"
     return pd.DataFrame([rec], columns=FOREIGN_FUND_FLOW_COLUMNS)
+
+
+# ==========================================
+# 空頭避風港強勢股（方案 B）盤後選股掃描模組
+# ==========================================
+SAFE_HAVEN_COLUMNS = [
+    "股票代號",
+    "股票名稱",
+    "狀態判定",
+    "最新收盤價",
+    "60MA季線價",
+    "10MA移動停利參考價",
+    "距60MA乖離率(%)",
+    "15日超額報酬RS(%)",
+    "5日均量(張)"
+]
+
+
+class BearMarketSafeHavenStrategy:
+    """空頭避風港強勢股（方案 B）核心量化策略引擎。"""
+
+    GATE_BLOCKED_MSG = "目前大盤尚處於第一波恐慌期或未進入第二波回測壓力測試，暫不啟動方案 B 掃描"
+    STATUS_BREAKOUT = "🚀 突破點火（右側試單訊號）"
+    STATUS_HOLDING = "🛡️ 通過雙波測試（抗跌蓄勢觀察中）"
+    MIN_REQUIRED_BARS = 85
+
+    @staticmethod
+    def filter_common_stocks(stock_dict: Dict[str, str]) -> Dict[str, str]:
+        """
+        從 fetch_all_tw_stocks() 回傳字典中過濾上市(.TW)與上櫃(.TWO)所有普通股：
+        僅保留 4 碼純數字且非 00 開頭的代號，並排除 ETF、權證、ETN 與 TDR（91 開頭或 -DR 結尾）。
+        """
+        filtered = {}
+        if not isinstance(stock_dict, dict):
+            return filtered
+
+        for ticker, name in stock_dict.items():
+            t_str = str(ticker).strip().upper()
+            if not (t_str.endswith(".TW") or t_str.endswith(".TWO")):
+                continue
+            code = t_str.split(".")[0]
+            name_str = str(name).strip()
+            if not (code.isdigit() and len(code) == 4):
+                continue
+            if code.startswith("00"):
+                continue
+            if code.startswith("91") or name_str.upper().endswith("-DR"):
+                continue
+            filtered[t_str] = name_str
+        return filtered
+
+    @staticmethod
+    def _normalize_ohlcv_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """統一去除時區、正規化日線日期索引、去重排序並清理無效列。"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = df.copy()
+        if isinstance(out.columns, pd.MultiIndex):
+            lv0 = out.columns.get_level_values(0)
+            lv1 = out.columns.get_level_values(1)
+            if "Close" in lv0:
+                out.columns = lv0
+            elif "Close" in lv1:
+                out.columns = lv1
+            else:
+                return pd.DataFrame()
+
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()]
+        required_cols = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in out.columns for c in required_cols):
+            return pd.DataFrame()
+
+        out = out[required_cols].copy()
+        for col in required_cols:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+        out = out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        out = out[(out["Close"] > 0) & (out["Low"] > 0) & (out["High"] >= out["Low"]) & (out["Volume"] >= 0)]
+        if out.empty:
+            return pd.DataFrame()
+
+        idx = pd.to_datetime(out.index)
+        try:
+            if idx.tz is not None:
+                idx = idx.tz_convert("Asia/Taipei").tz_localize(None)
+        except Exception:
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+        out.index = idx.normalize()
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        return out
+
+    @staticmethod
+    def _extract_ticker_df(raw_df: Optional[pd.DataFrame], ticker: str, single_ticker: bool = False) -> pd.DataFrame:
+        """從 yfinance 批次或單檔下載結果抽取單一標的之標準化 OHLCV DataFrame。"""
+        if raw_df is None or raw_df.empty:
+            return pd.DataFrame()
+        try:
+            if isinstance(raw_df.columns, pd.MultiIndex):
+                lv0 = raw_df.columns.get_level_values(0)
+                lv1 = raw_df.columns.get_level_values(1)
+                if ticker in lv0:
+                    sub = raw_df.xs(ticker, axis=1, level=0)
+                elif ticker in lv1:
+                    sub = raw_df.xs(ticker, axis=1, level=1)
+                elif single_ticker:
+                    sub = raw_df.copy()
+                else:
+                    return pd.DataFrame()
+            else:
+                sub = raw_df.copy() if single_ticker else pd.DataFrame()
+            return BearMarketSafeHavenStrategy._normalize_ohlcv_df(sub)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def fetch_twii_data(session=None, period: str = "6mo") -> pd.DataFrame:
+        """下載加權指數 (^TWII) 近 6 個月日線資料並標準化索引。"""
+        yf_sess = session if session is not None else get_yf_session()
+        for use_sess in (True, False):
+            try:
+                kw = {
+                    "period": period,
+                    "interval": "1d",
+                    "auto_adjust": False,
+                    "progress": False,
+                    "threads": False
+                }
+                if use_sess:
+                    kw["session"] = yf_sess
+                raw = yf.download("^TWII", **kw)
+                df = BearMarketSafeHavenStrategy._extract_ticker_df(raw, "^TWII", single_ticker=True)
+                if not df.empty and len(df) >= 75:
+                    return df
+            except Exception:
+                continue
+
+        try:
+            hist = yf.Ticker("^TWII", session=yf_sess).history(period=period, auto_adjust=False)
+            return BearMarketSafeHavenStrategy._normalize_ohlcv_df(hist)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def evaluate_market_gate(twii_df: Optional[pd.DataFrame] = None, session=None) -> Dict:
+        """
+        檢核大盤 (^TWII) 條件 1 與條件 2 閘門狀態：
+        - 條件 1：最新收盤低於 60MA，且過去 10 個交易日至少 7 日收盤位於 60MA 之下。
+        - 條件 2：近 7 個交易日最低點 <= 前段（第 -25 至 -8 日）波段低點 Low_1 * 1.01。
+        """
+        tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+        eval_time_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+
+        df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(twii_df) if twii_df is not None else BearMarketSafeHavenStrategy.fetch_twii_data(session=session)
+        if df.empty or len(df) < 75:
+            return {
+                "status": "error",
+                "eval_time": eval_time_str,
+                "gate_passed": False,
+                "cond1_passed": False,
+                "cond2_passed": False,
+                "message": "無法取得足夠的加權指數 (^TWII) 近 6 個月日線資料，無法執行方案 B 大盤閘門檢核。",
+                "twii_df": pd.DataFrame()
+            }
+
+        df = df.copy()
+        df["MA60"] = df["Close"].rolling(60).mean()
+        if df["MA60"].iloc[-10:].isna().any():
+            return {
+                "status": "error",
+                "eval_time": eval_time_str,
+                "gate_passed": False,
+                "cond1_passed": False,
+                "cond2_passed": False,
+                "message": "加權指數 (^TWII) 季線 (60MA) 樣本不足，無法執行方案 B 大盤閘門檢核。",
+                "twii_df": df
+            }
+
+        latest_date = df.index[-1].strftime("%Y-%m-%d")
+        latest_close = float(df["Close"].iloc[-1])
+        latest_ma60 = float(df["MA60"].iloc[-1])
+
+        recent_10 = df.iloc[-10:]
+        below_ma60_days_10 = int((recent_10["Close"] < recent_10["MA60"]).sum())
+        cond1_passed = bool((latest_close < latest_ma60) and (below_ma60_days_10 >= 7))
+
+        prev_seg = df.iloc[-25:-7]
+        recent_seg = df.iloc[-7:]
+
+        low_1_idx = prev_seg["Low"].idxmin()
+        prev_low_1 = float(prev_seg.loc[low_1_idx, "Low"])
+        prev_low_1_date = low_1_idx.strftime("%Y-%m-%d")
+
+        recent_low_idx = recent_seg["Low"].idxmin()
+        recent_low_7d = float(recent_seg.loc[recent_low_idx, "Low"])
+        recent_low_7d_date = recent_low_idx.strftime("%Y-%m-%d")
+
+        low_threshold = prev_low_1 * 1.01
+        cond2_passed = bool(prev_low_1 > 0 and recent_low_7d <= low_threshold)
+        is_new_low = bool(recent_low_7d < prev_low_1)
+        low_ratio_pct = round((recent_low_7d / prev_low_1 - 1.0) * 100.0, 2) if prev_low_1 > 0 else np.nan
+
+        gate_passed = bool(cond1_passed and cond2_passed)
+        if gate_passed:
+            msg = "大盤同時滿足條件 1（破季線時間閘門）與條件 2（第二波回測／破底壓力測試），啟動方案 B 掃描。"
+        else:
+            msg = BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG
+
+        return {
+            "status": "success",
+            "eval_time": eval_time_str,
+            "gate_passed": gate_passed,
+            "cond1_passed": cond1_passed,
+            "cond2_passed": cond2_passed,
+            "message": msg,
+            "latest_date": latest_date,
+            "latest_close": round(latest_close, 2),
+            "latest_ma60": round(latest_ma60, 2),
+            "below_ma60_days_10": below_ma60_days_10,
+            "prev_low_1": round(prev_low_1, 2),
+            "prev_low_1_date": prev_low_1_date,
+            "recent_low_7d": round(recent_low_7d, 2),
+            "recent_low_7d_date": recent_low_7d_date,
+            "low_threshold": round(low_threshold, 2),
+            "low_ratio_pct": low_ratio_pct,
+            "is_new_low": is_new_low,
+            "twii_df": df
+        }
+
+    @staticmethod
+    def evaluate_single_stock(
+        ticker: str,
+        stock_name: str,
+        stock_df: Optional[pd.DataFrame],
+        twii_df: Optional[pd.DataFrame]
+    ) -> Optional[Dict]:
+        """
+        對單一普通股執行方案 B 條件 3、4、5 量化篩選與訊號分級。
+        通過全部條件則回傳標準欄位 dict，否則回傳 None。
+        """
+        try:
+            s_df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(stock_df)
+            t_df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(twii_df)
+            if s_df.empty or t_df.empty:
+                return None
+            if len(s_df) < BearMarketSafeHavenStrategy.MIN_REQUIRED_BARS or len(t_df) < 25:
+                return None
+
+            s_df = s_df.copy()
+            s_df["MA10"] = s_df["Close"].rolling(10).mean()
+            s_df["MA60"] = s_df["Close"].rolling(60).mean()
+            s_df["Vol_MA5"] = s_df["Volume"].rolling(5).mean()
+
+            common_idx = s_df.index.intersection(t_df.index)
+            if len(common_idx) < 26:
+                return None
+
+            # 確保個股最新交易日與大盤同步（排除已停牌或過舊標的）
+            if common_idx[-1] < t_df.index[-2]:
+                return None
+
+            s_aligned = s_df.loc[common_idx]
+            t_aligned = t_df.loc[common_idx]
+
+            # 檢查必要指標無 NaN 斷層
+            if (
+                s_aligned["MA60"].iloc[-15:].isna().any()
+                or pd.isna(s_aligned["MA60"].iloc[-11])
+                or pd.isna(s_aligned["MA10"].iloc[-1])
+                or pd.isna(s_aligned["Vol_MA5"].iloc[-1])
+                or pd.isna(s_aligned["Vol_MA5"].iloc[-2])
+            ):
+                return None
+
+            # 條件 3：個股全程守穩 60MA 季線多方防線
+            cond3_all_above_ma60 = bool((s_aligned["Close"].iloc[-15:] > s_aligned["MA60"].iloc[-15:]).all())
+            latest_ma60 = float(s_aligned["MA60"].iloc[-1])
+            ma60_10d_ago = float(s_aligned["MA60"].iloc[-11])
+            cond3_ma60_trend = bool(latest_ma60 > 0 and ma60_10d_ago > 0 and latest_ma60 >= ma60_10d_ago * 0.99)
+            if not (cond3_all_above_ma60 and cond3_ma60_trend):
+                return None
+
+            # 條件 4：個股結構底背離（底底高 + 近 15 日對大盤超額報酬 RS > +8%）
+            stock_prev_low = float(s_aligned["Low"].iloc[-25:-7].min())
+            stock_recent_low = float(s_aligned["Low"].iloc[-7:].min())
+            if stock_prev_low <= 0 or not (stock_recent_low > stock_prev_low * 1.02):
+                return None
+
+            stock_c_now = float(s_aligned["Close"].iloc[-1])
+            stock_c_15d = float(s_aligned["Close"].iloc[-16])
+            twii_c_now = float(t_aligned["Close"].iloc[-1])
+            twii_c_15d = float(t_aligned["Close"].iloc[-16])
+            if stock_c_15d <= 0 or twii_c_15d <= 0:
+                return None
+
+            stock_ret_15d = (stock_c_now / stock_c_15d - 1.0) * 100.0
+            twii_ret_15d = (twii_c_now / twii_c_15d - 1.0) * 100.0
+            rs_15d = stock_ret_15d - twii_ret_15d
+            if rs_15d <= 8.0:
+                return None
+
+            # 條件 5：流動性濾網（5 日均量 > 1,500 張，即 1,500,000 股）
+            vol_ma5_shares = float(s_aligned["Vol_MA5"].iloc[-1])
+            if vol_ma5_shares <= 1_500_000.0:
+                return None
+
+            # 訊號分級：突破近 10 日（不含當日）最高價且當日量 > 前一日 5 日均量 1.3 倍
+            prev_10d_high = float(s_aligned["High"].iloc[-11:-1].max())
+            latest_vol = float(s_aligned["Volume"].iloc[-1])
+            prev_vol_ma5 = float(s_aligned["Vol_MA5"].iloc[-2])
+            is_breakout = bool(
+                (stock_c_now > prev_10d_high)
+                and (prev_vol_ma5 > 0)
+                and (latest_vol > prev_vol_ma5 * 1.3)
+            )
+            status_label = (
+                BearMarketSafeHavenStrategy.STATUS_BREAKOUT
+                if is_breakout
+                else BearMarketSafeHavenStrategy.STATUS_HOLDING
+            )
+
+            latest_ma10 = float(s_aligned["MA10"].iloc[-1])
+            bias_60ma = (stock_c_now - latest_ma60) / latest_ma60 * 100.0
+            vol_ma5_lots = vol_ma5_shares / 1000.0
+
+            return {
+                "股票代號": str(ticker).split(".")[0],
+                "股票名稱": str(stock_name).strip(),
+                "狀態判定": status_label,
+                "最新收盤價": round(stock_c_now, 2),
+                "60MA季線價": round(latest_ma60, 2),
+                "10MA移動停利參考價": round(latest_ma10, 2),
+                "距60MA乖離率(%)": round(bias_60ma, 2),
+                "15日超額報酬RS(%)": round(rs_15d, 2),
+                "5日均量(張)": round(vol_ma5_lots, 1)
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _download_chunk_worker(chunk: List[str], period: str = "6mo", request_delay: float = 0.35) -> Dict[str, pd.DataFrame]:
+        """單一執行緒批次下載工作函式，內建獨立 Session、Rate Limit 防護與例外隔離。"""
+        result_map = {}
+        worker_session = get_yf_session()
+        single_mode = len(chunk) == 1
+        raw = None
+
+        for use_sess in (True, False):
+            try:
+                kw = {
+                    "period": period,
+                    "interval": "1d",
+                    "auto_adjust": False,
+                    "progress": False,
+                    "threads": False
+                }
+                if use_sess:
+                    kw["session"] = worker_session
+                raw = yf.download(chunk, **kw)
+                if raw is not None and not raw.empty:
+                    break
+            except Exception:
+                raw = None
+
+        if raw is not None and not raw.empty:
+            for ticker in chunk:
+                try:
+                    df_t = BearMarketSafeHavenStrategy._extract_ticker_df(raw, ticker, single_ticker=single_mode)
+                    if not df_t.empty:
+                        result_map[ticker] = df_t
+                except Exception:
+                    continue
+
+        if request_delay > 0:
+            time.sleep(request_delay)
+        return result_map
+
+    @staticmethod
+    def scan_market(
+        stock_dict: Optional[Dict[str, str]] = None,
+        twii_df: Optional[pd.DataFrame] = None,
+        preloaded_data: Optional[Dict[str, pd.DataFrame]] = None,
+        max_workers: int = 5,
+        chunk_size: int = 30,
+        request_delay: float = 0.35,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        session=None
+    ) -> Dict:
+        """
+        執行方案 B 完整盤後掃描流程：
+        1. 先執行大盤 (^TWII) 條件 1 與條件 2 閘門檢核；未通過則立即停止，不進行個股下載。
+        2. 過濾上市／上櫃普通股，優先複用 preloaded_data（若有效筆數 >= 85 日），剩餘標的以 ThreadPoolExecutor 批次下載。
+        3. 執行條件 3、4、5 與訊號分級，依 15日超額報酬RS(%) 由高到低排序回傳標準 DataFrame。
+        """
+        yf_sess = session if session is not None else get_yf_session()
+        gate_info = BearMarketSafeHavenStrategy.evaluate_market_gate(twii_df=twii_df, session=yf_sess)
+
+        empty_df = pd.DataFrame(columns=SAFE_HAVEN_COLUMNS)
+        if gate_info.get("status") != "success":
+            return {
+                "status": "error",
+                "gate_passed": False,
+                "message": gate_info.get("message", "大盤閘門檢核失敗"),
+                "gate_info": gate_info,
+                "scanned_count": 0,
+                "reused_count": 0,
+                "results_df": empty_df
+            }
+
+        if not gate_info.get("gate_passed", False):
+            return {
+                "status": "blocked",
+                "gate_passed": False,
+                "message": BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG,
+                "gate_info": gate_info,
+                "scanned_count": 0,
+                "reused_count": 0,
+                "results_df": empty_df
+            }
+
+        raw_stocks = stock_dict if stock_dict is not None else fetch_all_tw_stocks()
+        common_stocks = BearMarketSafeHavenStrategy.filter_common_stocks(raw_stocks)
+        tickers = list(common_stocks.keys())
+        total_count = len(tickers)
+
+        if total_count == 0:
+            return {
+                "status": "error",
+                "gate_passed": True,
+                "message": "無法取得上市／上櫃普通股清單，無法執行方案 B 掃描。",
+                "gate_info": gate_info,
+                "scanned_count": 0,
+                "reused_count": 0,
+                "results_df": empty_df
+            }
+
+        twii_clean = gate_info["twii_df"]
+        matched_rows = []
+        to_download = []
+        reused_count = 0
+        processed_count = 0
+
+        # 優先複用呼叫端已下載之日線資料（降低重複請求）
+        if isinstance(preloaded_data, dict) and preloaded_data:
+            for ticker in tickers:
+                cached_df = preloaded_data.get(ticker)
+                if cached_df is not None and not cached_df.empty:
+                    norm_df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(cached_df)
+                    if len(norm_df) >= BearMarketSafeHavenStrategy.MIN_REQUIRED_BARS:
+                        reused_count += 1
+                        processed_count += 1
+                        row = BearMarketSafeHavenStrategy.evaluate_single_stock(
+                            ticker=ticker,
+                            stock_name=common_stocks[ticker],
+                            stock_df=norm_df,
+                            twii_df=twii_clean
+                        )
+                        if row is not None:
+                            matched_rows.append(row)
+                        continue
+                to_download.append(ticker)
+        else:
+            to_download = tickers
+
+        if progress_callback and processed_count > 0:
+            try:
+                progress_callback(processed_count, total_count, f"已複用快取日線 {processed_count} / {total_count} 檔...")
+            except Exception:
+                pass
+
+        # 剩餘標的以 ThreadPoolExecutor 分批下載與評估
+        if to_download:
+            safe_chunk_size = max(1, int(chunk_size))
+            safe_workers = max(1, min(int(max_workers), 8))
+            chunks = [to_download[i:i + safe_chunk_size] for i in range(0, len(to_download), safe_chunk_size)]
+
+            with ThreadPoolExecutor(max_workers=safe_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        BearMarketSafeHavenStrategy._download_chunk_worker,
+                        chunk,
+                        "6mo",
+                        request_delay
+                    ): chunk
+                    for chunk in chunks
+                }
+                for future in as_completed(future_map):
+                    chunk = future_map[future]
+                    try:
+                        chunk_data = future.result()
+                    except Exception:
+                        chunk_data = {}
+
+                    for ticker in chunk:
+                        try:
+                            df_t = chunk_data.get(ticker)
+                            if df_t is not None and not df_t.empty:
+                                row = BearMarketSafeHavenStrategy.evaluate_single_stock(
+                                    ticker=ticker,
+                                    stock_name=common_stocks[ticker],
+                                    stock_df=df_t,
+                                    twii_df=twii_clean
+                                )
+                                if row is not None:
+                                    matched_rows.append(row)
+                        except Exception:
+                            continue
+
+                    processed_count += len(chunk)
+                    if progress_callback:
+                        try:
+                            progress_callback(
+                                min(processed_count, total_count),
+                                total_count,
+                                f"正在掃描方案 B 普通股：{min(processed_count, total_count)} / {total_count} 檔（已入選 {len(matched_rows)} 檔）..."
+                            )
+                        except Exception:
+                            pass
+
+        if matched_rows:
+            results_df = pd.DataFrame(matched_rows, columns=SAFE_HAVEN_COLUMNS)
+            results_df = results_df.sort_values(by="15日超額報酬RS(%)", ascending=False).reset_index(drop=True)
+            msg = f"方案 B 掃描完成，共檢測 {total_count} 檔普通股，精選出 {len(results_df)} 檔空頭避風港強勢股。"
+        else:
+            results_df = empty_df
+            msg = f"方案 B 掃描完成，共檢測 {total_count} 檔普通股，今日無同時符合 5 項嚴格條件之標的。"
+
+        return {
+            "status": "success",
+            "gate_passed": True,
+            "message": msg,
+            "gate_info": gate_info,
+            "scanned_count": total_count,
+            "reused_count": reused_count,
+            "results_df": results_df
+        }
+
+    @staticmethod
+    def build_excel_dataframe(scan_res: Optional[Dict]) -> pd.DataFrame:
+        """
+        產生供 Excel 第 4 工作表（空頭避風港_方案B）寫入的標準化 DataFrame；
+        若當日大盤未通過閘門或無達標標的，則輸出單列狀態說明以維持報表結構完整。
+        """
+        if isinstance(scan_res, dict):
+            res_df = scan_res.get("results_df")
+            if isinstance(res_df, pd.DataFrame) and not res_df.empty:
+                return res_df[SAFE_HAVEN_COLUMNS].copy()
+            status_msg = scan_res.get("message") or BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG
+        else:
+            status_msg = BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG
+
+        return pd.DataFrame([{
+            "股票代號": "-",
+            "股票名稱": "方案 B 狀態說明",
+            "狀態判定": status_msg,
+            "最新收盤價": np.nan,
+            "60MA季線價": np.nan,
+            "10MA移動停利參考價": np.nan,
+            "距60MA乖離率(%)": np.nan,
+            "15日超額報酬RS(%)": np.nan,
+            "5日均量(張)": np.nan
+        }], columns=SAFE_HAVEN_COLUMNS)
