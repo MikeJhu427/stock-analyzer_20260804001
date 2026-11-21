@@ -78,6 +78,24 @@ def get_foreign_fund_flow_report():
         get_foreign_fund_flow_report.clear()
         return {"status": "error", "msg": f"外資資金流向監控載入異常：{str(e)}"}
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_safe_haven_market_gate():
+    try:
+        res = core.BearMarketSafeHavenStrategy.evaluate_market_gate(session=core.get_yf_session())
+        if not res or res.get("status") != "success":
+            get_safe_haven_market_gate.clear()
+        return res
+    except Exception as e:
+        get_safe_haven_market_gate.clear()
+        return {
+            "status": "error",
+            "gate_passed": False,
+            "cond1_passed": False,
+            "cond2_passed": False,
+            "message": f"方案 B 大盤閘門載入異常：{str(e)}",
+            "twii_df": pd.DataFrame()
+        }
+
 def _format_pct_display(val):
     if pd.isna(val) or val is None:
         return "-"
@@ -170,7 +188,8 @@ page_options = [
     "🚀 全市場智慧掃描", 
     "📑 財報三表地雷掃描", 
     "📐 幾何型態滿足點測距", 
-    "🤖 量化型態狀態機 (程式A)"
+    "🤖 量化型態狀態機 (程式A)",
+    "🛡️ 空頭避風港 (方案B)"
 ]
 selected_page = st.radio("📌 快速切換功能分頁：", page_options, horizontal=True)
 
@@ -1387,3 +1406,131 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     st.success(f"**當前主導狀態**：{' ； '.join(dict.fromkeys(final_states))}")
                 else:
                     st.warning("**當前主導狀態**：目前無已確認之水平反轉型態或趨勢線突破，市場處於軌道內整理或單向波段中。")
+
+# ----------------------------------------------------
+# 頁籤 7：空頭避風港強勢股（方案 B）
+# ----------------------------------------------------
+elif selected_page == "🛡️ 空頭避風港 (方案B)":
+    col_sh1, col_sh2 = st.columns([4, 1])
+    with col_sh1:
+        st.write("專為大盤跌破季線並進入第二波壓力測試期設計的盤後強勢股掃描器，嚴格過濾上市／上櫃普通股（排除 ETF、權證、ETN 與 TDR），鎖定全程守穩 60MA、結構底底高、15 日超額報酬 RS > +8% 且具流動性之避風港標的。")
+    with col_sh2:
+        if st.button("🔄 重新檢核大盤閘門", use_container_width=True):
+            get_safe_haven_market_gate.clear()
+            st.rerun()
+
+    with st.spinner("⏳ 正在檢核加權指數 (^TWII) 條件 1 與條件 2 閘門狀態..."):
+        gate_info = get_safe_haven_market_gate()
+
+    if not isinstance(gate_info, dict) or gate_info.get("status") != "success":
+        err_msg = gate_info.get("message", "無法取得加權指數資料，請稍後再試。") if isinstance(gate_info, dict) else "大盤閘門檢核失敗。"
+        st.error(f"❌ {err_msg}")
+    else:
+        st.caption(f"最新交易日：{gate_info['latest_date']} ｜ 檢核時間：{gate_info['eval_time']} ｜ 資料來源：Yahoo Finance (^TWII)")
+
+        if gate_info.get("gate_passed"):
+            st.success(f"✅ **大盤閘門已開啟**：{gate_info['message']}")
+        else:
+            st.warning(f"⚠️ **{core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}**")
+
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric(
+            "^TWII 最新收盤 / 60MA",
+            f"{gate_info['latest_close']:,.2f}",
+            delta=f"60MA {gate_info['latest_ma60']:,.2f} ({gate_info['latest_close'] - gate_info['latest_ma60']:+.2f})",
+            delta_color="normal"
+        )
+        g2.metric(
+            "條件 1：近 10 日破季線天數",
+            f"{gate_info['below_ma60_days_10']} / 10 日",
+            delta="✅ 通過 (需>=7日且收盤<60MA)" if gate_info["cond1_passed"] else "❌ 未達標",
+            delta_color="off"
+        )
+        g3.metric(
+            "前段波段低點 Low_1 (-25~-8日)",
+            f"{gate_info['prev_low_1']:,.2f}",
+            delta=f"{gate_info['prev_low_1_date']} ｜ 1.01倍門檻 {gate_info['low_threshold']:,.2f}",
+            delta_color="off"
+        )
+        g4.metric(
+            "條件 2：近 7 日最低點 (雙波回測)",
+            f"{gate_info['recent_low_7d']:,.2f}",
+            delta=(
+                f"✅ 通過 ({'破底' if gate_info['is_new_low'] else '回測前低'} {gate_info['low_ratio_pct']:+.2f}%)"
+                if gate_info["cond2_passed"]
+                else f"❌ 未回測 ({gate_info['low_ratio_pct']:+.2f}%)"
+            ),
+            delta_color="off"
+        )
+
+        st.markdown("---")
+        run_plan_b_btn = st.button("🚀 執行方案 B 掃描", type="primary")
+
+        if run_plan_b_btn:
+            if not gate_info.get("gate_passed"):
+                st.warning(f"⚠️ {core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                status_text.text("⏳ 正在取得上市／上櫃普通股清單...")
+                stock_dict = get_all_tw_stocks()
+
+                if not stock_dict:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error("❌ 無法取得台股清單，請稍後再試。")
+                else:
+                    def _on_plan_b_progress(done_cnt, total_cnt, msg):
+                        ratio = min(1.0, done_cnt / total_cnt) if total_cnt > 0 else 0.0
+                        progress_bar.progress(ratio)
+                        status_text.text(f"⏳ {msg}")
+
+                    scan_res = core.BearMarketSafeHavenStrategy.scan_market(
+                        stock_dict=stock_dict,
+                        twii_df=gate_info.get("twii_df"),
+                        max_workers=5,
+                        chunk_size=30,
+                        request_delay=0.35,
+                        progress_callback=_on_plan_b_progress,
+                        session=core.get_yf_session()
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.session_state.plan_b_scan_res = scan_res
+
+        if "plan_b_scan_res" in st.session_state:
+            pb_res = st.session_state.plan_b_scan_res
+            pb_status = pb_res.get("status")
+
+            if pb_status == "blocked":
+                st.warning(f"⚠️ {pb_res.get('message', core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG)}")
+            elif pb_status == "error":
+                st.error(f"❌ {pb_res.get('message', '方案 B 掃描發生錯誤。')}")
+            else:
+                res_df = pb_res.get("results_df", pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS))
+                st.success(f"🎉 {pb_res.get('message', '方案 B 掃描完成。')}")
+
+                if not res_df.empty:
+                    breakout_cnt = int((res_df["狀態判定"] == core.BearMarketSafeHavenStrategy.STATUS_BREAKOUT).sum())
+                    holding_cnt = int((res_df["狀態判定"] == core.BearMarketSafeHavenStrategy.STATUS_HOLDING).sum())
+
+                    s1, s2, s3 = st.columns(3)
+                    s1.metric("總入選家數", f"{len(res_df)} 檔")
+                    s2.metric("🚀 突破點火（右側試單）", f"{breakout_cnt} 檔")
+                    s3.metric("🛡️ 通過雙波測試（觀察中）", f"{holding_cnt} 檔")
+
+                    display_df = res_df.copy()
+                    display_df.index = range(1, len(display_df) + 1)
+                    st.dataframe(display_df, use_container_width=True)
+
+                    tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+                    today_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d")
+                    csv_bytes = res_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="📥 下載方案 B 強勢股清單 (CSV / UTF-8-SIG)",
+                        data=csv_bytes,
+                        file_name=f"plan_b_safe_haven_{today_str}.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("今日大盤已通過雙波回測閘門，但全市場普通股中尚無同時通過 5 項嚴格條件的標的。")
