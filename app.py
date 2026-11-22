@@ -61,10 +61,6 @@ def get_stock_data(symbol):
     return core.fetch_stock_data(symbol)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_real_volume_summary(df_tail, stock_id):
-    return core.get_latest_real_volume_summary(df_tail, stock_id)
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_volatility_monitor_report():
     res = core.CrossMarketVolatilityMonitor.evaluate(core.get_yf_session())
     if not res or res.get("status") != "success":
@@ -81,6 +77,89 @@ def get_foreign_fund_flow_report():
     except Exception as e:
         get_foreign_fund_flow_report.clear()
         return {"status": "error", "msg": f"外資資金流向監控載入異常：{str(e)}"}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_safe_haven_market_gate():
+    try:
+        res = core.BearMarketSafeHavenStrategy.evaluate_market_gate(session=core.get_yf_session())
+        if not res or res.get("status") != "success":
+            get_safe_haven_market_gate.clear()
+        return res
+    except Exception as e:
+        get_safe_haven_market_gate.clear()
+        return {
+            "status": "error",
+            "gate_passed": False,
+            "cond1_passed": False,
+            "cond2_passed": False,
+            "message": f"方案 B 大盤閘門載入異常：{str(e)}",
+            "twii_df": pd.DataFrame()
+        }
+
+def _calc_display_width(text) -> int:
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return 0
+    s = str(text)
+    return sum(2 if ord(ch) > 127 else 1 for ch in s)
+
+def _format_scan_excel_sheet(writer, sheet_name: str = "Sheet1"):
+    """為全市場掃描匯出之 Excel 套用實體量數值格式與自動欄寬調整。"""
+    try:
+        ws = writer.sheets.get(sheet_name)
+        if ws is None:
+            return
+        two_dec_cols = {
+            "當沖張數",
+            "當沖率(%)",
+            "實體留倉量(張)",
+            "實體20日均量(張)",
+            "實體量比"
+        }
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        for col_idx, col_name in enumerate(headers, start=1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_len = _calc_display_width(col_name)
+            for row_idx in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                val = cell.value
+                display_str = ""
+                if col_name in two_dec_cols and isinstance(val, (int, float)) and pd.notna(val):
+                    cell.number_format = "#,##0.00"
+                    display_str = f"{val:,.2f}"
+                elif val is not None:
+                    display_str = str(val)
+                max_len = max(max_len, _calc_display_width(display_str))
+            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 50)
+    except Exception:
+        pass
+
+def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=None) -> list:
+    """組合 Web 端全市場掃描報表的完整欄位順序（既有欄位＋背離欄位＋8 項實體量新增欄位）。"""
+    base_cols = ['股票代號', '股票名稱', '觸發日期']
+    if config_dict.get("enable_30d_backtest", False):
+        base_cols.append('近30日觸發次數')
+    base_cols.extend([
+        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
+    ])
+    base_cols.extend(core.ScanEngine.get_all_metric_keys())
+    base_cols.extend([
+        '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+        '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '當日收盤', '月均量(張)'
+    ])
+    if config_dict.get("use_weekly_filter", False):
+        base_cols.extend(['週K共振', '週K背離'])
+    base_cols.extend(['年線/半年線空排', '年線斜率(%)', '半年線斜率(%)'])
+
+    div_cols = [f"日K背離({r_w},{o_w})" for r_w, o_w in div_pairs]
+    if existing_cols is not None:
+        extra_div = [c for c in existing_cols if '背離' in c and c not in base_cols and c not in div_cols]
+        div_cols.extend(extra_div)
+
+    all_cols = base_cols + [c for c in div_cols if c not in base_cols]
+    for col in core.REAL_TURNOVER_COLUMNS:
+        if col not in all_cols:
+            all_cols.append(col)
+    return all_cols
 
 def _format_pct_display(val):
     if pd.isna(val) or val is None:
@@ -174,7 +253,8 @@ page_options = [
     "🚀 全市場智慧掃描", 
     "📑 財報三表地雷掃描", 
     "📐 幾何型態滿足點測距", 
-    "🤖 量化型態狀態機 (程式A)"
+    "🤖 量化型態狀態機 (程式A)",
+    "🛡️ 空頭避風港 (方案B)"
 ]
 selected_page = st.radio("📌 快速切換功能分頁：", page_options, horizontal=True)
 
@@ -547,16 +627,6 @@ elif selected_page == "📊 單檔深度解析":
                         st.markdown(f"- ⚠️ **籌碼狀況**：低於加權均線 ({last_row['VWMA20']:.2f})，近期買盤套牢，上方有**解套賣壓**。")
                     st.markdown(f"- 🛡️ **主力防線**：近兩個月最大量防守價為 **{last_row['Max_Vol_Defense']:.2f}**，此價位不破皆可偏多看待。")
 
-                # 實體波段留倉量（扣除當日沖銷）精簡指標卡片
-                rv_res = get_real_volume_summary(recent_df, real_ticker.split('.')[0])
-                rv1, rv2, rv3, rv4 = st.columns(4)
-                rv1.metric("當沖率 (%)", f"{rv_res['當沖率(%)']:.2f}%")
-                rv2.metric("實體留倉量 (張)", f"{rv_res['實體留倉量(張)']:,}")
-                rv3.metric("實體量比 (vs 20MA)", f"{rv_res['實體量比']:.2f}x")
-                rv4.metric("量能結構標籤", rv_res["量能結構標籤"])
-                if rv_res.get("is_fake_vol_trap", False):
-                    st.error("🚨 **UTAD_FAKE_VOLUME_TRAP（高當沖假爆量誘多警示）**：當日總量爆增且當沖率偏高並伴隨上影線收弱，建議剔除多頭買進訊號。")
-
                 fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12), sharex=True, gridspec_kw={'height_ratios': [2.8, 1.2, 1.2]})
                 ax1.plot(plot_df.index, plot_df['Close'], label='Close', color='#1f77b4', linewidth=1.8)
                 ax1.plot(plot_df.index, plot_df['MA5'], label='MA5', color='purple', linestyle=':', alpha=0.8, linewidth=1.5)
@@ -592,7 +662,7 @@ elif selected_page == "📊 單檔深度解析":
 # 頁籤 3：全市場智慧掃描
 # ----------------------------------------------------
 elif selected_page == "🚀 全市場智慧掃描":
-    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的，並進行多級別背離與均線扣抵判定。")
+    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的，並進行多級別背離、均線扣抵與入選標的實體波段留倉量判定。")
 
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         profile_names = list(st.session_state.config["profiles"].keys())
@@ -821,26 +891,24 @@ elif selected_page == "🚀 全市場智慧掃描":
             progress_bar.progress(min(1.0, (i + chunk_size) / len(tickers)))
 
         reversal_list, final_results = list(reversal_candidates.values()), []
+        candidate_daily_dfs = {}
+        candidate_full_tickers = {}
+
         if reversal_list:
-            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離與實體波段留倉量...")
+            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離...")
             long_data = yf.download([item["_Full_Ticker"] for item in reversal_list], threads=False, progress=False, session=yf_session, **dl_kwargs)
 
             for idx, item in enumerate(reversal_list):
                 try:
                     ticker, specific_offset, daily_df = item.pop("_Full_Ticker"), item.pop("_Offset"), item.pop("_Daily_DF")
                     pass_60m_adv, adv_60m_data = item.pop("_Pass_60m_Adv", False), item.pop("_Adv_60m_Data", None)
-                    has_daily_div, has_m60_div = False, False
+                    has_daily_div = False
                     item['年線/半年線空排'] = item['半年線斜率(%)'] = item['年線斜率(%)'] = "無資料"
                     item['均線最大最小差異百分比(%)'] = "-"
                     item['均線糾結狀態'] = "-"
                     item['短天期均線差異(%)'] = "-"
                     item['短均線糾結狀態'] = "-"
-                    item['當沖率(%)'] = 0.0
-                    item['實體留倉量(張)'] = 0
-                    item['實體量比'] = 0.0
-                    item['量能結構標籤'] = "⚪ 一般量能結構"
 
-                    long_df = pd.DataFrame()
                     try:
                         if isinstance(long_data.columns, pd.MultiIndex):
                             if ticker in long_data.columns.get_level_values(0): long_df = long_data.xs(ticker, axis=1, level=0).dropna(how='all')
@@ -888,19 +956,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                             item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
                             if res_tags: has_daily_div = True
 
-                    # 實體波段留倉量（扣除當日沖銷）後置檢核
-                    vol_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
-                    try:
-                        rv_res = core.get_latest_real_volume_summary(vol_src_df.tail(60), item["股票代號"])
-                        item["當沖率(%)"] = rv_res["當沖率(%)"]
-                        item["實體留倉量(張)"] = rv_res["實體留倉量(張)"]
-                        item["實體量比"] = rv_res["實體量比"]
-                        item["量能結構標籤"] = rv_res["量能結構標籤"]
-                        if rv_res.get("is_fake_vol_trap", False):
-                            item["進場位置建議"] = "🚫 假爆量誘多(剔除多訊)"
-                    except Exception:
-                        pass
-
                     base_tags = core.ScanEngine.generate_base_tags(item, config_dict)
                     div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
                     
@@ -909,43 +964,53 @@ elif selected_page == "🚀 全市場智慧掃描":
                         base_tags.insert(0, sig_name)
 
                     item["演算法建議結果"] = " & ".join(base_tags) + div_tag
+                    candidate_daily_dfs[ticker] = daily_df
+                    candidate_full_tickers[item["股票代號"]] = ticker
                     final_results.append(item)
                 except Exception: pass
                 progress_bar.progress(min(1.0, (idx + 1) / len(reversal_list)))
 
+        # 僅對篩選後入選標的批次抓取當沖資料並補齊 8 項實體波段留倉量欄位
+        if final_results:
+            progress_bar.progress(0)
+            def _on_rtv_progress(done_cnt, total_cnt, msg):
+                progress_bar.progress(min(1.0, done_cnt / total_cnt) if total_cnt > 0 else 1.0)
+                status_text.text(f"⏳ {msg}")
+
+            core.RealTurnoverVolumeAnalyzer.enrich_candidates(
+                candidates=final_results,
+                daily_df_map=candidate_daily_dfs,
+                ticker_key="股票代號",
+                date_key="觸發日期",
+                full_ticker_map=candidate_full_tickers,
+                session=yf_session,
+                request_delay=0.25,
+                progress_callback=_on_rtv_progress
+            )
+
         status_text.empty(); progress_bar.empty()
-        res_df = pd.DataFrame(final_results)
 
-        base_cols = ['股票代號', '股票名稱', '觸發日期']
-        if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
-        base_cols.extend([
-            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
-        ])
-        
-        base_cols.extend(core.ScanEngine.get_all_metric_keys())
-        
-        base_cols.extend([
-            '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
-            '當沖率(%)', '實體留倉量(張)', '實體量比', '量能結構標籤',
-            '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '當日收盤', '月均量(張)'
-        ])
-        if config_dict["use_weekly_filter"]: base_cols.extend(['週K共振', '週K背離'])
-        base_cols.extend(['年線/半年線空排', '年線斜率(%)', '半年線斜率(%)'])
-
-        cols = base_cols + [c for c in res_df.columns if '背離' in c and c not in base_cols]
-        if not res_df.empty:
-            res_df = res_df[[c for c in cols if c in res_df.columns]]
-            
+        if final_results:
+            res_df = pd.DataFrame(final_results)
+            cols = _build_app_scan_columns(config_dict, div_pairs, existing_cols=res_df.columns)
+            for c in cols:
+                if c not in res_df.columns:
+                    res_df[c] = np.nan
+            res_df = res_df[cols]
             sort_keys = [k for k in ["*年線回測分數", "共振分數", "反轉分數", "VCP分數"] if k in res_df.columns]
             if sort_keys:
                 res_df = res_df.sort_values(by=sort_keys, ascending=False).reset_index(drop=True)
             res_df.index = res_df.index + 1
+        else:
+            # 0 檔符合條件時仍保留完整原有欄位＋8 項實體量新增欄位的空表結構
+            cols = _build_app_scan_columns(config_dict, div_pairs)
+            res_df = pd.DataFrame(columns=cols)
 
         st.session_state.scan_res_df, st.session_state.scan_algo_mode, st.session_state.market_info = res_df, algo_mode, market_info
         st.session_state.scan_msg = f"🎉 掃描完成！本次共精選出 **{len(res_df)}** 檔標的。"
 
         # === Google Drive 自動上傳邏輯 (強制使用 xlsx 標準寫入) ===
-        if config_dict.get("auto_upload_gdrive", False) and not res_df.empty:
+        if config_dict.get("auto_upload_gdrive", False):
             webhook_url = ""
             token = ""
             try:
@@ -960,10 +1025,10 @@ elif selected_page == "🚀 全市場智慧掃描":
                 timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
                 
                 try:
-                    # 強制採用 openpyxl 輸出，保證產生現代化的標準 .xlsx 檔，避免相容性錯誤
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        res_df.to_excel(writer, index=False)
+                        res_df.to_excel(writer, sheet_name="全市場掃描結果", index=False)
+                        _format_scan_excel_sheet(writer, "全市場掃描結果")
                     buffer.seek(0)
                     xlsx_bytes = buffer.read()
                     
@@ -1000,25 +1065,42 @@ elif selected_page == "🚀 全市場智慧掃描":
             c4.metric("約當大台基礎", st.session_state.market_info["自動運算基準價值 (約當大台基礎)"])
             st.info(f"**大盤環境判定：** {st.session_state.market_info['大盤環境判定']}")
 
-        if not st.session_state.scan_res_df.empty:
-            st.dataframe(st.session_state.scan_res_df, use_container_width=True)
-            
-            tw_tz = datetime.timezone(datetime.timedelta(hours=8))
-            timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
+        st.dataframe(st.session_state.scan_res_df, use_container_width=True)
+
+        tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+        timestamp = datetime.datetime.now(tw_tz).strftime('%Y-%m-%d %H%M')
+        dl_col1, dl_col2 = st.columns(2)
+
+        with dl_col1:
             try:
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    st.session_state.scan_res_df.to_excel(writer, index=False)
+                    st.session_state.scan_res_df.to_excel(writer, sheet_name="全市場掃描結果", index=False)
+                    _format_scan_excel_sheet(writer, "全市場掃描結果")
                 buffer.seek(0)
-                
                 file_name = f"stock_scan_results_{timestamp}.xlsx"
-                st.download_button(label="📥 下載建議清單 (Excel)", data=buffer.read(), file_name=file_name, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                st.download_button(
+                    label="📥 下載建議清單 (Excel / .xlsx)",
+                    data=buffer.read(),
+                    file_name=file_name,
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    use_container_width=True
+                )
             except ImportError:
-                st.error("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)。已為您自動降級為 CSV 格式下載。")
-                csv = st.session_state.scan_res_df.to_csv(index=False).encode('utf-8-sig')
-                file_name_csv = f"stock_scan_results_{timestamp}.csv"
-                st.download_button(label="📥 下載建議清單 (CSV 備用)", data=csv, file_name=file_name_csv, mime='text/csv')
+                st.warning("⚠️ 系統缺少 Excel 輸出套件 (openpyxl)，請改用右側 CSV 格式下載。")
 
+        with dl_col2:
+            csv_data = st.session_state.scan_res_df.to_csv(index=False).encode('utf-8-sig')
+            file_name_csv = f"stock_scan_results_{timestamp}.csv"
+            st.download_button(
+                label="📥 下載建議清單 (CSV / UTF-8-SIG)",
+                data=csv_data,
+                file_name=file_name_csv,
+                mime='text/csv',
+                use_container_width=True
+            )
+
+        if not st.session_state.scan_res_df.empty:
             def transfer_to_audit():
                 tickers_str = ", ".join(st.session_state.scan_res_df['股票代號'].astype(str).tolist())
                 st.session_state.batch_input_area = tickers_str
@@ -1136,7 +1218,7 @@ elif selected_page == "📑 財報三表地雷掃描":
                             "合約負債判定": res["cl_status"].split(" ")[0] if " " in res["cl_status"] else res["cl_status"],
                             "ROE年化(%)": f"{res['ROE年化(%)']:.2f}%" if pd.notna(res.get('ROE年化(%)')) else "-",
                             "ROA年化(%)": f"{res['ROA年化(%)']:.2f}%" if pd.notna(res.get('ROA年化(%)')) else "-",
-                            "營收YoY(%)": f"{res['營收成長(%)']:.2f}%" if pd.notna(res.get('營收成長(%)')) else "-",
+                            "營收YoY(%)": f"{res['營收成長(%)']:.2f}%" if pd.notna(res['營收成長(%)']) else "-",
                             "毛利率(%)": f"{res['毛利率']:.2f}%" if pd.notna(res['毛利率']) else "-",
                             "營益率(%)": f"{res['營益率']:.2f}%" if pd.notna(res['營益率']) else "-",
                             "CFO/淨利(倍)": f"{res['CFO/淨利']:.2f}" if pd.notna(res['CFO/淨利']) else "-",
@@ -1420,3 +1502,131 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     st.success(f"**當前主導狀態**：{' ； '.join(dict.fromkeys(final_states))}")
                 else:
                     st.warning("**當前主導狀態**：目前無已確認之水平反轉型態或趨勢線突破，市場處於軌道內整理或單向波段中。")
+
+# ----------------------------------------------------
+# 頁籤 7：空頭避風港強勢股（方案 B）
+# ----------------------------------------------------
+elif selected_page == "🛡️ 空頭避風港 (方案B)":
+    col_sh1, col_sh2 = st.columns([4, 1])
+    with col_sh1:
+        st.write("專為大盤跌破季線並進入第二波壓力測試期設計的盤後強勢股掃描器，嚴格過濾上市／上櫃普通股（排除 ETF、權證、ETN 與 TDR），鎖定全程守穩 60MA、結構底底高、15 日超額報酬 RS > +8% 且具流動性之避風港標的。")
+    with col_sh2:
+        if st.button("🔄 重新檢核大盤閘門", use_container_width=True):
+            get_safe_haven_market_gate.clear()
+            st.rerun()
+
+    with st.spinner("⏳ 正在檢核加權指數 (^TWII) 條件 1 與條件 2 閘門狀態..."):
+        gate_info = get_safe_haven_market_gate()
+
+    if not isinstance(gate_info, dict) or gate_info.get("status") != "success":
+        err_msg = gate_info.get("message", "無法取得加權指數資料，請稍後再試。") if isinstance(gate_info, dict) else "大盤閘門檢核失敗。"
+        st.error(f"❌ {err_msg}")
+    else:
+        st.caption(f"最新交易日：{gate_info['latest_date']} ｜ 檢核時間：{gate_info['eval_time']} ｜ 資料來源：Yahoo Finance (^TWII)")
+
+        if gate_info.get("gate_passed"):
+            st.success(f"✅ **大盤閘門已開啟**：{gate_info['message']}")
+        else:
+            st.warning(f"⚠️ **{core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}**")
+
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric(
+            "^TWII 最新收盤 / 60MA",
+            f"{gate_info['latest_close']:,.2f}",
+            delta=f"60MA {gate_info['latest_ma60']:,.2f} ({gate_info['latest_close'] - gate_info['latest_ma60']:+.2f})",
+            delta_color="normal"
+        )
+        g2.metric(
+            "條件 1：近 10 日破季線天數",
+            f"{gate_info['below_ma60_days_10']} / 10 日",
+            delta="✅ 通過 (需>=7日且收盤<60MA)" if gate_info["cond1_passed"] else "❌ 未達標",
+            delta_color="off"
+        )
+        g3.metric(
+            "前段波段低點 Low_1 (-25~-8日)",
+            f"{gate_info['prev_low_1']:,.2f}",
+            delta=f"{gate_info['prev_low_1_date']} ｜ 1.01倍門檻 {gate_info['low_threshold']:,.2f}",
+            delta_color="off"
+        )
+        g4.metric(
+            "條件 2：近 7 日最低點 (雙波回測)",
+            f"{gate_info['recent_low_7d']:,.2f}",
+            delta=(
+                f"✅ 通過 ({'破底' if gate_info['is_new_low'] else '回測前低'} {gate_info['low_ratio_pct']:+.2f}%)"
+                if gate_info["cond2_passed"]
+                else f"❌ 未回測 ({gate_info['low_ratio_pct']:+.2f}%)"
+            ),
+            delta_color="off"
+        )
+
+        st.markdown("---")
+        run_plan_b_btn = st.button("🚀 執行方案 B 掃描", type="primary")
+
+        if run_plan_b_btn:
+            if not gate_info.get("gate_passed"):
+                st.warning(f"⚠️ {core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                status_text.text("⏳ 正在取得上市／上櫃普通股清單...")
+                stock_dict = get_all_tw_stocks()
+
+                if not stock_dict:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error("❌ 無法取得台股清單，請稍後再試。")
+                else:
+                    def _on_plan_b_progress(done_cnt, total_cnt, msg):
+                        ratio = min(1.0, done_cnt / total_cnt) if total_cnt > 0 else 0.0
+                        progress_bar.progress(ratio)
+                        status_text.text(f"⏳ {msg}")
+
+                    scan_res = core.BearMarketSafeHavenStrategy.scan_market(
+                        stock_dict=stock_dict,
+                        twii_df=gate_info.get("twii_df"),
+                        max_workers=5,
+                        chunk_size=30,
+                        request_delay=0.35,
+                        progress_callback=_on_plan_b_progress,
+                        session=core.get_yf_session()
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.session_state.plan_b_scan_res = scan_res
+
+        if "plan_b_scan_res" in st.session_state:
+            pb_res = st.session_state.plan_b_scan_res
+            pb_status = pb_res.get("status")
+
+            if pb_status == "blocked":
+                st.warning(f"⚠️ {pb_res.get('message', core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG)}")
+            elif pb_status == "error":
+                st.error(f"❌ {pb_res.get('message', '方案 B 掃描發生錯誤。')}")
+            else:
+                res_df = pb_res.get("results_df", pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS))
+                st.success(f"🎉 {pb_res.get('message', '方案 B 掃描完成。')}")
+
+                if not res_df.empty:
+                    breakout_cnt = int((res_df["狀態判定"] == core.BearMarketSafeHavenStrategy.STATUS_BREAKOUT).sum())
+                    holding_cnt = int((res_df["狀態判定"] == core.BearMarketSafeHavenStrategy.STATUS_HOLDING).sum())
+
+                    s1, s2, s3 = st.columns(3)
+                    s1.metric("總入選家數", f"{len(res_df)} 檔")
+                    s2.metric("🚀 突破點火（右側試單）", f"{breakout_cnt} 檔")
+                    s3.metric("🛡️ 通過雙波測試（觀察中）", f"{holding_cnt} 檔")
+
+                    display_df = res_df.copy()
+                    display_df.index = range(1, len(display_df) + 1)
+                    st.dataframe(display_df, use_container_width=True)
+
+                    tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+                    today_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d")
+                    csv_bytes = res_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="📥 下載方案 B 強勢股清單 (CSV / UTF-8-SIG)",
+                        data=csv_bytes,
+                        file_name=f"plan_b_safe_haven_{today_str}.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("今日大盤已通過雙波回測閘門，但全市場普通股中尚無同時通過 5 項嚴格條件的標的。")
