@@ -3486,7 +3486,9 @@ class WyckoffPhaseAnalyzer:
             work["ATR14"] = tr.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
 
             cur_close = float(close.iloc[-1])
+            cur_open = float(open_p.iloc[-1])
             cur_ma20 = WyckoffPhaseAnalyzer._safe_num(work["MA20"].iloc[-1], cur_close)
+            prev_ma20 = WyckoffPhaseAnalyzer._safe_num(work["MA20"].iloc[-2], cur_ma20) if len(work) >= 2 else cur_ma20
             cur_ma60 = WyckoffPhaseAnalyzer._safe_num(work["MA60"].iloc[-1], cur_close)
             cur_ma120 = WyckoffPhaseAnalyzer._safe_num(work["MA120"].iloc[-1], cur_ma60)
             cur_atr = WyckoffPhaseAnalyzer._safe_num(work["ATR14"].iloc[-1], cur_close * 0.02)
@@ -3499,6 +3501,7 @@ class WyckoffPhaseAnalyzer:
             ma20_slope = WyckoffPhaseAnalyzer._calc_5d_slope_pct(work["MA20"])
             ma60_slope = WyckoffPhaseAnalyzer._calc_5d_slope_pct(work["MA60"])
             ma120_slope = WyckoffPhaseAnalyzer._calc_5d_slope_pct(work["MA120"])
+            ma20_turn_up = bool(cur_ma20 >= prev_ma20)
             bias20 = ((cur_close - cur_ma20) / cur_ma20 * 100.0) if cur_ma20 > 0 else 0.0
 
             # 關鍵價位界定：以前段 55 日 [-60:-5] 避免近 5 日測試/突破自我參照
@@ -3547,6 +3550,10 @@ class WyckoffPhaseAnalyzer:
 
             # 2. 三大威科夫物理印記
             recent5 = work.iloc[-5:]
+            low5_min = float(recent5["Low"].min())
+            low5_pos_120d = ((low5_min - low_120) / (high_120 - low_120)) if high_120 > low_120 else 0.5
+            low5_pos_120d = float(np.clip(low5_pos_120d, 0.0, 1.0))
+
             vol_zero_issue = (cur_vol_ma20 <= 0.0) or (float(recent5["Volume"].sum()) <= 0.0)
 
             # (A) 努力與結果 (Effort vs. Result)
@@ -3639,12 +3646,28 @@ class WyckoffPhaseAnalyzer:
             tr_days = int(in_tr_mask.sum())
             tr_width_pct = ((creek_res - ice_line) / ice_line * 100.0) if ice_line > 0 else 999.0
             sufficient_cause = bool((tr_days >= 25) and (tr_width_pct <= 35.0))
+            is_narrow_base = bool((tr_days >= 25) and (tr_width_pct <= 25.0))
 
             # 輔助結構條件
             bull_ma_align = bool((cur_close > cur_ma20) and (cur_ma20 > cur_ma60) and (ma20_slope > 0))
             bear_ma_align = bool((cur_close < cur_ma20) and (cur_ma20 < cur_ma60) and (ma20_slope < 0))
             is_high_zone = bool((pos_120d >= 0.70) or (ret_60d >= 20.0))
-            is_low_zone = bool((pos_120d <= 0.40) or (max_drawdown_pct >= 15.0))
+            is_low_zone = bool(
+                (pos_120d <= 0.40)
+                or (low5_pos_120d <= 0.35)
+                or (max_drawdown_pct >= 15.0)
+                or (is_narrow_base and pos_120d < 0.70)
+            )
+            is_early_breakout = bool(
+                sufficient_cause
+                and (pos_120d < 0.70)
+                and (cur_pct >= 3.0)
+                and (cur_close > cur_open)
+                and (cur_vol_ratio >= 1.2)
+                and (cur_close > cur_ma20)
+                and (cur_close > cur_ma60)
+                and ma20_turn_up
+            )
 
             high_sideways_churn = bool(
                 (cur_close >= ice_line + 0.65 * (creek_res - ice_line))
@@ -3681,21 +3704,26 @@ class WyckoffPhaseAnalyzer:
                     key_event = "BC"
                     phase_label_zh = "高檔派發階段 - BC爆量滯漲"
                     action_signal = "REBOUND_SELL_LPSY" if (evr_type == "bear_selloff" or cur_close < cur_ma20) else "WAIT_OBSERVE"
-            elif bull_ma_align and (has_jac_break or is_lps_pullback or cur_close > creek_res):
+            elif (bull_ma_align and (has_jac_break or is_lps_pullback or cur_close > creek_res)) or is_early_breakout:
                 wyckoff_phase = "Phase_C_D_E_Markup"
                 if has_jac_break or (cur_close > creek_res and cur_vol_ratio >= 1.1):
                     key_event = "JAC"
                     phase_label_zh = "拉升主升階段 - JAC突破小溪"
                     action_signal = "WAIT_OBSERVE" if bias20 > 8.0 else "PULLBACK_BUY"
+                elif is_early_breakout:
+                    key_event = "JAC"
+                    phase_label_zh = "拉升主升階段 - JAC起漲突破"
+                    action_signal = "WAIT_OBSERVE" if bias20 > 8.0 else "PULLBACK_BUY"
                 else:
                     key_event = "LPS"
                     phase_label_zh = "拉升主升階段 - LPS縮量回測支撐"
                     action_signal = "WAIT_OBSERVE" if bias20 > 8.0 else "PULLBACK_BUY"
-            elif is_low_zone and (
-                has_spring
-                or evr_type == "low_absorb"
-                or is_st_confirm
-                or (not bear_ma_align and cur_close >= ice_line * 0.98)
+            elif (has_spring and pos_120d < 0.70) or (
+                is_low_zone and (
+                    evr_type == "low_absorb"
+                    or is_st_confirm
+                    or (not bear_ma_align and cur_close >= ice_line * 0.98)
+                )
             ):
                 wyckoff_phase = "Phase_A_B_Accumulation"
                 if has_spring:
@@ -3730,7 +3758,11 @@ class WyckoffPhaseAnalyzer:
                     wyckoff_phase = "Phase_C_D_E_Markdown"
                     key_event = "LPSY"
                     phase_label_zh = "派發後下跌階段 - 均線反壓整理"
-                elif cur_close >= cur_ma60:
+                elif cur_close >= cur_ma20 and cur_close >= cur_ma60:
+                    wyckoff_phase = "Phase_A_B_Accumulation"
+                    key_event = "ST"
+                    phase_label_zh = "吸籌築底階段 - 築底轉強測試"
+                elif pos_120d >= 0.65 and not (cur_pct >= 3.0 and cur_close > cur_open):
                     wyckoff_phase = "Phase_A_B_Distribution"
                     key_event = "BC"
                     phase_label_zh = "高檔派發階段 - 中高檔橫盤震盪"
@@ -3744,7 +3776,7 @@ class WyckoffPhaseAnalyzer:
 
             # 均線與位階一致性 (+0~20)
             if wyckoff_phase == "Phase_C_D_E_Markup":
-                if bull_ma_align:
+                if bull_ma_align or is_early_breakout:
                     score += 10
                 if ma60_slope >= 0 and ma120_slope >= -0.05:
                     score += 10
@@ -3761,7 +3793,7 @@ class WyckoffPhaseAnalyzer:
             else:
                 if is_low_zone:
                     score += 10
-                if pos_120d <= 0.30 or max_drawdown_pct >= 20.0:
+                if pos_120d <= 0.30 or low5_pos_120d <= 0.25 or max_drawdown_pct >= 20.0:
                     score += 10
 
             # 量能驗證強度 (+0~20)
@@ -3784,7 +3816,7 @@ class WyckoffPhaseAnalyzer:
             # 因果堆積與收盤意志加成 (+0~10)
             if sufficient_cause:
                 score += 5
-            if has_spring or has_ut or has_sow_break or has_jac_break:
+            if has_spring or has_ut or has_sow_break or has_jac_break or is_early_breakout:
                 score += 5
 
             # 懲罰扣分
