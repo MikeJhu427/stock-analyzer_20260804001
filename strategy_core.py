@@ -4,12 +4,11 @@ import time
 import requests
 import datetime
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from scipy.signal import argrelextrema
@@ -2752,1123 +2751,267 @@ def build_foreign_fund_flow_df(flow_res: Dict, for_excel: bool = False) -> pd.Da
 
 
 # ==========================================
-# 空頭避風港強勢股（方案 B）盤後選股掃描模組
+# 實體波段留倉量（扣除當日沖銷）後置檢核模組
 # ==========================================
-SAFE_HAVEN_COLUMNS = [
-    "股票代號",
-    "股票名稱",
-    "狀態判定",
-    "最新收盤價",
-    "60MA季線價",
-    "10MA移動停利參考價",
-    "距60MA乖離率(%)",
-    "15日超額報酬RS(%)",
-    "5日均量(張)"
-]
+_TWTB4U_DATE_CACHE: Dict[str, Dict[str, float]] = {}
 
 
-class BearMarketSafeHavenStrategy:
-    """空頭避風港強勢股（方案 B）核心量化策略引擎。"""
+def _fetch_twse_twtb4u_by_date(session: requests.Session, date_compact: str) -> Dict[str, float]:
+    """抓取證交所 TWTB4U 單日上市當沖成交股數並轉換為張數，寫入執行期間快取。"""
+    if date_compact in _TWTB4U_DATE_CACHE:
+        return _TWTB4U_DATE_CACHE[date_compact]
 
-    GATE_BLOCKED_MSG = "目前大盤尚處於第一波恐慌期或未進入第二波回測壓力測試，暫不啟動方案 B 掃描"
-    STATUS_BREAKOUT = "🚀 突破點火（右側試單訊號）"
-    STATUS_HOLDING = "🛡️ 通過雙波測試（抗跌蓄勢觀察中）"
-    MIN_REQUIRED_BARS = 85
+    day_map: Dict[str, float] = {}
+    url = "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://www.twse.com.tw/zh/trading/dayTrading/twtb4u.html"
+    }
+    try:
+        resp = session.get(
+            url,
+            params={"response": "json", "date": date_compact},
+            headers=headers,
+            timeout=15,
+            verify=False
+        )
+        time.sleep(0.5)
+        if resp.status_code == 200:
+            payload = resp.json()
+            if isinstance(payload, dict) and payload.get("stat") == "OK":
+                tables = payload.get("tables") or []
+                target_fields = []
+                target_rows = []
+                for tbl in tables:
+                    fields = tbl.get("fields") or []
+                    if any("證券代號" in str(f) for f in fields):
+                        target_fields = [str(f).strip() for f in fields]
+                        target_rows = tbl.get("data") or []
+                        break
+                if not target_rows and payload.get("data"):
+                    target_fields = [str(f).strip() for f in (payload.get("fields") or [])]
+                    target_rows = payload.get("data") or []
 
-    @staticmethod
-    def filter_common_stocks(stock_dict: Dict[str, str]) -> Dict[str, str]:
-        """
-        從 fetch_all_tw_stocks() 回傳字典中過濾上市(.TW)與上櫃(.TWO)所有普通股：
-        僅保留 4 碼純數字且非 00 開頭的代號，並排除 ETF、權證、ETN 與 TDR（91 開頭或 -DR 結尾）。
-        """
-        filtered = {}
-        if not isinstance(stock_dict, dict):
-            return filtered
+                vol_col_idx = 3
+                for idx, fname in enumerate(target_fields):
+                    if "成交股數" in fname:
+                        vol_col_idx = idx
+                        break
 
-        for ticker, name in stock_dict.items():
-            t_str = str(ticker).strip().upper()
-            if not (t_str.endswith(".TW") or t_str.endswith(".TWO")):
-                continue
-            code = t_str.split(".")[0]
-            name_str = str(name).strip()
-            if not (code.isdigit() and len(code) == 4):
-                continue
-            if code.startswith("00"):
-                continue
-            if code.startswith("91") or name_str.upper().endswith("-DR"):
-                continue
-            filtered[t_str] = name_str
-        return filtered
-
-    @staticmethod
-    def _normalize_ohlcv_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-        """統一去除時區、正規化日線日期索引、去重排序並清理無效列。"""
-        if df is None or df.empty:
-            return pd.DataFrame()
-        out = df.copy()
-        if isinstance(out.columns, pd.MultiIndex):
-            lv0 = out.columns.get_level_values(0)
-            lv1 = out.columns.get_level_values(1)
-            if "Close" in lv0:
-                out.columns = lv0
-            elif "Close" in lv1:
-                out.columns = lv1
-            else:
-                return pd.DataFrame()
-
-        out = out.loc[:, ~pd.Index(out.columns).duplicated()]
-        required_cols = ["Open", "High", "Low", "Close", "Volume"]
-        if any(c not in out.columns for c in required_cols):
-            return pd.DataFrame()
-
-        out = out[required_cols].copy()
-        for col in required_cols:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-
-        out = out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-        out = out[(out["Close"] > 0) & (out["Low"] > 0) & (out["High"] >= out["Low"]) & (out["Volume"] >= 0)]
-        if out.empty:
-            return pd.DataFrame()
-
-        idx = pd.to_datetime(out.index)
-        try:
-            if idx.tz is not None:
-                idx = idx.tz_convert("Asia/Taipei").tz_localize(None)
-        except Exception:
-            if idx.tz is not None:
-                idx = idx.tz_localize(None)
-        out.index = idx.normalize()
-        out = out[~out.index.duplicated(keep="last")].sort_index()
-        return out
-
-    @staticmethod
-    def _extract_ticker_df(raw_df: Optional[pd.DataFrame], ticker: str, single_ticker: bool = False) -> pd.DataFrame:
-        """從 yfinance 批次或單檔下載結果抽取單一標的之標準化 OHLCV DataFrame。"""
-        if raw_df is None or raw_df.empty:
-            return pd.DataFrame()
-        try:
-            if isinstance(raw_df.columns, pd.MultiIndex):
-                lv0 = raw_df.columns.get_level_values(0)
-                lv1 = raw_df.columns.get_level_values(1)
-                if ticker in lv0:
-                    sub = raw_df.xs(ticker, axis=1, level=0)
-                elif ticker in lv1:
-                    sub = raw_df.xs(ticker, axis=1, level=1)
-                elif single_ticker:
-                    sub = raw_df.copy()
-                else:
-                    return pd.DataFrame()
-            else:
-                sub = raw_df.copy() if single_ticker else pd.DataFrame()
-            return BearMarketSafeHavenStrategy._normalize_ohlcv_df(sub)
-        except Exception:
-            return pd.DataFrame()
-
-    @staticmethod
-    def fetch_twii_data(session=None, period: str = "6mo") -> pd.DataFrame:
-        """下載加權指數 (^TWII) 近 6 個月日線資料並標準化索引。"""
-        yf_sess = session if session is not None else get_yf_session()
-        for use_sess in (True, False):
-            try:
-                kw = {
-                    "period": period,
-                    "interval": "1d",
-                    "auto_adjust": False,
-                    "progress": False,
-                    "threads": False
-                }
-                if use_sess:
-                    kw["session"] = yf_sess
-                raw = yf.download("^TWII", **kw)
-                df = BearMarketSafeHavenStrategy._extract_ticker_df(raw, "^TWII", single_ticker=True)
-                if not df.empty and len(df) >= 75:
-                    return df
-            except Exception:
-                continue
-
-        try:
-            hist = yf.Ticker("^TWII", session=yf_sess).history(period=period, auto_adjust=False)
-            return BearMarketSafeHavenStrategy._normalize_ohlcv_df(hist)
-        except Exception:
-            return pd.DataFrame()
-
-    @staticmethod
-    def evaluate_market_gate(twii_df: Optional[pd.DataFrame] = None, session=None) -> Dict:
-        """
-        檢核大盤 (^TWII) 條件 1 與條件 2 閘門狀態：
-        - 條件 1：最新收盤低於 60MA，且過去 10 個交易日至少 7 日收盤位於 60MA 之下。
-        - 條件 2：近 7 個交易日最低點 <= 前段（第 -25 至 -8 日）波段低點 Low_1 * 1.01。
-        """
-        tw_tz = datetime.timezone(datetime.timedelta(hours=8))
-        eval_time_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
-
-        df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(twii_df) if twii_df is not None else BearMarketSafeHavenStrategy.fetch_twii_data(session=session)
-        if df.empty or len(df) < 75:
-            return {
-                "status": "error",
-                "eval_time": eval_time_str,
-                "gate_passed": False,
-                "cond1_passed": False,
-                "cond2_passed": False,
-                "message": "無法取得足夠的加權指數 (^TWII) 近 6 個月日線資料，無法執行方案 B 大盤閘門檢核。",
-                "twii_df": pd.DataFrame()
-            }
-
-        df = df.copy()
-        df["MA60"] = df["Close"].rolling(60).mean()
-        if df["MA60"].iloc[-10:].isna().any():
-            return {
-                "status": "error",
-                "eval_time": eval_time_str,
-                "gate_passed": False,
-                "cond1_passed": False,
-                "cond2_passed": False,
-                "message": "加權指數 (^TWII) 季線 (60MA) 樣本不足，無法執行方案 B 大盤閘門檢核。",
-                "twii_df": df
-            }
-
-        latest_date = df.index[-1].strftime("%Y-%m-%d")
-        latest_close = float(df["Close"].iloc[-1])
-        latest_ma60 = float(df["MA60"].iloc[-1])
-
-        recent_10 = df.iloc[-10:]
-        below_ma60_days_10 = int((recent_10["Close"] < recent_10["MA60"]).sum())
-        cond1_passed = bool((latest_close < latest_ma60) and (below_ma60_days_10 >= 7))
-
-        prev_seg = df.iloc[-25:-7]
-        recent_seg = df.iloc[-7:]
-
-        low_1_idx = prev_seg["Low"].idxmin()
-        prev_low_1 = float(prev_seg.loc[low_1_idx, "Low"])
-        prev_low_1_date = low_1_idx.strftime("%Y-%m-%d")
-
-        recent_low_idx = recent_seg["Low"].idxmin()
-        recent_low_7d = float(recent_seg.loc[recent_low_idx, "Low"])
-        recent_low_7d_date = recent_low_idx.strftime("%Y-%m-%d")
-
-        low_threshold = prev_low_1 * 1.01
-        cond2_passed = bool(prev_low_1 > 0 and recent_low_7d <= low_threshold)
-        is_new_low = bool(recent_low_7d < prev_low_1)
-        low_ratio_pct = round((recent_low_7d / prev_low_1 - 1.0) * 100.0, 2) if prev_low_1 > 0 else np.nan
-
-        gate_passed = bool(cond1_passed and cond2_passed)
-        if gate_passed:
-            msg = "大盤同時滿足條件 1（破季線時間閘門）與條件 2（第二波回測／破底壓力測試），啟動方案 B 掃描。"
-        else:
-            msg = BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG
-
-        return {
-            "status": "success",
-            "eval_time": eval_time_str,
-            "gate_passed": gate_passed,
-            "cond1_passed": cond1_passed,
-            "cond2_passed": cond2_passed,
-            "message": msg,
-            "latest_date": latest_date,
-            "latest_close": round(latest_close, 2),
-            "latest_ma60": round(latest_ma60, 2),
-            "below_ma60_days_10": below_ma60_days_10,
-            "prev_low_1": round(prev_low_1, 2),
-            "prev_low_1_date": prev_low_1_date,
-            "recent_low_7d": round(recent_low_7d, 2),
-            "recent_low_7d_date": recent_low_7d_date,
-            "low_threshold": round(low_threshold, 2),
-            "low_ratio_pct": low_ratio_pct,
-            "is_new_low": is_new_low,
-            "twii_df": df
-        }
-
-    @staticmethod
-    def evaluate_single_stock(
-        ticker: str,
-        stock_name: str,
-        stock_df: Optional[pd.DataFrame],
-        twii_df: Optional[pd.DataFrame]
-    ) -> Optional[Dict]:
-        """
-        對單一普通股執行方案 B 條件 3、4、5 量化篩選與訊號分級。
-        通過全部條件則回傳標準欄位 dict，否則回傳 None。
-        """
-        try:
-            s_df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(stock_df)
-            t_df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(twii_df)
-            if s_df.empty or t_df.empty:
-                return None
-            if len(s_df) < BearMarketSafeHavenStrategy.MIN_REQUIRED_BARS or len(t_df) < 25:
-                return None
-
-            s_df = s_df.copy()
-            s_df["MA10"] = s_df["Close"].rolling(10).mean()
-            s_df["MA60"] = s_df["Close"].rolling(60).mean()
-            s_df["Vol_MA5"] = s_df["Volume"].rolling(5).mean()
-
-            common_idx = s_df.index.intersection(t_df.index)
-            if len(common_idx) < 26:
-                return None
-
-            # 確保個股最新交易日與大盤同步（排除已停牌或過舊標的）
-            if common_idx[-1] < t_df.index[-2]:
-                return None
-
-            s_aligned = s_df.loc[common_idx]
-            t_aligned = t_df.loc[common_idx]
-
-            # 檢查必要指標無 NaN 斷層
-            if (
-                s_aligned["MA60"].iloc[-15:].isna().any()
-                or pd.isna(s_aligned["MA60"].iloc[-11])
-                or pd.isna(s_aligned["MA10"].iloc[-1])
-                or pd.isna(s_aligned["Vol_MA5"].iloc[-1])
-                or pd.isna(s_aligned["Vol_MA5"].iloc[-2])
-            ):
-                return None
-
-            # 條件 3：個股全程守穩 60MA 季線多方防線
-            cond3_all_above_ma60 = bool((s_aligned["Close"].iloc[-15:] > s_aligned["MA60"].iloc[-15:]).all())
-            latest_ma60 = float(s_aligned["MA60"].iloc[-1])
-            ma60_10d_ago = float(s_aligned["MA60"].iloc[-11])
-            cond3_ma60_trend = bool(latest_ma60 > 0 and ma60_10d_ago > 0 and latest_ma60 >= ma60_10d_ago * 0.99)
-            if not (cond3_all_above_ma60 and cond3_ma60_trend):
-                return None
-
-            # 條件 4：個股結構底背離（底底高 + 近 15 日對大盤超額報酬 RS > +8%）
-            stock_prev_low = float(s_aligned["Low"].iloc[-25:-7].min())
-            stock_recent_low = float(s_aligned["Low"].iloc[-7:].min())
-            if stock_prev_low <= 0 or not (stock_recent_low > stock_prev_low * 1.02):
-                return None
-
-            stock_c_now = float(s_aligned["Close"].iloc[-1])
-            stock_c_15d = float(s_aligned["Close"].iloc[-16])
-            twii_c_now = float(t_aligned["Close"].iloc[-1])
-            twii_c_15d = float(t_aligned["Close"].iloc[-16])
-            if stock_c_15d <= 0 or twii_c_15d <= 0:
-                return None
-
-            stock_ret_15d = (stock_c_now / stock_c_15d - 1.0) * 100.0
-            twii_ret_15d = (twii_c_now / twii_c_15d - 1.0) * 100.0
-            rs_15d = stock_ret_15d - twii_ret_15d
-            if rs_15d <= 8.0:
-                return None
-
-            # 條件 5：流動性濾網（5 日均量 > 1,500 張，即 1,500,000 股）
-            vol_ma5_shares = float(s_aligned["Vol_MA5"].iloc[-1])
-            if vol_ma5_shares <= 1_500_000.0:
-                return None
-
-            # 訊號分級：突破近 10 日（不含當日）最高價且當日量 > 前一日 5 日均量 1.3 倍
-            prev_10d_high = float(s_aligned["High"].iloc[-11:-1].max())
-            latest_vol = float(s_aligned["Volume"].iloc[-1])
-            prev_vol_ma5 = float(s_aligned["Vol_MA5"].iloc[-2])
-            is_breakout = bool(
-                (stock_c_now > prev_10d_high)
-                and (prev_vol_ma5 > 0)
-                and (latest_vol > prev_vol_ma5 * 1.3)
-            )
-            status_label = (
-                BearMarketSafeHavenStrategy.STATUS_BREAKOUT
-                if is_breakout
-                else BearMarketSafeHavenStrategy.STATUS_HOLDING
-            )
-
-            latest_ma10 = float(s_aligned["MA10"].iloc[-1])
-            bias_60ma = (stock_c_now - latest_ma60) / latest_ma60 * 100.0
-            vol_ma5_lots = vol_ma5_shares / 1000.0
-
-            return {
-                "股票代號": str(ticker).split(".")[0],
-                "股票名稱": str(stock_name).strip(),
-                "狀態判定": status_label,
-                "最新收盤價": round(stock_c_now, 2),
-                "60MA季線價": round(latest_ma60, 2),
-                "10MA移動停利參考價": round(latest_ma10, 2),
-                "距60MA乖離率(%)": round(bias_60ma, 2),
-                "15日超額報酬RS(%)": round(rs_15d, 2),
-                "5日均量(張)": round(vol_ma5_lots, 1)
-            }
-        except Exception:
-            return None
-
-    @staticmethod
-    def _download_chunk_worker(chunk: List[str], period: str = "6mo", request_delay: float = 0.35) -> Dict[str, pd.DataFrame]:
-        """單一執行緒批次下載工作函式，內建獨立 Session、Rate Limit 防護與例外隔離。"""
-        result_map = {}
-        worker_session = get_yf_session()
-        single_mode = len(chunk) == 1
-        raw = None
-
-        for use_sess in (True, False):
-            try:
-                kw = {
-                    "period": period,
-                    "interval": "1d",
-                    "auto_adjust": False,
-                    "progress": False,
-                    "threads": False
-                }
-                if use_sess:
-                    kw["session"] = worker_session
-                raw = yf.download(chunk, **kw)
-                if raw is not None and not raw.empty:
-                    break
-            except Exception:
-                raw = None
-
-        if raw is not None and not raw.empty:
-            for ticker in chunk:
-                try:
-                    df_t = BearMarketSafeHavenStrategy._extract_ticker_df(raw, ticker, single_ticker=single_mode)
-                    if not df_t.empty:
-                        result_map[ticker] = df_t
-                except Exception:
-                    continue
-
-        if request_delay > 0:
-            time.sleep(request_delay)
-        return result_map
-
-    @staticmethod
-    def scan_market(
-        stock_dict: Optional[Dict[str, str]] = None,
-        twii_df: Optional[pd.DataFrame] = None,
-        preloaded_data: Optional[Dict[str, pd.DataFrame]] = None,
-        max_workers: int = 5,
-        chunk_size: int = 30,
-        request_delay: float = 0.35,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
-        session=None
-    ) -> Dict:
-        """
-        執行方案 B 完整盤後掃描流程：
-        1. 先執行大盤 (^TWII) 條件 1 與條件 2 閘門檢核；未通過則立即停止，不進行個股下載。
-        2. 過濾上市／上櫃普通股，優先複用 preloaded_data（若有效筆數 >= 85 日），剩餘標的以 ThreadPoolExecutor 批次下載。
-        3. 執行條件 3、4、5 與訊號分級，依 15日超額報酬RS(%) 由高到低排序回傳標準 DataFrame。
-        """
-        yf_sess = session if session is not None else get_yf_session()
-        gate_info = BearMarketSafeHavenStrategy.evaluate_market_gate(twii_df=twii_df, session=yf_sess)
-
-        empty_df = pd.DataFrame(columns=SAFE_HAVEN_COLUMNS)
-        if gate_info.get("status") != "success":
-            return {
-                "status": "error",
-                "gate_passed": False,
-                "message": gate_info.get("message", "大盤閘門檢核失敗"),
-                "gate_info": gate_info,
-                "scanned_count": 0,
-                "reused_count": 0,
-                "results_df": empty_df
-            }
-
-        if not gate_info.get("gate_passed", False):
-            return {
-                "status": "blocked",
-                "gate_passed": False,
-                "message": BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG,
-                "gate_info": gate_info,
-                "scanned_count": 0,
-                "reused_count": 0,
-                "results_df": empty_df
-            }
-
-        raw_stocks = stock_dict if stock_dict is not None else fetch_all_tw_stocks()
-        common_stocks = BearMarketSafeHavenStrategy.filter_common_stocks(raw_stocks)
-        tickers = list(common_stocks.keys())
-        total_count = len(tickers)
-
-        if total_count == 0:
-            return {
-                "status": "error",
-                "gate_passed": True,
-                "message": "無法取得上市／上櫃普通股清單，無法執行方案 B 掃描。",
-                "gate_info": gate_info,
-                "scanned_count": 0,
-                "reused_count": 0,
-                "results_df": empty_df
-            }
-
-        twii_clean = gate_info["twii_df"]
-        matched_rows = []
-        to_download = []
-        reused_count = 0
-        processed_count = 0
-
-        # 優先複用呼叫端已下載之日線資料（降低重複請求）
-        if isinstance(preloaded_data, dict) and preloaded_data:
-            for ticker in tickers:
-                cached_df = preloaded_data.get(ticker)
-                if cached_df is not None and not cached_df.empty:
-                    norm_df = BearMarketSafeHavenStrategy._normalize_ohlcv_df(cached_df)
-                    if len(norm_df) >= BearMarketSafeHavenStrategy.MIN_REQUIRED_BARS:
-                        reused_count += 1
-                        processed_count += 1
-                        row = BearMarketSafeHavenStrategy.evaluate_single_stock(
-                            ticker=ticker,
-                            stock_name=common_stocks[ticker],
-                            stock_df=norm_df,
-                            twii_df=twii_clean
-                        )
-                        if row is not None:
-                            matched_rows.append(row)
+                for row in target_rows:
+                    if not row or len(row) <= vol_col_idx:
                         continue
-                to_download.append(ticker)
-        else:
-            to_download = tickers
-
-        if progress_callback and processed_count > 0:
-            try:
-                progress_callback(processed_count, total_count, f"已複用快取日線 {processed_count} / {total_count} 檔...")
-            except Exception:
-                pass
-
-        # 剩餘標的以 ThreadPoolExecutor 分批下載與評估
-        if to_download:
-            safe_chunk_size = max(1, int(chunk_size))
-            safe_workers = max(1, min(int(max_workers), 8))
-            chunks = [to_download[i:i + safe_chunk_size] for i in range(0, len(to_download), safe_chunk_size)]
-
-            with ThreadPoolExecutor(max_workers=safe_workers) as executor:
-                future_map = {
-                    executor.submit(
-                        BearMarketSafeHavenStrategy._download_chunk_worker,
-                        chunk,
-                        "6mo",
-                        request_delay
-                    ): chunk
-                    for chunk in chunks
-                }
-                for future in as_completed(future_map):
-                    chunk = future_map[future]
+                    code = str(row[0]).strip()
+                    raw_vol = str(row[vol_col_idx]).replace(",", "").strip()
                     try:
-                        chunk_data = future.result()
+                        day_map[code] = float(raw_vol) / 1000.0
                     except Exception:
-                        chunk_data = {}
+                        continue
+    except Exception:
+        pass
 
-                    for ticker in chunk:
-                        try:
-                            df_t = chunk_data.get(ticker)
-                            if df_t is not None and not df_t.empty:
-                                row = BearMarketSafeHavenStrategy.evaluate_single_stock(
-                                    ticker=ticker,
-                                    stock_name=common_stocks[ticker],
-                                    stock_df=df_t,
-                                    twii_df=twii_clean
-                                )
-                                if row is not None:
-                                    matched_rows.append(row)
-                        except Exception:
+    _TWTB4U_DATE_CACHE[date_compact] = day_map
+    return day_map
+
+
+def fetch_day_trading_volume(stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    串接 FinMind (TaiwanStockDayTrading) 或證交所 OpenAPI (TWTB4U) 取得每日當沖張數。
+    回傳以無時區正規化日期為索引之 DataFrame，包含欄位 `day_trade_vol` (張)。
+    """
+    empty_df = pd.DataFrame(columns=["day_trade_vol"])
+    empty_df.index = pd.DatetimeIndex([], name="date")
+
+    code = str(stock_id).strip().upper().split(".")[0]
+    if not code:
+        return empty_df
+
+    try:
+        start_dt = pd.to_datetime(start_date).normalize()
+        end_dt = pd.to_datetime(end_date).normalize()
+    except Exception:
+        return empty_df
+
+    session = get_yf_session()
+
+    # 1. 第一順位：FinMind TaiwanStockDayTrading（支援上市 .TW 與上櫃 .TWO 區間查詢）
+    try:
+        params = {
+            "dataset": "TaiwanStockDayTrading",
+            "data_id": code,
+            "start_date": start_dt.strftime("%Y-%m-%d"),
+            "end_date": end_dt.strftime("%Y-%m-%d")
+        }
+        fm_token = os.environ.get("FINMIND_TOKEN", "").strip()
+        if fm_token:
+            params["token"] = fm_token
+
+        resp = session.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params=params,
+            timeout=15,
+            verify=False
+        )
+        time.sleep(0.3)
+
+        if resp.status_code == 200:
+            payload = resp.json()
+            if isinstance(payload, dict) and str(payload.get("msg", "")).lower() == "success":
+                rows = payload.get("data") or []
+                if rows:
+                    records = []
+                    for r in rows:
+                        d_str = r.get("date")
+                        vol_raw = r.get("Volume", 0)
+                        if d_str is None:
                             continue
-
-                    processed_count += len(chunk)
-                    if progress_callback:
                         try:
-                            progress_callback(
-                                min(processed_count, total_count),
-                                total_count,
-                                f"正在掃描方案 B 普通股：{min(processed_count, total_count)} / {total_count} 檔（已入選 {len(matched_rows)} 檔）..."
-                            )
+                            vol_lots = float(vol_raw) / 1000.0
                         except Exception:
-                            pass
+                            vol_lots = 0.0
+                        records.append({"date": pd.to_datetime(d_str).normalize(), "day_trade_vol": max(0.0, vol_lots)})
+                    if records:
+                        dt_df = pd.DataFrame(records).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                        return dt_df[["day_trade_vol"]]
+                else:
+                    # FinMind 成功回傳但該股區間無當沖紀錄（如暫停先賣後買或無當沖）
+                    return empty_df
+    except Exception:
+        pass
 
-        if matched_rows:
-            results_df = pd.DataFrame(matched_rows, columns=SAFE_HAVEN_COLUMNS)
-            results_df = results_df.sort_values(by="15日超額報酬RS(%)", ascending=False).reset_index(drop=True)
-            msg = f"方案 B 掃描完成，共檢測 {total_count} 檔普通股，精選出 {len(results_df)} 檔空頭避風港強勢股。"
-        else:
-            results_df = empty_df
-            msg = f"方案 B 掃描完成，共檢測 {total_count} 檔普通股，今日無同時符合 5 項嚴格條件之標的。"
+    # 2. 第二順位備援：台灣證交所 OpenAPI (TWTB4U)
+    try:
+        records = []
+        b_days = pd.bdate_range(start=start_dt, end=end_dt)
+        for dt_ts in b_days:
+            d_compact = dt_ts.strftime("%Y%m%d")
+            day_map = _fetch_twse_twtb4u_by_date(session, d_compact)
+            if code in day_map:
+                records.append({"date": dt_ts.normalize(), "day_trade_vol": max(0.0, float(day_map[code]))})
+        if records:
+            dt_df = pd.DataFrame(records).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+            return dt_df[["day_trade_vol"]]
+    except Exception:
+        pass
 
-        return {
-            "status": "success",
-            "gate_passed": True,
-            "message": msg,
-            "gate_info": gate_info,
-            "scanned_count": total_count,
-            "reused_count": reused_count,
-            "results_df": results_df
-        }
-
-    @staticmethod
-    def build_excel_dataframe(scan_res: Optional[Dict]) -> pd.DataFrame:
-        """
-        產生供 Excel 第 4 工作表（空頭避風港_方案B）寫入的標準化 DataFrame；
-        若當日大盤未通過閘門或無達標標的，則輸出單列狀態說明以維持報表結構完整。
-        """
-        if isinstance(scan_res, dict):
-            res_df = scan_res.get("results_df")
-            if isinstance(res_df, pd.DataFrame) and not res_df.empty:
-                return res_df[SAFE_HAVEN_COLUMNS].copy()
-            status_msg = scan_res.get("message") or BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG
-        else:
-            status_msg = BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG
-
-        return pd.DataFrame([{
-            "股票代號": "-",
-            "股票名稱": "方案 B 狀態說明",
-            "狀態判定": status_msg,
-            "最新收盤價": np.nan,
-            "60MA季線價": np.nan,
-            "10MA移動停利參考價": np.nan,
-            "距60MA乖離率(%)": np.nan,
-            "15日超額報酬RS(%)": np.nan,
-            "5日均量(張)": np.nan
-        }], columns=SAFE_HAVEN_COLUMNS)
+    return empty_df
 
 
-# ==========================================
-# 純 Python 威科夫週期階段與量價結構判定模組
-# ==========================================
-WYCKOFF_REPORT_COLUMNS = [
-    "威科夫階段",
-    "威科夫階段代碼",
-    "威科夫事件",
-    "威科夫信心分",
-    "威科夫操作訊號",
-    "冰線支撐",
-    "阻力小溪",
-    "騙線警示",
-    "努力與結果",
-    "威科夫判讀摘要"
-]
-
-
-class WyckoffPhaseAnalyzer:
+def calc_real_volume_metrics(df: pd.DataFrame, stock_id: str) -> pd.DataFrame:
     """
-    100% 純 Python 確定性威科夫（Wyckoff）量價週期與結構判定引擎。
-    直接接收已下載之日線 DataFrame 運算，零 AI 呼叫、零額外行情請求。
+    計算扣除當日沖銷後的實體波段留倉量指標與威科夫高當沖假爆量陷阱判定。
     """
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    MIN_BARS = 60
-    VALID_PHASES = (
-        "Phase_A_B_Accumulation",
-        "Phase_C_D_E_Markup",
-        "Phase_A_B_Distribution",
-        "Phase_C_D_E_Markdown"
-    )
-    VALID_EVENTS = ("SC", "AR", "ST", "Spring", "JAC", "LPS", "BC", "UT", "SOW", "LPSY")
-    VALID_ACTIONS = ("WAIT_OBSERVE", "PULLBACK_BUY", "REBOUND_SELL_LPSY", "STOP_LOSS_EXIT")
-
-    @staticmethod
-    def _safe_num(val, default: float = 0.0) -> float:
-        try:
-            f = float(val)
-            return f if np.isfinite(f) else float(default)
-        except Exception:
-            return float(default)
-
-    @staticmethod
-    def _default_result(stock_id: str, stock_name: str, ref_price: float = 0.0, reason: str = "歷史K線不足60根，暫不判定威科夫週期。") -> Dict:
-        price_val = round(WyckoffPhaseAnalyzer._safe_num(ref_price, 0.0), 2)
-        summary = str(reason)[:50]
-        return {
-            "stock_id": str(stock_id or "").strip(),
-            "stock_name": str(stock_name or "").strip(),
-            "wyckoff_phase": "Phase_A_B_Accumulation",
-            "phase_label_zh": "資料不足（未滿60根K線）",
-            "key_event": "ST",
-            "confidence_score": 0,
-            "ice_line_support": float(price_val),
-            "creek_resistance": float(price_val),
-            "trap_warning": "無明顯騙線",
-            "effort_vs_result_analysis": "有效K線不足60根，無法執行威科夫量價分析",
-            "action_signal": "WAIT_OBSERVE",
-            "summary_reason": summary
-        }
-
-    @staticmethod
-    def _clean_ohlcv(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return pd.DataFrame()
-        out = df.copy()
-        if isinstance(out.columns, pd.MultiIndex):
-            lv0 = out.columns.get_level_values(0)
-            lv1 = out.columns.get_level_values(1)
-            if "Close" in lv0:
-                out.columns = lv0
-            elif "Close" in lv1:
-                out.columns = lv1
-            else:
-                return pd.DataFrame()
-
-        out = out.loc[:, ~pd.Index(out.columns).duplicated()]
-        req_cols = ["Open", "High", "Low", "Close", "Volume"]
-        if any(c not in out.columns for c in ["Open", "High", "Low", "Close"]):
-            return pd.DataFrame()
-        if "Volume" not in out.columns:
-            out["Volume"] = 0.0
-
-        out = out[req_cols].copy()
-        for c in req_cols:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-
-        out["Volume"] = out["Volume"].fillna(0.0).clip(lower=0.0)
-        out = out.dropna(subset=["Open", "High", "Low", "Close"])
-        out = out[
-            (out["Open"] > 0)
-            & (out["High"] > 0)
-            & (out["Low"] > 0)
-            & (out["Close"] > 0)
-            & (out["High"] >= out["Low"])
-        ]
-        if out.empty:
-            return pd.DataFrame()
-
-        out = out[~out.index.duplicated(keep="last")].sort_index()
+    out = df.copy()
+    required_cols = {"Volume", "High", "Low", "Close"}
+    if not required_cols.issubset(set(out.columns)):
         return out
 
-    @staticmethod
-    def _calc_5d_slope_pct(series: pd.Series) -> float:
-        valid = series.dropna()
-        if len(valid) < 2:
-            return 0.0
-        cur = float(valid.iloc[-1])
-        prev = float(valid.iloc[-6]) if len(valid) >= 6 else float(valid.iloc[0])
-        if prev <= 0 or not np.isfinite(cur) or not np.isfinite(prev):
-            return 0.0
-        return (cur - prev) / prev * 100.0
+    idx_norm = pd.to_datetime(out.index)
+    if idx_norm.tz is not None:
+        idx_norm = idx_norm.tz_localize(None)
+    idx_norm = idx_norm.normalize()
 
-    @staticmethod
-    def to_report_fields(res: Optional[Dict]) -> Dict:
-        """將 evaluate() 輸出字典轉換為 scan_task3.py 與 app.py 統一報表欄位。"""
-        if not isinstance(res, dict):
-            res = WyckoffPhaseAnalyzer._default_result("", "")
+    end_dt = idx_norm.max()
+    start_dt = min(idx_norm.min(), end_dt - pd.Timedelta(days=45))
+
+    dt_df = fetch_day_trading_volume(
+        stock_id=stock_id,
+        start_date=start_dt.strftime("%Y-%m-%d"),
+        end_date=end_dt.strftime("%Y-%m-%d")
+    )
+
+    if not dt_df.empty:
+        aligned_dt = dt_df["day_trade_vol"].reindex(idx_norm).fillna(0.0).values
+    else:
+        aligned_dt = np.zeros(len(out), dtype=float)
+
+    total_vol = pd.to_numeric(out["Volume"], errors="coerce").fillna(0.0) / 1000.0
+    day_trade_vol = pd.Series(aligned_dt, index=out.index, dtype=float).fillna(0.0).clip(lower=0.0)
+
+    real_vol = (total_vol - day_trade_vol).clip(lower=0.0)
+    day_trade_ratio = pd.Series(
+        np.where(total_vol > 0, (day_trade_vol / total_vol).clip(0.0, 1.0), 0.0),
+        index=out.index,
+        dtype=float
+    )
+
+    real_vol_ma5 = real_vol.rolling(5).mean()
+    real_vol_ma20 = real_vol.rolling(20).mean()
+    real_vol_ratio = pd.Series(
+        np.where((real_vol_ma20 > 0) & pd.notna(real_vol_ma20), real_vol / real_vol_ma20, 0.0),
+        index=out.index,
+        dtype=float
+    )
+
+    total_vol_ma20 = total_vol.rolling(20).mean()
+    hl_range = (pd.to_numeric(out["High"], errors="coerce") - pd.to_numeric(out["Low"], errors="coerce")).replace(0, np.nan)
+    upper_weak_ratio = (pd.to_numeric(out["High"], errors="coerce") - pd.to_numeric(out["Close"], errors="coerce")) / hl_range
+
+    is_valid_vol_breakout = (
+        (day_trade_ratio <= 0.40) &
+        pd.notna(real_vol_ma20) &
+        (real_vol_ma20 > 0) &
+        (real_vol >= real_vol_ma20 * 1.5)
+    ).fillna(False)
+
+    is_fake_vol_trap = (
+        pd.notna(total_vol_ma20) &
+        (total_vol_ma20 > 0) &
+        (total_vol >= total_vol_ma20 * 2.0) &
+        (day_trade_ratio >= 0.60) &
+        (upper_weak_ratio >= 0.50)
+    ).fillna(False)
+
+    vol_structure_tag = np.where(
+        is_fake_vol_trap,
+        "UTAD_FAKE_VOLUME_TRAP",
+        np.where(is_valid_vol_breakout, "✅ 實體有效放量", "⚪ 一般量能結構")
+    )
+
+    out["day_trade_vol"] = day_trade_vol
+    out["real_vol"] = real_vol
+    out["day_trade_ratio"] = day_trade_ratio
+    out["real_vol_ma5"] = real_vol_ma5
+    out["real_vol_ma20"] = real_vol_ma20
+    out["real_vol_ratio"] = real_vol_ratio
+    out["is_valid_vol_breakout"] = is_valid_vol_breakout
+    out["is_fake_vol_trap"] = is_fake_vol_trap
+    out["vol_structure_tag"] = vol_structure_tag
+
+    return out
+
+
+def get_latest_real_volume_summary(df: pd.DataFrame, stock_id: str) -> Dict:
+    """回傳最新一列實體留倉量摘要欄位，供 scan_task3.py 與 app.py 統一呼叫。"""
+    default_res = {
+        "當沖率(%)": 0.0,
+        "實體留倉量(張)": 0,
+        "實體量比": 0.0,
+        "量能結構標籤": "⚪ 一般量能結構",
+        "is_fake_vol_trap": False,
+        "is_valid_vol_breakout": False
+    }
+    try:
+        metrics_df = calc_real_volume_metrics(df, stock_id)
+        if metrics_df is None or metrics_df.empty or "vol_structure_tag" not in metrics_df.columns:
+            return default_res
+
+        last = metrics_df.iloc[-1]
+        dt_ratio_pct = round(float(last["day_trade_ratio"]) * 100.0, 2) if pd.notna(last["day_trade_ratio"]) else 0.0
+        real_vol_lots = int(round(float(last["real_vol"]))) if pd.notna(last["real_vol"]) else 0
+        real_vol_ratio = round(float(last["real_vol_ratio"]), 2) if pd.notna(last["real_vol_ratio"]) else 0.0
+
         return {
-            "威科夫階段": str(res.get("phase_label_zh", "資料不足（未滿60根K線）")),
-            "威科夫階段代碼": str(res.get("wyckoff_phase", "Phase_A_B_Accumulation")),
-            "威科夫事件": str(res.get("key_event", "ST")),
-            "威科夫信心分": int(WyckoffPhaseAnalyzer._safe_num(res.get("confidence_score", 0), 0)),
-            "威科夫操作訊號": str(res.get("action_signal", "WAIT_OBSERVE")),
-            "冰線支撐": round(WyckoffPhaseAnalyzer._safe_num(res.get("ice_line_support", 0.0), 0.0), 2),
-            "阻力小溪": round(WyckoffPhaseAnalyzer._safe_num(res.get("creek_resistance", 0.0), 0.0), 2),
-            "騙線警示": str(res.get("trap_warning", "無明顯騙線")),
-            "努力與結果": str(res.get("effort_vs_result_analysis", "無資料")),
-            "威科夫判讀摘要": str(res.get("summary_reason", ""))[:50]
+            "當沖率(%)": dt_ratio_pct,
+            "實體留倉量(張)": real_vol_lots,
+            "實體量比": real_vol_ratio,
+            "量能結構標籤": str(last["vol_structure_tag"]),
+            "is_fake_vol_trap": bool(last["is_fake_vol_trap"]),
+            "is_valid_vol_breakout": bool(last["is_valid_vol_breakout"])
         }
-
-    @staticmethod
-    def evaluate(df: Optional[pd.DataFrame], stock_id: str = "", stock_name: str = "") -> Dict:
-        s_id = str(stock_id or "").strip()
-        s_name = str(stock_name or "").strip()
-
-        try:
-            clean_df = WyckoffPhaseAnalyzer._clean_ohlcv(df)
-            if clean_df.empty:
-                return WyckoffPhaseAnalyzer._default_result(s_id, s_name, 0.0)
-
-            latest_close_raw = float(clean_df["Close"].iloc[-1])
-            if len(clean_df) < WyckoffPhaseAnalyzer.MIN_BARS:
-                return WyckoffPhaseAnalyzer._default_result(s_id, s_name, latest_close_raw)
-
-            work = clean_df.copy()
-            close = work["Close"]
-            high = work["High"]
-            low = work["Low"]
-            open_p = work["Open"]
-            vol = work["Volume"]
-
-            # 1. 基礎量價與結構特徵計算
-            work["MA20"] = close.rolling(20, min_periods=20).mean()
-            work["MA60"] = close.rolling(60, min_periods=60).mean()
-            work["MA120"] = close.rolling(120, min_periods=60).mean()
-            work["Vol_MA5"] = vol.rolling(5, min_periods=1).mean()
-            work["Vol_MA10"] = vol.rolling(10, min_periods=1).mean()
-            work["Vol_MA20"] = vol.rolling(20, min_periods=1).mean()
-
-            with np.errstate(divide="ignore", invalid="ignore"):
-                work["Vol_Ratio"] = np.where(work["Vol_MA20"] > 0, vol / work["Vol_MA20"], 0.0)
-            work["Vol_Ratio"] = pd.Series(work["Vol_Ratio"], index=work.index).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-            work["Pct_Change"] = close.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0) * 100.0
-            prev_c = close.shift(1)
-            tr = pd.concat([
-                (high - low),
-                (high - prev_c).abs(),
-                (low - prev_c).abs()
-            ], axis=1).max(axis=1)
-            work["ATR14"] = tr.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-
-            cur_close = float(close.iloc[-1])
-            cur_open = float(open_p.iloc[-1])
-            cur_ma20 = WyckoffPhaseAnalyzer._safe_num(work["MA20"].iloc[-1], cur_close)
-            prev_ma20 = WyckoffPhaseAnalyzer._safe_num(work["MA20"].iloc[-2], cur_ma20) if len(work) >= 2 else cur_ma20
-            cur_ma60 = WyckoffPhaseAnalyzer._safe_num(work["MA60"].iloc[-1], cur_close)
-            cur_ma120 = WyckoffPhaseAnalyzer._safe_num(work["MA120"].iloc[-1], cur_ma60)
-            cur_atr = WyckoffPhaseAnalyzer._safe_num(work["ATR14"].iloc[-1], cur_close * 0.02)
-            cur_vol_ma5 = WyckoffPhaseAnalyzer._safe_num(work["Vol_MA5"].iloc[-1], 0.0)
-            cur_vol_ma10 = WyckoffPhaseAnalyzer._safe_num(work["Vol_MA10"].iloc[-1], 0.0)
-            cur_vol_ma20 = WyckoffPhaseAnalyzer._safe_num(work["Vol_MA20"].iloc[-1], 0.0)
-            cur_vol_ratio = WyckoffPhaseAnalyzer._safe_num(work["Vol_Ratio"].iloc[-1], 0.0)
-            cur_pct = WyckoffPhaseAnalyzer._safe_num(work["Pct_Change"].iloc[-1], 0.0)
-
-            ma20_slope = WyckoffPhaseAnalyzer._calc_5d_slope_pct(work["MA20"])
-            ma60_slope = WyckoffPhaseAnalyzer._calc_5d_slope_pct(work["MA60"])
-            ma120_slope = WyckoffPhaseAnalyzer._calc_5d_slope_pct(work["MA120"])
-            ma20_turn_up = bool(cur_ma20 >= prev_ma20)
-            bias20 = ((cur_close - cur_ma20) / cur_ma20 * 100.0) if cur_ma20 > 0 else 0.0
-
-            # 關鍵價位界定：以前段 55 日 [-60:-5] 避免近 5 日測試/突破自我參照
-            ref_df = work.iloc[-60:-5]
-            ref_lows = ref_df["Low"].values
-            ref_highs = ref_df["High"].values
-
-            piv_low_idx = argrelextrema(ref_lows, np.less, order=3)[0]
-            piv_high_idx = argrelextrema(ref_highs, np.greater, order=3)[0]
-
-            if len(piv_low_idx) >= 2:
-                ice_line = float(np.percentile(ref_lows[piv_low_idx], 20))
-            else:
-                ice_line = float(np.percentile(ref_lows, 10))
-
-            if len(piv_high_idx) >= 2:
-                creek_res = float(np.percentile(ref_highs[piv_high_idx], 80))
-            else:
-                creek_res = float(np.percentile(ref_highs, 90))
-
-            if creek_res <= ice_line * 1.02:
-                ice_line = float(np.min(ref_lows))
-                creek_res = float(np.max(ref_highs))
-            if creek_res <= ice_line * 1.01:
-                pad = max(cur_atr * 1.5, cur_close * 0.03)
-                ice_line = max(0.01, cur_close - pad)
-                creek_res = cur_close + pad
-
-            # 120日位階百分位與回撤/漲幅基準
-            win_120 = work.iloc[-min(len(work), 120):]
-            low_120 = float(win_120["Low"].min())
-            high_120 = float(win_120["High"].max())
-            pos_120d = ((cur_close - low_120) / (high_120 - low_120)) if high_120 > low_120 else 0.5
-            pos_120d = float(np.clip(pos_120d, 0.0, 1.0))
-
-            win_60 = work.iloc[-60:]
-            high_60 = float(win_60["High"].max())
-            dd_60 = ((high_60 - cur_close) / high_60 * 100.0) if high_60 > 0 else 0.0
-            dd_120 = ((high_120 - cur_close) / high_120 * 100.0) if high_120 > 0 else 0.0
-            max_drawdown_pct = max(dd_60, dd_120)
-
-            close_60_ago = float(win_60["Close"].iloc[0])
-            ret_60d = ((cur_close / close_60_ago - 1.0) * 100.0) if close_60_ago > 0 else 0.0
-            close_10_ago = float(work["Close"].iloc[-10]) if len(work) >= 10 else close_60_ago
-            ret_10d = ((cur_close / close_10_ago - 1.0) * 100.0) if close_10_ago > 0 else 0.0
-
-            # 2. 三大威科夫物理印記
-            recent5 = work.iloc[-5:]
-            low5_min = float(recent5["Low"].min())
-            low5_pos_120d = ((low5_min - low_120) / (high_120 - low_120)) if high_120 > low_120 else 0.5
-            low5_pos_120d = float(np.clip(low5_pos_120d, 0.0, 1.0))
-
-            vol_zero_issue = (cur_vol_ma20 <= 0.0) or (float(recent5["Volume"].sum()) <= 0.0)
-
-            # (A) 努力與結果 (Effort vs. Result)
-            evr_type = "normal"
-            evr_short = "量價配合正常"
-            evr_vol_ratio = cur_vol_ratio
-            if vol_zero_issue:
-                effort_text = "近期成交量為零或資料缺漏，無法驗證量能努力"
-                evr_short = "量能資料不足"
-            else:
-                effort_text = ""
-                for idx_pos in range(len(work) - 1, len(work) - 6, -1):
-                    row = work.iloc[idx_pos]
-                    vr = WyckoffPhaseAnalyzer._safe_num(row["Vol_Ratio"], 0.0)
-                    if vr <= 1.5:
-                        continue
-                    o_v = float(row["Open"])
-                    h_v = float(row["High"])
-                    l_v = float(row["Low"])
-                    c_v = float(row["Close"])
-                    pct_v = WyckoffPhaseAnalyzer._safe_num(row["Pct_Change"], 0.0)
-
-                    body = abs(c_v - o_v)
-                    body_pct = (body / o_v * 100.0) if o_v > 0 else 0.0
-                    total_rng = max(h_v - l_v, 1e-8)
-                    upper_sh = h_v - max(o_v, c_v)
-                    lower_sh = min(o_v, c_v) - l_v
-
-                    is_bear_engulf = False
-                    if idx_pos > 0:
-                        prev_row = work.iloc[idx_pos - 1]
-                        p_o, p_c = float(prev_row["Open"]), float(prev_row["Close"])
-                        if (c_v < o_v) and (p_c > p_o) and (o_v >= p_c) and (c_v <= p_o) and (pct_v <= -1.5):
-                            is_bear_engulf = True
-
-                    if (pct_v <= -2.5 and c_v < o_v) or is_bear_engulf:
-                        evr_type = "bear_selloff"
-                        evr_vol_ratio = vr
-                        evr_short = "帶量長黑賣壓湧現"
-                        effort_text = f"帶量長黑賣壓湧現（近5日量比{vr:.2f}倍、單日{pct_v:+.2f}%），空方力道主導"
-                        break
-                    if (upper_sh > 1.5 * body and upper_sh / total_rng >= 0.40) or (pos_120d >= 0.65 and body_pct < 1.2):
-                        evr_type = "high_stall"
-                        evr_vol_ratio = vr
-                        evr_short = "高檔爆量滯漲"
-                        effort_text = f"高檔爆量滯漲（量比{vr:.2f}倍、實體僅{body_pct:.2f}%且遇上檔反壓），努力與結果背離"
-                        break
-                    if (lower_sh > 1.5 * body and lower_sh / total_rng >= 0.40) and (pos_120d <= 0.45 or cur_close <= cur_ma20):
-                        evr_type = "low_absorb"
-                        evr_vol_ratio = vr
-                        evr_short = "低檔爆量長下影承接"
-                        effort_text = f"低檔爆量長下影承接（量比{vr:.2f}倍），買盤吸收恐慌賣壓"
-                        break
-                    if body_pct < 1.2:
-                        evr_type = "narrow_stall"
-                        evr_vol_ratio = vr
-                        evr_short = "爆量實體狹窄僵持"
-                        effort_text = f"爆量但實體收幅狹窄（量比{vr:.2f}倍、實體{body_pct:.2f}%），努力與結果背離"
-                        break
-
-                if not effort_text:
-                    if cur_vol_ratio >= 1.2 and cur_pct > 0:
-                        evr_short = "溫和放量推升"
-                        effort_text = f"量價配合正常，溫和放量推動價格上行（量比{cur_vol_ratio:.2f}倍）"
-                    elif cur_vol_ratio < 0.85:
-                        evr_short = "量縮整理沉澱"
-                        effort_text = f"量價配合正常，量縮整理籌碼沉澱（量比{cur_vol_ratio:.2f}倍）"
-                    else:
-                        evr_short = "量價配合正常"
-                        effort_text = f"近期量價配合正常（量比{cur_vol_ratio:.2f}倍），未見顯著努力與結果背離"
-
-            # (B) 收盤價意志 (Closing Intent)
-            has_ut = bool(((recent5["High"] > creek_res) & (recent5["Close"] < creek_res)).any())
-            has_spring = bool(((recent5["Low"] < ice_line) & (recent5["Close"] > ice_line)).any())
-            has_sow_bar = bool(
-                (
-                    (recent5["Close"] < ice_line)
-                    & (recent5["Close"] < recent5["Open"])
-                    & ((recent5["Vol_Ratio"] >= 1.3) | (recent5["Pct_Change"] <= -2.5))
-                ).any()
-            )
-            has_sow_break = bool(has_sow_bar and (cur_close < ice_line))
-            has_jac_bar = bool(
-                ((recent5["Close"] > creek_res) & (recent5["Vol_Ratio"] >= 1.3)).any()
-            )
-            has_jac_break = bool(has_jac_bar and (cur_close > creek_res))
-
-            # (C) 因果堆積 (Cause & Effect)
-            in_tr_mask = (win_60["Close"] >= ice_line * 0.98) & (win_60["Close"] <= creek_res * 1.02)
-            tr_days = int(in_tr_mask.sum())
-            tr_width_pct = ((creek_res - ice_line) / ice_line * 100.0) if ice_line > 0 else 999.0
-            sufficient_cause = bool((tr_days >= 25) and (tr_width_pct <= 35.0))
-            is_narrow_base = bool((tr_days >= 25) and (tr_width_pct <= 25.0))
-
-            # 輔助結構條件
-            bull_ma_align = bool((cur_close > cur_ma20) and (cur_ma20 > cur_ma60) and (ma20_slope > 0))
-            bear_ma_align = bool((cur_close < cur_ma20) and (cur_ma20 < cur_ma60) and (ma20_slope < 0))
-            is_high_zone = bool((pos_120d >= 0.70) or (ret_60d >= 20.0))
-            is_low_zone = bool(
-                (pos_120d <= 0.40)
-                or (low5_pos_120d <= 0.35)
-                or (max_drawdown_pct >= 15.0)
-                or (is_narrow_base and pos_120d < 0.70)
-            )
-            is_early_breakout = bool(
-                sufficient_cause
-                and (pos_120d < 0.70)
-                and (cur_pct >= 3.0)
-                and (cur_close > cur_open)
-                and (cur_vol_ratio >= 1.2)
-                and (cur_close > cur_ma20)
-                and (cur_close > cur_ma60)
-                and ma20_turn_up
-            )
-
-            high_sideways_churn = bool(
-                (cur_close >= ice_line + 0.65 * (creek_res - ice_line))
-                and (cur_vol_ma20 > 0)
-                and (cur_vol_ma10 > 1.15 * cur_vol_ma20)
-                and (ret_10d < 2.0)
-            )
-            is_lps_pullback = bool(
-                bull_ma_align
-                and (cur_close >= ice_line * 0.99)
-                and ((cur_vol_ratio <= 0.90) or (cur_vol_ma20 > 0 and cur_vol_ma5 <= cur_vol_ma20 * 0.95))
-            )
-            is_st_confirm = bool(
-                (cur_vol_ma20 > 0)
-                and (cur_vol_ma5 < 0.85 * cur_vol_ma20)
-                and (cur_close >= ice_line * 0.99)
-                and sufficient_cause
-            )
-
-            # 3. 四大生命週期階段互斥優先級判定（強制四擇一）
-            matched_priority = True
-            if has_sow_break:
-                wyckoff_phase = "Phase_C_D_E_Markdown"
-                key_event = "SOW"
-                phase_label_zh = "派發後下跌階段 - SOW有效破冰線"
-                action_signal = "STOP_LOSS_EXIT"
-            elif is_high_zone and (has_ut or evr_type in ("high_stall", "narrow_stall") or high_sideways_churn):
-                wyckoff_phase = "Phase_A_B_Distribution"
-                if has_ut:
-                    key_event = "UT"
-                    phase_label_zh = "高檔派發階段 - UT誘多滯漲"
-                    action_signal = "REBOUND_SELL_LPSY"
-                else:
-                    key_event = "BC"
-                    phase_label_zh = "高檔派發階段 - BC爆量滯漲"
-                    action_signal = "REBOUND_SELL_LPSY" if (evr_type == "bear_selloff" or cur_close < cur_ma20) else "WAIT_OBSERVE"
-            elif (bull_ma_align and (has_jac_break or is_lps_pullback or cur_close > creek_res)) or is_early_breakout:
-                wyckoff_phase = "Phase_C_D_E_Markup"
-                if has_jac_break or (cur_close > creek_res and cur_vol_ratio >= 1.1):
-                    key_event = "JAC"
-                    phase_label_zh = "拉升主升階段 - JAC突破小溪"
-                    action_signal = "WAIT_OBSERVE" if bias20 > 8.0 else "PULLBACK_BUY"
-                elif is_early_breakout:
-                    key_event = "JAC"
-                    phase_label_zh = "拉升主升階段 - JAC起漲突破"
-                    action_signal = "WAIT_OBSERVE" if bias20 > 8.0 else "PULLBACK_BUY"
-                else:
-                    key_event = "LPS"
-                    phase_label_zh = "拉升主升階段 - LPS縮量回測支撐"
-                    action_signal = "WAIT_OBSERVE" if bias20 > 8.0 else "PULLBACK_BUY"
-            elif (has_spring and pos_120d < 0.70) or (
-                is_low_zone and (
-                    evr_type == "low_absorb"
-                    or is_st_confirm
-                    or (not bear_ma_align and cur_close >= ice_line * 0.98)
-                )
-            ):
-                wyckoff_phase = "Phase_A_B_Accumulation"
-                if has_spring:
-                    key_event = "Spring"
-                    phase_label_zh = "吸籌築底階段 - Spring破底翻"
-                    action_signal = "PULLBACK_BUY"
-                elif evr_type == "low_absorb":
-                    key_event = "SC"
-                    phase_label_zh = "吸籌築底階段 - SC拋售高潮承接"
-                    action_signal = "WAIT_OBSERVE"
-                elif is_st_confirm:
-                    key_event = "ST"
-                    phase_label_zh = "吸籌築底階段 - ST縮量二次測試"
-                    action_signal = "PULLBACK_BUY"
-                else:
-                    key_event = "AR"
-                    phase_label_zh = "吸籌築底階段 - AR自動反彈整理" if sufficient_cause else "吸籌築底階段 - AR跌深反彈(堆積不足)"
-                    action_signal = "WAIT_OBSERVE"
-            elif bear_ma_align:
-                wyckoff_phase = "Phase_C_D_E_Markdown"
-                key_event = "LPSY"
-                phase_label_zh = "派發後下跌階段 - 回測LPSY反壓"
-                action_signal = "REBOUND_SELL_LPSY"
-            else:
-                matched_priority = False
-                action_signal = "WAIT_OBSERVE"
-                if cur_close >= cur_ma20 and ma20_slope >= 0:
-                    wyckoff_phase = "Phase_C_D_E_Markup"
-                    key_event = "LPS"
-                    phase_label_zh = "拉升主升階段 - 區間偏多整理"
-                elif cur_close < cur_ma20 and ma20_slope < 0:
-                    wyckoff_phase = "Phase_C_D_E_Markdown"
-                    key_event = "LPSY"
-                    phase_label_zh = "派發後下跌階段 - 均線反壓整理"
-                elif cur_close >= cur_ma20 and cur_close >= cur_ma60:
-                    wyckoff_phase = "Phase_A_B_Accumulation"
-                    key_event = "ST"
-                    phase_label_zh = "吸籌築底階段 - 築底轉強測試"
-                elif pos_120d >= 0.65 and not (cur_pct >= 3.0 and cur_close > cur_open):
-                    wyckoff_phase = "Phase_A_B_Distribution"
-                    key_event = "BC"
-                    phase_label_zh = "高檔派發階段 - 中高檔橫盤震盪"
-                else:
-                    wyckoff_phase = "Phase_A_B_Accumulation"
-                    key_event = "ST"
-                    phase_label_zh = "吸籌築底階段 - 低中檔橫盤測試"
-
-            # 4. 信心分數 (0~100 整數)
-            score = 50 if matched_priority else 30
-
-            # 均線與位階一致性 (+0~20)
-            if wyckoff_phase == "Phase_C_D_E_Markup":
-                if bull_ma_align or is_early_breakout:
-                    score += 10
-                if ma60_slope >= 0 and ma120_slope >= -0.05:
-                    score += 10
-            elif wyckoff_phase == "Phase_C_D_E_Markdown":
-                if bear_ma_align or cur_close < ice_line:
-                    score += 10
-                if ma20_slope < 0 and ma60_slope <= 0:
-                    score += 10
-            elif wyckoff_phase == "Phase_A_B_Distribution":
-                if is_high_zone:
-                    score += 10
-                if pos_120d >= 0.80 or high_sideways_churn:
-                    score += 10
-            else:
-                if is_low_zone:
-                    score += 10
-                if pos_120d <= 0.30 or low5_pos_120d <= 0.25 or max_drawdown_pct >= 20.0:
-                    score += 10
-
-            # 量能驗證強度 (+0~20)
-            if not vol_zero_issue:
-                if key_event in ("SOW", "JAC", "SC", "BC", "UT"):
-                    check_vr = max(cur_vol_ratio, evr_vol_ratio)
-                    if check_vr >= 1.5:
-                        score += 20
-                    elif check_vr >= 1.2:
-                        score += 10
-                elif key_event in ("LPS", "ST", "LPSY"):
-                    if cur_vol_ratio <= 0.85 or (cur_vol_ma20 > 0 and cur_vol_ma5 <= cur_vol_ma20 * 0.85):
-                        score += 20
-                    elif cur_vol_ratio <= 1.0:
-                        score += 10
-                else:
-                    if cur_vol_ratio >= 1.2 or cur_vol_ratio <= 0.85:
-                        score += 10
-
-            # 因果堆積與收盤意志加成 (+0~10)
-            if sufficient_cause:
-                score += 5
-            if has_spring or has_ut or has_sow_break or has_jac_break or is_early_breakout:
-                score += 5
-
-            # 懲罰扣分
-            if wyckoff_phase == "Phase_A_B_Accumulation" and key_event == "AR" and not sufficient_cause:
-                score -= 10
-            if wyckoff_phase == "Phase_C_D_E_Markup" and bias20 > 8.0:
-                score -= 10
-            if vol_zero_issue:
-                score -= 10
-
-            confidence_score = int(np.clip(round(score), 0, 100))
-
-            # 5. 騙線警示與 50 字內結構化摘要
-            if has_ut:
-                trap_warning = "⚠️ UT上衝回落誘多陷阱，慎防假突破套牢"
-            elif has_spring:
-                trap_warning = "⚠️ Spring破底翻掃損誘空，留意主力洗盤後轉強"
-            elif wyckoff_phase == "Phase_C_D_E_Markdown" and key_event == "SOW":
-                trap_warning = "⚠️ 帶量有效跌破冰線，慎防破線後假反彈陷阱"
-            elif wyckoff_phase == "Phase_A_B_Accumulation" and key_event == "AR" and not sufficient_cause:
-                trap_warning = "⚠️ 底部橫盤堆積不足，慎防跌深逃命反彈(AR/LPSY)"
-            elif wyckoff_phase == "Phase_A_B_Distribution":
-                trap_warning = "⚠️ 高檔爆量滯漲，慎防主力拉高出貨派發"
-            else:
-                trap_warning = "無明顯騙線"
-
-            ice_r = round(WyckoffPhaseAnalyzer._safe_num(ice_line, cur_close), 2)
-            creek_r = round(WyckoffPhaseAnalyzer._safe_num(creek_res, cur_close), 2)
-
-            short_phase_map = {
-                "Phase_A_B_Accumulation": "吸籌築底",
-                "Phase_C_D_E_Markup": "拉升主升",
-                "Phase_A_B_Distribution": "高檔派發",
-                "Phase_C_D_E_Markdown": "派發下跌"
-            }
-            summary_reason = f"{short_phase_map[wyckoff_phase]}{key_event}，冰線{ice_r:.2f}/小溪{creek_r:.2f}，{evr_short}。"
-            if len(summary_reason) > 50:
-                summary_reason = summary_reason[:49] + "。"
-
-            return {
-                "stock_id": s_id,
-                "stock_name": s_name,
-                "wyckoff_phase": wyckoff_phase,
-                "phase_label_zh": phase_label_zh,
-                "key_event": key_event,
-                "confidence_score": confidence_score,
-                "ice_line_support": float(ice_r),
-                "creek_resistance": float(creek_r),
-                "trap_warning": trap_warning,
-                "effort_vs_result_analysis": effort_text,
-                "action_signal": action_signal,
-                "summary_reason": summary_reason
-            }
-        except Exception:
-            return WyckoffPhaseAnalyzer._default_result(s_id, s_name, 0.0, "威科夫運算發生異常，已降級回傳預設狀態。")
+    except Exception:
+        return default_res
