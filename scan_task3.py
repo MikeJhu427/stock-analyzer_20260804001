@@ -500,7 +500,7 @@ def run_full_scan():
         _run_plan_b_safe_haven(stock_dict, plan_b_daily_cache, yf_session)
         return print("💡 今日全市場無符合條件標的，任務結束。")
 
-    print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、240MA年線深度評分與背離...")
+    print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、240MA年線深度評分、背離與威科夫週期...")
     candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
     import yfinance as yf
     long_data = yf.download(candidate_tickers, period="2y", threads=False, progress=False, session=yf_session)
@@ -516,7 +516,9 @@ def run_full_scan():
             item['均線糾結狀態'] = "-"
             item['短天期均線差異(%)'] = "-"
             item['短均線糾結狀態'] = "-"
+            item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
 
+            long_df = pd.DataFrame()
             try:
                 if isinstance(long_data.columns, pd.MultiIndex):
                     if ticker in long_data.columns.get_level_values(0): long_df = long_data.xs(ticker, axis=1, level=0).dropna(how='all')
@@ -566,6 +568,14 @@ def run_full_scan():
                     item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
                     if res_tags: has_daily_div = True
 
+            # 純 Python 威科夫週期階段與量價結構判定（零額外下載，long_df 為空時降級使用 daily_df）
+            try:
+                wyckoff_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
+                wyckoff_res = core.WyckoffPhaseAnalyzer.evaluate(wyckoff_src_df, item["股票代號"], item["股票名稱"])
+                item.update(core.WyckoffPhaseAnalyzer.to_report_fields(wyckoff_res))
+            except Exception:
+                item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
+
             base_tags = core.ScanEngine.generate_base_tags(item, CONFIG)
             div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
             
@@ -584,8 +594,10 @@ def run_full_scan():
     
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
+    base_cols.append('演算法建議結果')
+    base_cols.extend(core.WYCKOFF_REPORT_COLUMNS)
     base_cols.extend([
-        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
+        '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
     ])
     
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
@@ -611,7 +623,7 @@ def run_full_scan():
         res_df.index = res_df.index + 1
 
         print("📊 掃描完成！最終報表標的預覽：")
-        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線糾結狀態', '短均線糾結狀態']].to_string())
+        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '威科夫階段', '威科夫事件', '均線糾結狀態', '短均線糾結狀態']].to_string())
 
         # 本地同步保留外資資金流向歷史紀錄（供下次執行去重附加）
         _persist_foreign_flow_history(foreign_flow_df)
