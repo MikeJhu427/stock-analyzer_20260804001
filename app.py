@@ -61,6 +61,10 @@ def get_stock_data(symbol):
     return core.fetch_stock_data(symbol)
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def get_real_volume_summary(df_tail, stock_id):
+    return core.get_latest_real_volume_summary(df_tail, stock_id)
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_volatility_monitor_report():
     res = core.CrossMarketVolatilityMonitor.evaluate(core.get_yf_session())
     if not res or res.get("status") != "success":
@@ -77,24 +81,6 @@ def get_foreign_fund_flow_report():
     except Exception as e:
         get_foreign_fund_flow_report.clear()
         return {"status": "error", "msg": f"外資資金流向監控載入異常：{str(e)}"}
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_safe_haven_market_gate():
-    try:
-        res = core.BearMarketSafeHavenStrategy.evaluate_market_gate(session=core.get_yf_session())
-        if not res or res.get("status") != "success":
-            get_safe_haven_market_gate.clear()
-        return res
-    except Exception as e:
-        get_safe_haven_market_gate.clear()
-        return {
-            "status": "error",
-            "gate_passed": False,
-            "cond1_passed": False,
-            "cond2_passed": False,
-            "message": f"方案 B 大盤閘門載入異常：{str(e)}",
-            "twii_df": pd.DataFrame()
-        }
 
 def _format_pct_display(val):
     if pd.isna(val) or val is None:
@@ -188,8 +174,7 @@ page_options = [
     "🚀 全市場智慧掃描", 
     "📑 財報三表地雷掃描", 
     "📐 幾何型態滿足點測距", 
-    "🤖 量化型態狀態機 (程式A)",
-    "🛡️ 空頭避風港 (方案B)"
+    "🤖 量化型態狀態機 (程式A)"
 ]
 selected_page = st.radio("📌 快速切換功能分頁：", page_options, horizontal=True)
 
@@ -466,7 +451,6 @@ elif selected_page == "📊 單檔深度解析":
             if df.empty:
                 st.error(f"❌ 查無 [{user_input}] 的歷史數據，請確認代號是否正確。")
             else:
-                raw_wyckoff_df = df.copy()
                 stock_name = get_tw_stock_name(real_ticker)
                 df = core.TechnicalIndicators.add_kd(df)
                 df = core.TechnicalIndicators.add_macd(df)
@@ -551,41 +535,6 @@ elif selected_page == "📊 單檔深度解析":
                                f"- 預估 1 段目標：{last_row['Adv_Target_1x']:.2f} | 預估 3 段目標：{last_row['Adv_Target_3x']:.2f}")
                     st.markdown("---")
 
-                # 純 Python 威科夫量價週期判定資訊卡片（直接沿用已抓取之 2 年期資料）
-                try:
-                    wyckoff_single = core.WyckoffPhaseAnalyzer.evaluate(
-                        raw_wyckoff_df, real_ticker.split('.')[0], stock_name
-                    )
-                except Exception:
-                    wyckoff_single = core.WyckoffPhaseAnalyzer._default_result(
-                        real_ticker.split('.')[0], stock_name
-                    )
-
-                with st.container(border=True):
-                    st.markdown("#### 🧭 威科夫量價週期判定")
-                    w_c1, w_c2, w_c3, w_c4 = st.columns(4)
-                    w_c1.metric(
-                        "核心事件 / 階段代碼",
-                        wyckoff_single["key_event"],
-                        delta=wyckoff_single["wyckoff_phase"],
-                        delta_color="off"
-                    )
-                    w_c2.metric(
-                        "操作訊號 / 信心分",
-                        wyckoff_single["action_signal"],
-                        delta=f"信心分：{wyckoff_single['confidence_score']} 分",
-                        delta_color="off"
-                    )
-                    w_c3.metric("冰線支撐 (Ice)", f"{wyckoff_single['ice_line_support']:.2f}")
-                    w_c4.metric("阻力小溪 (Creek)", f"{wyckoff_single['creek_resistance']:.2f}")
-                    st.markdown(
-                        f"- **威科夫階段**：{wyckoff_single['phase_label_zh']}\n"
-                        f"- **騙線警示**：{wyckoff_single['trap_warning']}\n"
-                        f"- **努力與結果**：{wyckoff_single['effort_vs_result_analysis']}\n"
-                        f"- **判讀摘要**：{wyckoff_single['summary_reason']}"
-                    )
-                st.markdown("---")
-
                 st.markdown(f"**更新日期：{last_date} | 最新收盤價：{last_row['Close']:.2f}**")
                 with st.container(height=165):
                     if last_row['Close'] > last_row['MA20']:
@@ -597,6 +546,16 @@ elif selected_page == "📊 單檔深度解析":
                     else:
                         st.markdown(f"- ⚠️ **籌碼狀況**：低於加權均線 ({last_row['VWMA20']:.2f})，近期買盤套牢，上方有**解套賣壓**。")
                     st.markdown(f"- 🛡️ **主力防線**：近兩個月最大量防守價為 **{last_row['Max_Vol_Defense']:.2f}**，此價位不破皆可偏多看待。")
+
+                # 實體波段留倉量（扣除當日沖銷）精簡指標卡片
+                rv_res = get_real_volume_summary(recent_df, real_ticker.split('.')[0])
+                rv1, rv2, rv3, rv4 = st.columns(4)
+                rv1.metric("當沖率 (%)", f"{rv_res['當沖率(%)']:.2f}%")
+                rv2.metric("實體留倉量 (張)", f"{rv_res['實體留倉量(張)']:,}")
+                rv3.metric("實體量比 (vs 20MA)", f"{rv_res['實體量比']:.2f}x")
+                rv4.metric("量能結構標籤", rv_res["量能結構標籤"])
+                if rv_res.get("is_fake_vol_trap", False):
+                    st.error("🚨 **UTAD_FAKE_VOLUME_TRAP（高當沖假爆量誘多警示）**：當日總量爆增且當沖率偏高並伴隨上影線收弱，建議剔除多頭買進訊號。")
 
                 fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12), sharex=True, gridspec_kw={'height_ratios': [2.8, 1.2, 1.2]})
                 ax1.plot(plot_df.index, plot_df['Close'], label='Close', color='#1f77b4', linewidth=1.8)
@@ -863,7 +822,7 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         reversal_list, final_results = list(reversal_candidates.values()), []
         if reversal_list:
-            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離與威科夫週期...")
+            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離與實體波段留倉量...")
             long_data = yf.download([item["_Full_Ticker"] for item in reversal_list], threads=False, progress=False, session=yf_session, **dl_kwargs)
 
             for idx, item in enumerate(reversal_list):
@@ -876,7 +835,10 @@ elif selected_page == "🚀 全市場智慧掃描":
                     item['均線糾結狀態'] = "-"
                     item['短天期均線差異(%)'] = "-"
                     item['短均線糾結狀態'] = "-"
-                    item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
+                    item['當沖率(%)'] = 0.0
+                    item['實體留倉量(張)'] = 0
+                    item['實體量比'] = 0.0
+                    item['量能結構標籤'] = "⚪ 一般量能結構"
 
                     long_df = pd.DataFrame()
                     try:
@@ -926,13 +888,18 @@ elif selected_page == "🚀 全市場智慧掃描":
                             item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
                             if res_tags: has_daily_div = True
 
-                    # 純 Python 威科夫週期階段與量價結構判定（零額外下載，long_df 為空時降級使用 daily_df）
+                    # 實體波段留倉量（扣除當日沖銷）後置檢核
+                    vol_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
                     try:
-                        wyckoff_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
-                        wyckoff_res = core.WyckoffPhaseAnalyzer.evaluate(wyckoff_src_df, item["股票代號"], item["股票名稱"])
-                        item.update(core.WyckoffPhaseAnalyzer.to_report_fields(wyckoff_res))
+                        rv_res = core.get_latest_real_volume_summary(vol_src_df.tail(60), item["股票代號"])
+                        item["當沖率(%)"] = rv_res["當沖率(%)"]
+                        item["實體留倉量(張)"] = rv_res["實體留倉量(張)"]
+                        item["實體量比"] = rv_res["實體量比"]
+                        item["量能結構標籤"] = rv_res["量能結構標籤"]
+                        if rv_res.get("is_fake_vol_trap", False):
+                            item["進場位置建議"] = "🚫 假爆量誘多(剔除多訊)"
                     except Exception:
-                        item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
+                        pass
 
                     base_tags = core.ScanEngine.generate_base_tags(item, config_dict)
                     div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
@@ -951,16 +918,15 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
-        base_cols.append('演算法建議結果')
-        base_cols.extend(core.WYCKOFF_REPORT_COLUMNS)
         base_cols.extend([
-            '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
+            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
         ])
         
         base_cols.extend(core.ScanEngine.get_all_metric_keys())
         
         base_cols.extend([
             '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+            '當沖率(%)', '實體留倉量(張)', '實體量比', '量能結構標籤',
             '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '當日收盤', '月均量(張)'
         ])
         if config_dict["use_weekly_filter"]: base_cols.extend(['週K共振', '週K背離'])
@@ -1171,12 +1137,12 @@ elif selected_page == "📑 財報三表地雷掃描":
                             "ROE年化(%)": f"{res['ROE年化(%)']:.2f}%" if pd.notna(res.get('ROE年化(%)')) else "-",
                             "ROA年化(%)": f"{res['ROA年化(%)']:.2f}%" if pd.notna(res.get('ROA年化(%)')) else "-",
                             "營收YoY(%)": f"{res['營收成長(%)']:.2f}%" if pd.notna(res.get('營收成長(%)')) else "-",
-                            "毛利率(%)": f"{res['毛利率']:.2f}%" if pd.notna(res.get('毛利率')) else "-",
-                            "營益率(%)": f"{res['營益率']:.2f}%" if pd.notna(res.get('營益率')) else "-",
-                            "CFO/淨利(倍)": f"{res['CFO/淨利']:.2f}" if pd.notna(res.get('CFO/淨利')) else "-",
-                            "CCC週期(天)": f"{res['CCC_now']:.0f}" if pd.notna(res.get('CCC_now')) else "-",
-                            "收現天數(DSO)": f"{res['DSO_now']:.0f}" if pd.notna(res.get('DSO_now')) else "-",
-                            "週轉天數(DIO)": f"{res['DIO_now']:.0f}" if pd.notna(res.get('DIO_now')) else "-",
+                            "毛利率(%)": f"{res['毛利率']:.2f}%" if pd.notna(res['毛利率']) else "-",
+                            "營益率(%)": f"{res['營益率']:.2f}%" if pd.notna(res['營益率']) else "-",
+                            "CFO/淨利(倍)": f"{res['CFO/淨利']:.2f}" if pd.notna(res['CFO/淨利']) else "-",
+                            "CCC週期(天)": f"{res['CCC_now']:.0f}" if pd.notna(res['CCC_now']) else "-",
+                            "收現天數(DSO)": f"{res['DSO_now']:.0f}" if pd.notna(res['DSO_now']) else "-",
+                            "週轉天數(DIO)": f"{res['DIO_now']:.0f}" if pd.notna(res['DIO_now']) else "-",
                             "警訊數": res["警訊數"], "護城河特徵": res["正向訊號"], "警示明細": res["診斷明細"]
                         })
                     time.sleep(0.5)
@@ -1454,131 +1420,3 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     st.success(f"**當前主導狀態**：{' ； '.join(dict.fromkeys(final_states))}")
                 else:
                     st.warning("**當前主導狀態**：目前無已確認之水平反轉型態或趨勢線突破，市場處於軌道內整理或單向波段中。")
-
-# ----------------------------------------------------
-# 頁籤 7：空頭避風港強勢股（方案 B）
-# ----------------------------------------------------
-elif selected_page == "🛡️ 空頭避風港 (方案B)":
-    col_sh1, col_sh2 = st.columns([4, 1])
-    with col_sh1:
-        st.write("專為大盤跌破季線並進入第二波壓力測試期設計的盤後強勢股掃描器，嚴格過濾上市／上櫃普通股（排除 ETF、權證、ETN 與 TDR），鎖定全程守穩 60MA、結構底底高、15 日超額報酬 RS > +8% 且具流動性之避風港標的。")
-    with col_sh2:
-        if st.button("🔄 重新檢核大盤閘門", use_container_width=True):
-            get_safe_haven_market_gate.clear()
-            st.rerun()
-
-    with st.spinner("⏳ 正在檢核加權指數 (^TWII) 條件 1 與條件 2 閘門狀態..."):
-        gate_info = get_safe_haven_market_gate()
-
-    if not isinstance(gate_info, dict) or gate_info.get("status") != "success":
-        err_msg = gate_info.get("message", "無法取得加權指數資料，請稍後再試。") if isinstance(gate_info, dict) else "大盤閘門檢核失敗。"
-        st.error(f"❌ {err_msg}")
-    else:
-        st.caption(f"最新交易日：{gate_info['latest_date']} ｜ 檢核時間：{gate_info['eval_time']} ｜ 資料來源：Yahoo Finance (^TWII)")
-
-        if gate_info.get("gate_passed"):
-            st.success(f"✅ **大盤閘門已開啟**：{gate_info['message']}")
-        else:
-            st.warning(f"⚠️ **{core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}**")
-
-        g1, g2, g3, g4 = st.columns(4)
-        g1.metric(
-            "^TWII 最新收盤 / 60MA",
-            f"{gate_info['latest_close']:,.2f}",
-            delta=f"60MA {gate_info['latest_ma60']:,.2f} ({gate_info['latest_close'] - gate_info['latest_ma60']:+.2f})",
-            delta_color="normal"
-        )
-        g2.metric(
-            "條件 1：近 10 日破季線天數",
-            f"{gate_info['below_ma60_days_10']} / 10 日",
-            delta="✅ 通過 (需>=7日且收盤<60MA)" if gate_info["cond1_passed"] else "❌ 未達標",
-            delta_color="off"
-        )
-        g3.metric(
-            "前段波段低點 Low_1 (-25~-8日)",
-            f"{gate_info['prev_low_1']:,.2f}",
-            delta=f"{gate_info['prev_low_1_date']} ｜ 1.01倍門檻 {gate_info['low_threshold']:,.2f}",
-            delta_color="off"
-        )
-        g4.metric(
-            "條件 2：近 7 日最低點 (雙波回測)",
-            f"{gate_info['recent_low_7d']:,.2f}",
-            delta=(
-                f"✅ 通過 ({'破底' if gate_info['is_new_low'] else '回測前低'} {gate_info['low_ratio_pct']:+.2f}%)"
-                if gate_info["cond2_passed"]
-                else f"❌ 未回測 ({gate_info['low_ratio_pct']:+.2f}%)"
-            ),
-            delta_color="off"
-        )
-
-        st.markdown("---")
-        run_plan_b_btn = st.button("🚀 執行方案 B 掃描", type="primary")
-
-        if run_plan_b_btn:
-            if not gate_info.get("gate_passed"):
-                st.warning(f"⚠️ {core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}")
-            else:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                status_text.text("⏳ 正在取得上市／上櫃普通股清單...")
-                stock_dict = get_all_tw_stocks()
-
-                if not stock_dict:
-                    progress_bar.empty()
-                    status_text.empty()
-                    st.error("❌ 無法取得台股清單，請稍後再試。")
-                else:
-                    def _on_plan_b_progress(done_cnt, total_cnt, msg):
-                        ratio = min(1.0, done_cnt / total_cnt) if total_cnt > 0 else 0.0
-                        progress_bar.progress(ratio)
-                        status_text.text(f"⏳ {msg}")
-
-                    scan_res = core.BearMarketSafeHavenStrategy.scan_market(
-                        stock_dict=stock_dict,
-                        twii_df=gate_info.get("twii_df"),
-                        max_workers=5,
-                        chunk_size=30,
-                        request_delay=0.35,
-                        progress_callback=_on_plan_b_progress,
-                        session=core.get_yf_session()
-                    )
-                    progress_bar.empty()
-                    status_text.empty()
-                    st.session_state.plan_b_scan_res = scan_res
-
-        if "plan_b_scan_res" in st.session_state:
-            pb_res = st.session_state.plan_b_scan_res
-            pb_status = pb_res.get("status")
-
-            if pb_status == "blocked":
-                st.warning(f"⚠️ {pb_res.get('message', core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG)}")
-            elif pb_status == "error":
-                st.error(f"❌ {pb_res.get('message', '方案 B 掃描發生錯誤。')}")
-            else:
-                res_df = pb_res.get("results_df", pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS))
-                st.success(f"🎉 {pb_res.get('message', '方案 B 掃描完成。')}")
-
-                if not res_df.empty:
-                    breakout_cnt = int((res_df["狀態判定"] == core.BearMarketSafeHavenStrategy.STATUS_BREAKOUT).sum())
-                    holding_cnt = int((res_df["狀態判定"] == core.BearMarketSafeHavenStrategy.STATUS_HOLDING).sum())
-
-                    s1, s2, s3 = st.columns(3)
-                    s1.metric("總入選家數", f"{len(res_df)} 檔")
-                    s2.metric("🚀 突破點火（右側試單）", f"{breakout_cnt} 檔")
-                    s3.metric("🛡️ 通過雙波測試（觀察中）", f"{holding_cnt} 檔")
-
-                    display_df = res_df.copy()
-                    display_df.index = range(1, len(display_df) + 1)
-                    st.dataframe(display_df, use_container_width=True)
-
-                    tw_tz = datetime.timezone(datetime.timedelta(hours=8))
-                    today_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d")
-                    csv_bytes = res_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label="📥 下載方案 B 強勢股清單 (CSV / UTF-8-SIG)",
-                        data=csv_bytes,
-                        file_name=f"plan_b_safe_haven_{today_str}.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.info("今日大盤已通過雙波回測閘門，但全市場普通股中尚無同時通過 5 項嚴格條件的標的。")
