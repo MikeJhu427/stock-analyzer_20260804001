@@ -466,6 +466,7 @@ elif selected_page == "📊 單檔深度解析":
             if df.empty:
                 st.error(f"❌ 查無 [{user_input}] 的歷史數據，請確認代號是否正確。")
             else:
+                raw_wyckoff_df = df.copy()
                 stock_name = get_tw_stock_name(real_ticker)
                 df = core.TechnicalIndicators.add_kd(df)
                 df = core.TechnicalIndicators.add_macd(df)
@@ -549,6 +550,41 @@ elif selected_page == "📊 單檔深度解析":
                                f"- 上影線頸線：{last_row['Adv_Neckline_1']:.2f} | 右肩回測基準：{last_row.get('Adv_Support_RS', 0):.2f}\n"
                                f"- 預估 1 段目標：{last_row['Adv_Target_1x']:.2f} | 預估 3 段目標：{last_row['Adv_Target_3x']:.2f}")
                     st.markdown("---")
+
+                # 純 Python 威科夫量價週期判定資訊卡片（直接沿用已抓取之 2 年期資料）
+                try:
+                    wyckoff_single = core.WyckoffPhaseAnalyzer.evaluate(
+                        raw_wyckoff_df, real_ticker.split('.')[0], stock_name
+                    )
+                except Exception:
+                    wyckoff_single = core.WyckoffPhaseAnalyzer._default_result(
+                        real_ticker.split('.')[0], stock_name
+                    )
+
+                with st.container(border=True):
+                    st.markdown("#### 🧭 威科夫量價週期判定")
+                    w_c1, w_c2, w_c3, w_c4 = st.columns(4)
+                    w_c1.metric(
+                        "核心事件 / 階段代碼",
+                        wyckoff_single["key_event"],
+                        delta=wyckoff_single["wyckoff_phase"],
+                        delta_color="off"
+                    )
+                    w_c2.metric(
+                        "操作訊號 / 信心分",
+                        wyckoff_single["action_signal"],
+                        delta=f"信心分：{wyckoff_single['confidence_score']} 分",
+                        delta_color="off"
+                    )
+                    w_c3.metric("冰線支撐 (Ice)", f"{wyckoff_single['ice_line_support']:.2f}")
+                    w_c4.metric("阻力小溪 (Creek)", f"{wyckoff_single['creek_resistance']:.2f}")
+                    st.markdown(
+                        f"- **威科夫階段**：{wyckoff_single['phase_label_zh']}\n"
+                        f"- **騙線警示**：{wyckoff_single['trap_warning']}\n"
+                        f"- **努力與結果**：{wyckoff_single['effort_vs_result_analysis']}\n"
+                        f"- **判讀摘要**：{wyckoff_single['summary_reason']}"
+                    )
+                st.markdown("---")
 
                 st.markdown(f"**更新日期：{last_date} | 最新收盤價：{last_row['Close']:.2f}**")
                 with st.container(height=165):
@@ -827,7 +863,7 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         reversal_list, final_results = list(reversal_candidates.values()), []
         if reversal_list:
-            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離...")
+            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離與威科夫週期...")
             long_data = yf.download([item["_Full_Ticker"] for item in reversal_list], threads=False, progress=False, session=yf_session, **dl_kwargs)
 
             for idx, item in enumerate(reversal_list):
@@ -840,7 +876,9 @@ elif selected_page == "🚀 全市場智慧掃描":
                     item['均線糾結狀態'] = "-"
                     item['短天期均線差異(%)'] = "-"
                     item['短均線糾結狀態'] = "-"
+                    item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
 
+                    long_df = pd.DataFrame()
                     try:
                         if isinstance(long_data.columns, pd.MultiIndex):
                             if ticker in long_data.columns.get_level_values(0): long_df = long_data.xs(ticker, axis=1, level=0).dropna(how='all')
@@ -888,6 +926,14 @@ elif selected_page == "🚀 全市場智慧掃描":
                             item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
                             if res_tags: has_daily_div = True
 
+                    # 純 Python 威科夫週期階段與量價結構判定（零額外下載，long_df 為空時降級使用 daily_df）
+                    try:
+                        wyckoff_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
+                        wyckoff_res = core.WyckoffPhaseAnalyzer.evaluate(wyckoff_src_df, item["股票代號"], item["股票名稱"])
+                        item.update(core.WyckoffPhaseAnalyzer.to_report_fields(wyckoff_res))
+                    except Exception:
+                        item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
+
                     base_tags = core.ScanEngine.generate_base_tags(item, config_dict)
                     div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
                     
@@ -905,8 +951,10 @@ elif selected_page == "🚀 全市場智慧掃描":
 
         base_cols = ['股票代號', '股票名稱', '觸發日期']
         if config_dict["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
+        base_cols.append('演算法建議結果')
+        base_cols.extend(core.WYCKOFF_REPORT_COLUMNS)
         base_cols.extend([
-            '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
+            '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
         ])
         
         base_cols.extend(core.ScanEngine.get_all_metric_keys())
@@ -1122,13 +1170,13 @@ elif selected_page == "📑 財報三表地雷掃描":
                             "合約負債判定": res["cl_status"].split(" ")[0] if " " in res["cl_status"] else res["cl_status"],
                             "ROE年化(%)": f"{res['ROE年化(%)']:.2f}%" if pd.notna(res.get('ROE年化(%)')) else "-",
                             "ROA年化(%)": f"{res['ROA年化(%)']:.2f}%" if pd.notna(res.get('ROA年化(%)')) else "-",
-                            "營收YoY(%)": f"{res['營收成長(%)']:.2f}%" if pd.notna(res['營收成長(%)']) else "-",
-                            "毛利率(%)": f"{res['毛利率']:.2f}%" if pd.notna(res['毛利率']) else "-",
-                            "營益率(%)": f"{res['營益率']:.2f}%" if pd.notna(res['營益率']) else "-",
-                            "CFO/淨利(倍)": f"{res['CFO/淨利']:.2f}" if pd.notna(res['CFO/淨利']) else "-",
-                            "CCC週期(天)": f"{res['CCC_now']:.0f}" if pd.notna(res['CCC_now']) else "-",
-                            "收現天數(DSO)": f"{res['DSO_now']:.0f}" if pd.notna(res['DSO_now']) else "-",
-                            "週轉天數(DIO)": f"{res['DIO_now']:.0f}" if pd.notna(res['DIO_now']) else "-",
+                            "營收YoY(%)": f"{res['營收成長(%)']:.2f}%" if pd.notna(res.get('營收成長(%)')) else "-",
+                            "毛利率(%)": f"{res['毛利率']:.2f}%" if pd.notna(res.get('毛利率')) else "-",
+                            "營益率(%)": f"{res['營益率']:.2f}%" if pd.notna(res.get('營益率')) else "-",
+                            "CFO/淨利(倍)": f"{res['CFO/淨利']:.2f}" if pd.notna(res.get('CFO/淨利')) else "-",
+                            "CCC週期(天)": f"{res['CCC_now']:.0f}" if pd.notna(res.get('CCC_now')) else "-",
+                            "收現天數(DSO)": f"{res['DSO_now']:.0f}" if pd.notna(res.get('DSO_now')) else "-",
+                            "週轉天數(DIO)": f"{res['DIO_now']:.0f}" if pd.notna(res.get('DIO_now')) else "-",
                             "警訊數": res["警訊數"], "護城河特徵": res["正向訊號"], "警示明細": res["診斷明細"]
                         })
                     time.sleep(0.5)
