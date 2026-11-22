@@ -11,7 +11,6 @@ import strategy_core as core
 CONFIG = core.DEFAULT_CONFIG.copy()
 FOREIGN_FLOW_SHEET_NAME = "外資資金流向監控"
 FOREIGN_FLOW_HISTORY_FILE = "foreign_fund_flow_history.xlsx"
-SAFE_HAVEN_SHEET_NAME = "空頭避風港_方案B"
 
 
 def _calc_display_width(text) -> int:
@@ -160,58 +159,6 @@ def _format_foreign_flow_sheet(writer, sheet_name: str, ref_sheet_name: str = "�
         pass
 
 
-def _format_safe_haven_sheet(writer, sheet_name: str, ref_sheet_name: str = "全市場掃描結果"):
-    """為「空頭避風港_方案B」工作表套用統一字型、數值格式與自動欄寬。"""
-    try:
-        ws = writer.sheets.get(sheet_name)
-        if ws is None:
-            return
-
-        ref_ws = writer.sheets.get(ref_sheet_name)
-        header_font = copy(ref_ws["A1"].font) if (ref_ws is not None and ref_ws.max_row >= 1) else None
-        data_font = copy(ref_ws["A2"].font) if (ref_ws is not None and ref_ws.max_row >= 2) else None
-
-        two_dec_cols = {
-            "最新收盤價",
-            "60MA季線價",
-            "10MA移動停利參考價",
-            "距60MA乖離率(%)",
-            "15日超額報酬RS(%)"
-        }
-        one_dec_cols = {"5日均量(張)"}
-
-        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-
-        for col_idx, col_name in enumerate(headers, start=1):
-            col_letter = ws.cell(row=1, column=col_idx).column_letter
-            max_len = _calc_display_width(col_name)
-
-            if header_font is not None:
-                ws.cell(row=1, column=col_idx).font = copy(header_font)
-
-            for row_idx in range(2, ws.max_row + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                if data_font is not None:
-                    cell.font = copy(data_font)
-
-                val = cell.value
-                display_str = ""
-                if col_name in two_dec_cols and isinstance(val, (int, float)) and pd.notna(val):
-                    cell.number_format = "#,##0.00"
-                    display_str = f"{val:,.2f}"
-                elif col_name in one_dec_cols and isinstance(val, (int, float)) and pd.notna(val):
-                    cell.number_format = "#,##0.0"
-                    display_str = f"{val:,.1f}"
-                elif val is not None:
-                    display_str = str(val)
-
-                max_len = max(max_len, _calc_display_width(display_str))
-
-            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 55)
-    except Exception:
-        pass
-
-
 def _persist_foreign_flow_history(flow_df: pd.DataFrame):
     """將去重後的歷史紀錄同步保存於本地檔案，供後續排程延續趨勢。"""
     try:
@@ -225,93 +172,6 @@ def _persist_foreign_flow_history(flow_df: pd.DataFrame):
             _format_foreign_flow_sheet(writer, FOREIGN_FLOW_SHEET_NAME, ref_sheet_name=FOREIGN_FLOW_SHEET_NAME)
     except Exception:
         pass
-
-
-def _run_plan_b_safe_haven(stock_dict: dict, preloaded_daily_map: dict, yf_session) -> dict:
-    """
-    執行方案 B（空頭避風港強勢股）盤後掃描步驟：
-    1. 先檢查加權指數 (^TWII) 條件 1 與條件 2 閘門；未同時達標則印出鎖定訊息並跳過個股掃描。
-    2. 若通過閘門，優先複用 Step 1 已下載日線資料執行全市場普通股掃描，印出排序結果並匯出本地 UTF-8-SIG CSV。
-    """
-    print("🚀 [Step 3] 執行空頭避風港強勢股（方案 B）大盤閘門檢核與盤後掃描...")
-    try:
-        gate_info = core.BearMarketSafeHavenStrategy.evaluate_market_gate(session=yf_session)
-    except Exception as e:
-        err_msg = f"方案 B 大盤閘門檢核異常：{str(e)}"
-        print(f"⚠️ {err_msg}")
-        return {
-            "status": "error",
-            "gate_passed": False,
-            "message": err_msg,
-            "results_df": pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS)
-        }
-
-    if gate_info.get("status") != "success":
-        print(f"⚠️ {gate_info.get('message', '無法取得大盤資料，略過方案 B 掃描。')}")
-        return {
-            "status": "error",
-            "gate_passed": False,
-            "message": gate_info.get("message", "大盤閘門檢核失敗"),
-            "gate_info": gate_info,
-            "results_df": pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS)
-        }
-
-    print(
-        f"🛡️ [^TWII {gate_info['latest_date']}] 收盤：{gate_info['latest_close']:.2f} | "
-        f"60MA：{gate_info['latest_ma60']:.2f} | 近10日破季線：{gate_info['below_ma60_days_10']} 日 | "
-        f"前段Low_1：{gate_info['prev_low_1']:.2f} ({gate_info['prev_low_1_date']}) | "
-        f"近7日最低：{gate_info['recent_low_7d']:.2f} ({gate_info['recent_low_7d_date']})"
-    )
-
-    if not gate_info.get("gate_passed", False):
-        print(f"⏸️ {core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG}")
-        return {
-            "status": "blocked",
-            "gate_passed": False,
-            "message": core.BearMarketSafeHavenStrategy.GATE_BLOCKED_MSG,
-            "gate_info": gate_info,
-            "results_df": pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS)
-        }
-
-    print("✅ 大盤同時滿足條件 1 與條件 2，啟動方案 B 普通股掃描...")
-    try:
-        scan_res = core.BearMarketSafeHavenStrategy.scan_market(
-            stock_dict=stock_dict,
-            twii_df=gate_info.get("twii_df"),
-            preloaded_data=preloaded_daily_map,
-            max_workers=5,
-            chunk_size=30,
-            request_delay=0.35,
-            session=yf_session
-        )
-    except Exception as e:
-        err_msg = f"方案 B 普通股掃描執行異常：{str(e)}"
-        print(f"⚠️ {err_msg}")
-        return {
-            "status": "error",
-            "gate_passed": True,
-            "message": err_msg,
-            "gate_info": gate_info,
-            "results_df": pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS)
-        }
-
-    res_df = scan_res.get("results_df", pd.DataFrame(columns=core.SAFE_HAVEN_COLUMNS))
-    print(f"🎯 {scan_res.get('message', '方案 B 掃描完成')}（複用日線快取：{scan_res.get('reused_count', 0)} 檔）")
-
-    if not res_df.empty:
-        print("📋 【空頭避風港強勢股（方案 B）】依 15日超額報酬RS(%) 降冪排序結果：")
-        print(res_df.to_string(index=False))
-
-    tw_tz = datetime.timezone(datetime.timedelta(hours=8))
-    today_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d")
-    csv_filename = f"plan_b_safe_haven_{today_str}.csv"
-    try:
-        res_df.to_csv(csv_filename, index=False, encoding="utf-8-sig")
-        print(f"💾 已於本地匯出方案 B 報表：{csv_filename}")
-    except Exception as e:
-        print(f"⚠️ 匯出本地 CSV ({csv_filename}) 失敗：{str(e)}")
-
-    return scan_res
 
 
 def run_full_scan():
@@ -366,9 +226,6 @@ def run_full_scan():
     total_needed_days = CONFIG["lookback_start"] + max_older_w + CONFIG["pivot_left"] + 70 + extra_buffer_days
     dl_period = "3mo" if total_needed_days <= 60 else "6mo" if total_needed_days <= 120 else "1y"
     
-    common_stock_set = set(core.BearMarketSafeHavenStrategy.filter_common_stocks(stock_dict).keys())
-    plan_b_daily_cache = {}
-
     reversal_candidates = {}
     chunk_size = 40
 
@@ -386,14 +243,6 @@ def run_full_scan():
                         elif ticker in data.columns.get_level_values(1): df = data.xs(ticker, axis=1, level=1).dropna(how='all')
                         else: df = pd.DataFrame()
                     else: df = data.dropna(how='all') if len(chunk) == 1 else pd.DataFrame()
-
-                    if (
-                        ticker in common_stock_set
-                        and not df.empty
-                        and len(df) >= core.BearMarketSafeHavenStrategy.MIN_REQUIRED_BARS
-                        and all(col in df.columns for col in ["Open", "High", "Low", "Close", "Volume"])
-                    ):
-                        plan_b_daily_cache[ticker] = df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
                     if df.empty or len(df) <= CONFIG["lookback_start"] + 20: continue
 
@@ -496,11 +345,9 @@ def run_full_scan():
 
     reversal_list = list(reversal_candidates.values())
     print(f"🎯 第一階段篩選完畢，共入選 {len(reversal_list)} 檔標的。")
-    if not reversal_list:
-        _run_plan_b_safe_haven(stock_dict, plan_b_daily_cache, yf_session)
-        return print("💡 今日全市場無符合條件標的，任務結束。")
+    if not reversal_list: return print("💡 今日全市場無符合條件標的，任務結束。")
 
-    print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、240MA年線深度評分、背離與威科夫週期...")
+    print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、240MA年線深度評分、背離與實體波段留倉量...")
     candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
     import yfinance as yf
     long_data = yf.download(candidate_tickers, period="2y", threads=False, progress=False, session=yf_session)
@@ -516,7 +363,10 @@ def run_full_scan():
             item['均線糾結狀態'] = "-"
             item['短天期均線差異(%)'] = "-"
             item['短均線糾結狀態'] = "-"
-            item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
+            item['當沖率(%)'] = 0.0
+            item['實體留倉量(張)'] = 0
+            item['實體量比'] = 0.0
+            item['量能結構標籤'] = "⚪ 一般量能結構"
 
             long_df = pd.DataFrame()
             try:
@@ -568,13 +418,18 @@ def run_full_scan():
                     item[f"日K背離({r_w},{o_w})"] = "+".join(res_tags) if res_tags else "無"
                     if res_tags: has_daily_div = True
 
-            # 純 Python 威科夫週期階段與量價結構判定（零額外下載，long_df 為空時降級使用 daily_df）
+            # 實體波段留倉量（扣除當日沖銷）後置檢核
+            vol_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
             try:
-                wyckoff_src_df = long_df if (long_df is not None and not long_df.empty) else daily_df
-                wyckoff_res = core.WyckoffPhaseAnalyzer.evaluate(wyckoff_src_df, item["股票代號"], item["股票名稱"])
-                item.update(core.WyckoffPhaseAnalyzer.to_report_fields(wyckoff_res))
+                rv_res = core.get_latest_real_volume_summary(vol_src_df.tail(60), item["股票代號"])
+                item["當沖率(%)"] = rv_res["當沖率(%)"]
+                item["實體留倉量(張)"] = rv_res["實體留倉量(張)"]
+                item["實體量比"] = rv_res["實體量比"]
+                item["量能結構標籤"] = rv_res["量能結構標籤"]
+                if rv_res.get("is_fake_vol_trap", False):
+                    item["進場位置建議"] = "🚫 假爆量誘多(剔除多訊)"
             except Exception:
-                item.update(core.WyckoffPhaseAnalyzer.to_report_fields(None))
+                pass
 
             base_tags = core.ScanEngine.generate_base_tags(item, CONFIG)
             div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
@@ -587,23 +442,19 @@ def run_full_scan():
             final_results.append(item)
         except Exception: continue
 
-    plan_b_res = _run_plan_b_safe_haven(stock_dict, plan_b_daily_cache, yf_session)
-    safe_haven_excel_df = core.BearMarketSafeHavenStrategy.build_excel_dataframe(plan_b_res)
-
     res_df = pd.DataFrame(final_results)
     
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if CONFIG["enable_30d_backtest"]: base_cols.append('近30日觸發次數')
-    base_cols.append('演算法建議結果')
-    base_cols.extend(core.WYCKOFF_REPORT_COLUMNS)
     base_cols.extend([
-        '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
+        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
     ])
     
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
     
     base_cols.extend([
         '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
+        '當沖率(%)', '實體留倉量(張)', '實體量比', '量能結構標籤',
         '當日KD(K值)', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', '當日收盤', '月均量(張)'
     ])
     if CONFIG["use_weekly_filter"]:
@@ -623,7 +474,7 @@ def run_full_scan():
         res_df.index = res_df.index + 1
 
         print("📊 掃描完成！最終報表標的預覽：")
-        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '威科夫階段', '威科夫事件', '均線糾結狀態', '短均線糾結狀態']].to_string())
+        print(res_df[['股票代號', '股票名稱', '演算法建議結果', '均線糾結狀態', '短均線糾結狀態', '量能結構標籤']].to_string())
 
         # 本地同步保留外資資金流向歷史紀錄（供下次執行去重附加）
         _persist_foreign_flow_history(foreign_flow_df)
@@ -637,7 +488,7 @@ def run_full_scan():
             file_name = f"auto_scan_all_{timestamp}.xlsx"
             
             try:
-                # 強制採用 openpyxl 輸出四工作表 .xlsx（掃描結果 + 波動率體制監控 + 外資資金流向監控 + 空頭避風港_方案B）
+                # 強制採用 openpyxl 輸出三工作表 .xlsx（掃描結果 + 波動率體制監控 + 外資資金流向監控）
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     res_df.to_excel(writer, sheet_name="全市場掃描結果", index=False)
@@ -647,11 +498,6 @@ def run_full_scan():
                         _format_foreign_flow_sheet(writer, FOREIGN_FLOW_SHEET_NAME, ref_sheet_name="全市場掃描結果")
                     except Exception as fe:
                         print(f"⚠️ 寫入「{FOREIGN_FLOW_SHEET_NAME}」工作表失敗，維持主報表匯出：{fe}")
-                    try:
-                        safe_haven_excel_df.to_excel(writer, sheet_name=SAFE_HAVEN_SHEET_NAME, index=False)
-                        _format_safe_haven_sheet(writer, SAFE_HAVEN_SHEET_NAME, ref_sheet_name="全市場掃描結果")
-                    except Exception as pbe:
-                        print(f"⚠️ 寫入「{SAFE_HAVEN_SHEET_NAME}」工作表失敗，維持主報表匯出：{pbe}")
                 buffer.seek(0)
                 xlsx_bytes = buffer.read()
                 
