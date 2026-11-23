@@ -107,7 +107,7 @@ def _merge_foreign_flow_history(flow_res: dict) -> pd.DataFrame:
 
 
 def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None) -> list:
-    """組合主掃描報表的完整欄位順序（既有欄位＋背離欄位＋8 項實體量新增欄位），確保 0 檔空表結構一致。"""
+    """組合主掃描報表的完整欄位順序（既有欄位＋背離欄位＋威科夫 5 項欄位＋8 項實體量新增欄位），確保 0 檔空表結構一致。"""
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if config.get("enable_30d_backtest", False):
         base_cols.append('近30日觸發次數')
@@ -136,6 +136,9 @@ def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None
         div_cols.extend(extra_div_cols)
 
     all_cols = base_cols + [c for c in div_cols if c not in base_cols]
+    for col in core.WYCKOFF_COLUMNS:
+        if col not in all_cols:
+            all_cols.append(col)
     for col in core.REAL_TURNOVER_COLUMNS:
         if col not in all_cols:
             all_cols.append(col)
@@ -143,13 +146,15 @@ def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None
 
 
 def _format_main_scan_sheet(writer, sheet_name: str = MAIN_SCAN_SHEET_NAME):
-    """為「全市場掃描結果」工作表套用實體量數值格式與自動欄寬調整。"""
+    """為「全市場掃描結果」工作表套用威科夫與實體量數值格式及自動欄寬調整。"""
     try:
         ws = writer.sheets.get(sheet_name)
         if ws is None:
             return
 
         two_dec_cols = {
+            "威科夫TR支撐價",
+            "威科夫TR壓力價",
             "當沖張數",
             "當沖率(%)",
             "實體留倉量(張)",
@@ -396,8 +401,8 @@ def export_scan_reports(
 ):
     """
     統一報表匯出介面（支援 .xlsx 與 .csv，預設 .xlsx）：
-    - .xlsx：輸出 4 工作表（含自動欄寬與實體量數值格式），即使 res_df 為 0 檔仍保留完整標頭。
-    - .csv：以 utf-8-sig 編碼輸出完整欄位（包含 8 項新增實體量欄位）。
+    - .xlsx：輸出 4 工作表（含自動欄寬與數值格式），即使 res_df 為 0 檔仍保留完整標頭。
+    - .csv：以 utf-8-sig 編碼輸出完整欄位（包含威科夫與 8 項新增實體量欄位）。
     """
     _persist_foreign_flow_history(foreign_flow_df)
 
@@ -519,7 +524,8 @@ def run_full_scan():
     print("🚀 [Step 1] 初始化：正在獲取台股上市櫃清單...")
     stock_dict = core.fetch_all_tw_stocks()
     tickers = list(stock_dict.keys())
-    print(f"✅ 成功獲取 {len(tickers)} 檔標的，開始執行第一階段篩選...")
+    liquidity_min_vol_lots = float(CONFIG.get("phase1_liquidity_min_vol_ma20_lots", 300))
+    print(f"✅ 成功獲取 {len(tickers)} 檔標的，開始執行第一階段篩選（流動性濾網：20日均量 > {liquidity_min_vol_lots:.0f} 張）...")
 
     div_pairs = [(CONFIG["div_recent_w"], CONFIG["div_older_w"])] if CONFIG["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
     max_older_w = max(pair[1] for pair in div_pairs)
@@ -558,16 +564,21 @@ def run_full_scan():
 
                     if df.empty or len(df) <= CONFIG["lookback_start"] + 20: continue
 
+                    # 第一階段流動性過濾：yfinance Volume 單位為股，統一除以 1000 換算為張，僅保留 20 日均量 > 300 張
+                    df['Volume_Lots'] = df['Volume'] / 1000.0
+                    df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
+                    latest_vol_ma20 = df['Vol_MA20'].iloc[-1]
+                    if pd.isna(latest_vol_ma20) or float(latest_vol_ma20) <= liquidity_min_vol_lots:
+                        continue
+
                     df = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df))
                     df = core.TechnicalIndicators.add_rsi(df)
                     expert_res_df = core.ExpertTradingStrategy.evaluate(df)
 
                     df['Pct_Change'] = df['Close'].pct_change() * 100
-                    df['Volume_Lots'] = df['Volume'] / 1000
                     df['MA5'] = df['Close'].rolling(5).mean()
                     df['MA20'] = df['Close'].rolling(20).mean()
                     df['MA60'] = df['Close'].rolling(60).mean()
-                    df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
 
                     df = core.ScanEngine.calculate_all_phase1_scores(df, CONFIG)
                     best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
@@ -663,7 +674,7 @@ def run_full_scan():
     candidate_full_tickers = {}
 
     if reversal_list:
-        print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、240MA年線深度評分與背離...")
+        print("🚀 [Step 2] 正在下載入選標的 2 年資料以運算週K、240MA年線深度評分、背離與威科夫吸籌偵測...")
         candidate_tickers = [item["_Full_Ticker"] for item in reversal_list]
         import yfinance as yf
         long_data = yf.download(candidate_tickers, period="2y", threads=False, progress=False, session=yf_session)
@@ -678,6 +689,7 @@ def run_full_scan():
                 item['均線糾結狀態'] = "-"
                 item['短天期均線差異(%)'] = "-"
                 item['短均線糾結狀態'] = "-"
+                item.update(core.WyckoffAccumulationAnalyzer.empty_result("資料不足"))
 
                 try:
                     if isinstance(long_data.columns, pd.MultiIndex):
@@ -707,6 +719,9 @@ def run_full_scan():
                             ma240_res = core.MA240PullbackRightSideStrategy.evaluate_phase2(long_df)
                             item['*回測走揚年線'] = "✅ 是" if ma240_res["is_pass"] else "❌ 否"
                             item['*年線回測分數'] = ma240_res["score"]
+
+                        wyk_res = core.WyckoffAccumulationAnalyzer.evaluate(long_df, CONFIG)
+                        item.update(wyk_res)
 
                         if CONFIG["use_weekly_filter"]:
                             wk_res = core.WeeklyAnalysisStrategy.evaluate(long_df, div_pairs, CONFIG["recent_lows_cnt"], CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"], CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"], 'Low' if CONFIG["reso_price_basis"] == "最低價 (Low)" else 'Close')
@@ -775,7 +790,7 @@ def run_full_scan():
         preview_cols = ['股票代號', '股票名稱', '演算法建議結果', '實體量是否更新至指定日期', '實體留倉量(張)', '實體量比', '實體量能判讀']
         print(res_df[[c for c in preview_cols if c in res_df.columns]].to_string())
     else:
-        # 0 檔符合條件時仍保留完整原有欄位＋8 項新增實體量欄位的空表結構
+        # 0 檔符合條件時仍保留完整原有欄位＋威科夫＋8 項新增實體量欄位的空表結構
         cols = _build_scan_output_columns(CONFIG, div_pairs)
         res_df = pd.DataFrame(columns=cols)
         print("💡 今日全市場無符合條件標的，將保留完整欄位標頭之空表結構進行報表匯出。")
