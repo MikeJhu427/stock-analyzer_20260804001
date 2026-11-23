@@ -103,12 +103,14 @@ def _calc_display_width(text) -> int:
     return sum(2 if ord(ch) > 127 else 1 for ch in s)
 
 def _format_scan_excel_sheet(writer, sheet_name: str = "Sheet1"):
-    """為全市場掃描匯出之 Excel 套用實體量數值格式與自動欄寬調整。"""
+    """為全市場掃描匯出之 Excel 套用威科夫與實體量數值格式及自動欄寬調整。"""
     try:
         ws = writer.sheets.get(sheet_name)
         if ws is None:
             return
         two_dec_cols = {
+            "威科夫TR支撐價",
+            "威科夫TR壓力價",
             "當沖張數",
             "當沖率(%)",
             "實體留倉量(張)",
@@ -134,7 +136,7 @@ def _format_scan_excel_sheet(writer, sheet_name: str = "Sheet1"):
         pass
 
 def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=None) -> list:
-    """組合 Web 端全市場掃描報表的完整欄位順序（既有欄位＋背離欄位＋8 項實體量新增欄位）。"""
+    """組合 Web 端全市場掃描報表的完整欄位順序（既有欄位＋背離欄位＋威科夫 5 項欄位＋8 項實體量新增欄位）。"""
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if config_dict.get("enable_30d_backtest", False):
         base_cols.append('近30日觸發次數')
@@ -156,6 +158,9 @@ def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=No
         div_cols.extend(extra_div)
 
     all_cols = base_cols + [c for c in div_cols if c not in base_cols]
+    for col in core.WYCKOFF_COLUMNS:
+        if col not in all_cols:
+            all_cols.append(col)
     for col in core.REAL_TURNOVER_COLUMNS:
         if col not in all_cols:
             all_cols.append(col)
@@ -662,7 +667,7 @@ elif selected_page == "📊 單檔深度解析":
 # 頁籤 3：全市場智慧掃描
 # ----------------------------------------------------
 elif selected_page == "🚀 全市場智慧掃描":
-    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的，並進行多級別背離、均線扣抵與入選標的實體波段留倉量判定。")
+    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的，並進行多級別背離、均線扣抵、威科夫吸籌偵測與入選標的實體波段留倉量判定。")
 
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         profile_names = list(st.session_state.config["profiles"].keys())
@@ -749,6 +754,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         config_dict["enable_60m_adv_scan"] = st.session_state.enable_60m_adv_scan
 
         div_pairs = [(config_dict["div_recent_w"], config_dict["div_older_w"])] if config_dict["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
+        liquidity_min_vol_lots = float(config_dict.get("phase1_liquidity_min_vol_ma20_lots", 300))
 
         dl_kwargs = {"period": "2y"}
         if config_dict["use_backtest_date"]:
@@ -781,14 +787,20 @@ elif selected_page == "🚀 全市場智慧掃描":
                             df = df[df.index.tz_localize(None).normalize() <= pd.to_datetime(config_dict["backtest_date_obj"])]
                         if df.empty or len(df) <= config_dict["lookback_start"] + 20: continue
 
+                        # 第一階段流動性過濾：yfinance Volume 單位為股，統一除以 1000 換算為張，僅保留 20 日均量 > 300 張（指定個股測試除外）
+                        force_pass = (scan_target_mode == "指定個股測試")
+                        df['Volume_Lots'] = df['Volume'] / 1000.0
+                        df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
+                        latest_vol_ma20 = df['Vol_MA20'].iloc[-1]
+                        if (not force_pass) and (pd.isna(latest_vol_ma20) or float(latest_vol_ma20) <= liquidity_min_vol_lots):
+                            continue
+
                         df = core.TechnicalIndicators.add_macd(core.TechnicalIndicators.add_kd(df))
                         df = core.TechnicalIndicators.add_rsi(df)
                         expert_res_df = core.ExpertTradingStrategy.evaluate(df)
 
                         df['Pct_Change'] = df['Close'].pct_change() * 100
-                        df['Volume_Lots'] = df['Volume'] / 1000
                         df['MA20'], df['MA60'] = df['Close'].rolling(20).mean(), df['Close'].rolling(60).mean()
-                        df['Vol_MA20'] = df['Volume_Lots'].rolling(20).mean()
                         std20 = df['Close'].rolling(20).std()
                         df['BB_Upper'], df['BB_Lower'] = df['MA20'] + 2 * std20, df['MA20'] - 2 * std20
 
@@ -803,7 +815,6 @@ elif selected_page == "🚀 全市場智慧掃描":
                             st.session_state.test_ticker_name = stock_dict.get(ticker, ticker)
 
                         best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
-                        force_pass = (scan_target_mode == "指定個股測試")
 
                         for offset in range(config_dict["lookback_end"], config_dict["lookback_start"] + 1):
                             if len(df) <= offset + 1: continue
@@ -895,7 +906,7 @@ elif selected_page == "🚀 全市場智慧掃描":
         candidate_full_tickers = {}
 
         if reversal_list:
-            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離...")
+            progress_bar.progress(0); status_text.text("正在下載初選標的長天期資料以計算深層背離與威科夫吸籌偵測...")
             long_data = yf.download([item["_Full_Ticker"] for item in reversal_list], threads=False, progress=False, session=yf_session, **dl_kwargs)
 
             for idx, item in enumerate(reversal_list):
@@ -908,6 +919,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                     item['均線糾結狀態'] = "-"
                     item['短天期均線差異(%)'] = "-"
                     item['短均線糾結狀態'] = "-"
+                    item.update(core.WyckoffAccumulationAnalyzer.empty_result("資料不足"))
 
                     try:
                         if isinstance(long_data.columns, pd.MultiIndex):
@@ -935,6 +947,9 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 ma240_res = core.MA240PullbackRightSideStrategy.evaluate_phase2(long_df)
                                 item['*回測走揚年線'] = "✅ 是" if ma240_res["is_pass"] else "❌ 否"
                                 item['*年線回測分數'] = ma240_res["score"]
+
+                            wyk_res = core.WyckoffAccumulationAnalyzer.evaluate(long_df, config_dict)
+                            item.update(wyk_res)
 
                             if config_dict["use_weekly_filter"]:
                                 wk_res = core.WeeklyAnalysisStrategy.evaluate(long_df, div_pairs, config_dict["recent_lows_cnt"], config_dict["older_lows_cnt"], config_dict["pivot_left"], config_dict["pivot_right"], config_dict["require_cross_confirm"], config_dict["reso_cross_days"], 'Low' if config_dict["reso_price_basis"] == "最低價 (Low)" else 'Close')
@@ -1002,7 +1017,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 res_df = res_df.sort_values(by=sort_keys, ascending=False).reset_index(drop=True)
             res_df.index = res_df.index + 1
         else:
-            # 0 檔符合條件時仍保留完整原有欄位＋8 項實體量新增欄位的空表結構
+            # 0 檔符合條件時仍保留完整原有欄位＋威科夫＋8 項實體量新增欄位的空表結構
             cols = _build_app_scan_columns(config_dict, div_pairs)
             res_df = pd.DataFrame(columns=cols)
 
