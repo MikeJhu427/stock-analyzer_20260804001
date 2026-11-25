@@ -30,7 +30,7 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "open_above_ma_max_pct": 2.0,
     "min_vol_mult_5ma": 1.8,
     "min_vol_lots": 1500.0,
-    "kd_low_lookback": 15,
+    "kd_low_lookback": 5,
     "kd_div_lookback": 20,
     "kd_high_zone_th": 70.0,
     "macd_prior_lookback": 25,
@@ -328,7 +328,7 @@ class MASqueezeBreakoutStrategy:
                 continue
 
             # ------------------------------------------
-            # 條件 4：雙指標低檔同步翻多共振（KD 平滑上升無頂背離 + MACD 綠柱收斂翻揚）
+            # 條件 4：雙指標低檔同步翻多共振（KD 近 5 日低點平滑上升無頂背離 + MACD 綠柱收斂翻揚）
             # ------------------------------------------
             if np.isnan(k_vals[i]) or np.isnan(d_vals[i]) or np.isnan(k_vals[i - 1]):
                 diag_arr[i] = "未過4:KD缺值"
