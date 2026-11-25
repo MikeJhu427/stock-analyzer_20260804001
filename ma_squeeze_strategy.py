@@ -20,6 +20,7 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "bbw_lookback": 60,
     "bbw_low_quantile": 0.50,
     "anti_choppy_window": 10,
+    "ma20_cross_deadband_pct": 0.5,
     "max_ma20_crosses": 2,
     "max_kd_crosses": 2,
     "min_body_pct": 3.5,
@@ -56,9 +57,12 @@ class MASqueezeBreakoutStrategy:
         return cfg
 
     @staticmethod
-    def _count_series_crosses(diff_values: np.ndarray) -> int:
-        """統計序列在零軸上下的有效穿越次數（忽略剛好等於 0 的平盤點）。"""
-        signs = np.sign(diff_values)
+    def _count_series_crosses(diff_values: np.ndarray, deadband: float = 0.0) -> int:
+        """統計序列在零軸上下的有效穿越次數（絕對值 <= deadband 視為貼線忽略）。"""
+        if deadband > 0.0:
+            signs = np.where(diff_values > deadband, 1, np.where(diff_values < -deadband, -1, 0))
+        else:
+            signs = np.sign(diff_values)
         non_zero = signs[signs != 0]
         if len(non_zero) < 2:
             return 0
@@ -150,6 +154,7 @@ class MASqueezeBreakoutStrategy:
         bbw_low_q = float(cfg["bbw_low_quantile"])
 
         chop_win = int(cfg["anti_choppy_window"])
+        ma20_deadband_pct = float(cfg["ma20_cross_deadband_pct"])
         max_ma20_crosses = int(cfg["max_ma20_crosses"])
         max_kd_crosses = int(cfg["max_kd_crosses"])
 
@@ -258,15 +263,16 @@ class MASqueezeBreakoutStrategy:
                 continue
 
             # ------------------------------------------
-            # 條件 2：排除「連續穿插」鋸齒雜訊區（檢核突破前 10 日 i-10 ~ i-1）
+            # 條件 2：排除「連續穿插」鋸齒雜訊區（檢核突破前 10 日 i-10 ~ i-1，20MA 含 ±0.5% 貼線死區）
             # ------------------------------------------
             chop_start = i - chop_win
-            ma20_diff = closes[chop_start:i] - ma20[chop_start:i]
-            if np.any(np.isnan(ma20_diff)):
+            ma20_seg = ma20[chop_start:i]
+            if np.any(np.isnan(ma20_seg)) or np.any(ma20_seg <= 0):
                 diag_arr[i] = "未過2:20MA缺值"
                 continue
 
-            ma20_crosses = MASqueezeBreakoutStrategy._count_series_crosses(ma20_diff)
+            ma20_diff_pct = (closes[chop_start:i] - ma20_seg) / ma20_seg * 100.0
+            ma20_crosses = MASqueezeBreakoutStrategy._count_series_crosses(ma20_diff_pct, deadband=ma20_deadband_pct)
             if ma20_crosses > max_ma20_crosses:
                 diag_arr[i] = f"未過2:20MA穿刺{ma20_crosses}次>{max_ma20_crosses}次"
                 continue
@@ -276,7 +282,7 @@ class MASqueezeBreakoutStrategy:
                 diag_arr[i] = "未過2:KD缺值"
                 continue
 
-            kd_crosses = MASqueezeBreakoutStrategy._count_series_crosses(kd_diff)
+            kd_crosses = MASqueezeBreakoutStrategy._count_series_crosses(kd_diff, deadband=0.0)
             if kd_crosses > max_kd_crosses:
                 diag_arr[i] = f"未過2:KD交叉{kd_crosses}次>{max_kd_crosses}次"
                 continue
