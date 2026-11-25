@@ -24,6 +24,8 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "min_body_pct": 3.5,
     "max_upper_shadow_pct": 1.5,
     "min_open_below_mas": 2,
+    "prev_close_above_ma_max_pct": 1.5,
+    "open_above_ma_max_pct": 2.0,
     "min_vol_mult_5ma": 1.8,
     "min_vol_lots": 1500.0,
     "kd_low_lookback": 15,
@@ -31,8 +33,9 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "kd_high_zone_th": 70.0,
     "macd_prior_lookback": 25,
     "macd_prior_min_hist": -0.15,
+    "macd_prior_min_pct": -0.25,
     "macd_cur_min_hist": -0.10,
-    "macd_cur_max_hist": 0.25
+    "macd_cur_max_pct": 1.50
 }
 
 
@@ -88,11 +91,11 @@ class MASqueezeBreakoutStrategy:
     @staticmethod
     def evaluate(df: Optional[pd.DataFrame], params: Optional[Dict] = None) -> pd.DataFrame:
         """
-        逐日檢核 5 項硬性條件（一票否決制），回傳與輸入 df 等長之結果 DataFrame：
+        逐日檢核硬性條件（一票否決制），回傳與輸入 df 等長之結果 DataFrame：
         - MA_Squeeze_Pass (bool)
-        - MA_Squeeze_Spread_Pct (float)
-        - MA_Squeeze_BBW_Pct (float)
-        - MA_Squeeze_Vol_Mult5 (float)
+        - MA_Squeeze_Spread_Pct (float，取突破前 5 日壓縮極差)
+        - MA_Squeeze_BBW_Pct (float，取突破前一日布林帶寬)
+        - MA_Squeeze_Vol_Mult5 (float，當日量對前一日 5 日均量倍數)
         """
         if df is None or df.empty:
             return pd.DataFrame(columns=[
@@ -108,7 +111,7 @@ class MASqueezeBreakoutStrategy:
         res["MA_Squeeze_BBW_Pct"] = np.nan
         res["MA_Squeeze_Vol_Mult5"] = np.nan
 
-        if len(df) < 65:
+        if len(df) < 66:
             return res
 
         required_cols = ["Open", "High", "Low", "Close", "Volume"]
@@ -148,6 +151,8 @@ class MASqueezeBreakoutStrategy:
         min_body_pct = float(cfg["min_body_pct"])
         max_upper_shadow_pct = float(cfg["max_upper_shadow_pct"])
         min_open_below = int(cfg["min_open_below_mas"])
+        prev_c_above_pct = float(cfg["prev_close_above_ma_max_pct"])
+        open_above_pct = float(cfg["open_above_ma_max_pct"])
         min_vol_mult_5ma = float(cfg["min_vol_mult_5ma"])
         min_vol_lots = float(cfg["min_vol_lots"])
 
@@ -157,119 +162,133 @@ class MASqueezeBreakoutStrategy:
 
         macd_prior_lb = int(cfg["macd_prior_lookback"])
         macd_prior_min = float(cfg["macd_prior_min_hist"])
+        macd_prior_min_pct = float(cfg["macd_prior_min_pct"])
         macd_cur_min = float(cfg["macd_cur_min_hist"])
-        macd_cur_max = float(cfg["macd_cur_max_hist"])
+        macd_cur_max_pct = float(cfg["macd_cur_max_pct"])
 
         pass_arr = np.zeros(len(work), dtype=bool)
         spread_arr = np.full(len(work), np.nan, dtype=float)
         bbw_arr = np.full(len(work), np.nan, dtype=float)
         vol_mult_arr = np.full(len(work), np.nan, dtype=float)
 
-        start_idx = max(60, chop_win, macd_prior_lb, kd_div_lb)
+        start_idx = max(60 + sq_win, chop_win + 1, macd_prior_lb + 1, kd_div_lb + 1)
 
         for i in range(start_idx, len(work)):
             o_i = opens[i]
             h_i = highs[i]
             c_i = closes[i]
             v_i = vols[i]
-            v_ma5_i = vol_ma5[i]
+            prev_c = closes[i - 1]
+            v_ma5_prev = vol_ma5[i - 1]
 
-            if any(np.isnan([o_i, h_i, c_i, v_i, v_ma5_i])) or o_i <= 0 or c_i <= 0 or v_ma5_i <= 0:
+            if any(np.isnan([o_i, h_i, c_i, v_i, prev_c, v_ma5_prev])) or o_i <= 0 or c_i <= 0 or prev_c <= 0 or v_ma5_prev <= 0:
                 continue
 
-            # 判斷當日與過去 5 日是否具備完整 120MA；充足則納入 5 條均線，否則使用 4 條均線
-            use_ma120 = not np.any(np.isnan(ma120[i - sq_win + 1:i + 1]))
+            # 突破前 5 個交易日（i-5 ~ i-1）檢核均線是否具備完整 120MA
+            pre_start = i - sq_win
+            use_ma120 = (not np.any(np.isnan(ma120[pre_start:i + 1])))
             if use_ma120:
-                ma_matrix = np.vstack([
-                    ma5[i - sq_win + 1:i + 1],
-                    ma10[i - sq_win + 1:i + 1],
-                    ma20[i - sq_win + 1:i + 1],
-                    ma60[i - sq_win + 1:i + 1],
-                    ma120[i - sq_win + 1:i + 1]
+                ma_matrix_pre = np.vstack([
+                    ma5[pre_start:i],
+                    ma10[pre_start:i],
+                    ma20[pre_start:i],
+                    ma60[pre_start:i],
+                    ma120[pre_start:i]
                 ])
+                prev_mas = np.array([ma5[i - 1], ma10[i - 1], ma20[i - 1], ma60[i - 1], ma120[i - 1]], dtype=float)
                 cur_mas = np.array([ma5[i], ma10[i], ma20[i], ma60[i], ma120[i]], dtype=float)
             else:
-                ma_matrix = np.vstack([
-                    ma5[i - sq_win + 1:i + 1],
-                    ma10[i - sq_win + 1:i + 1],
-                    ma20[i - sq_win + 1:i + 1],
-                    ma60[i - sq_win + 1:i + 1]
+                ma_matrix_pre = np.vstack([
+                    ma5[pre_start:i],
+                    ma10[pre_start:i],
+                    ma20[pre_start:i],
+                    ma60[pre_start:i]
                 ])
+                prev_mas = np.array([ma5[i - 1], ma10[i - 1], ma20[i - 1], ma60[i - 1]], dtype=float)
                 cur_mas = np.array([ma5[i], ma10[i], ma20[i], ma60[i]], dtype=float)
 
-            if np.any(np.isnan(ma_matrix)) or np.any(ma_matrix <= 0):
+            if np.any(np.isnan(ma_matrix_pre)) or np.any(ma_matrix_pre <= 0) or np.any(np.isnan(cur_mas)):
                 continue
 
-            # 計算各項即時紀錄值（供報表呈現）
-            ma_min_5d = np.min(ma_matrix, axis=0)
-            ma_max_5d = np.max(ma_matrix, axis=0)
+            # 紀錄突破前壓縮數值與當日量比（供報表呈現）
+            ma_min_5d = np.min(ma_matrix_pre, axis=0)
+            ma_max_5d = np.max(ma_matrix_pre, axis=0)
             spread_5d_pct = (ma_max_5d - ma_min_5d) / ma_min_5d * 100.0
             max_spread_5d = float(np.max(spread_5d_pct))
-            cur_bbw = float(bbw[i]) if not np.isnan(bbw[i]) else np.nan
-            cur_vol_mult = float(v_i / v_ma5_i)
+            pre_bbw = float(bbw[i - 1]) if not np.isnan(bbw[i - 1]) else np.nan
+            cur_vol_mult = float(v_i / v_ma5_prev)
 
             spread_arr[i] = round(max_spread_5d, 2)
-            bbw_arr[i] = round(cur_bbw, 2) if not np.isnan(cur_bbw) else np.nan
+            bbw_arr[i] = round(pre_bbw, 2) if not np.isnan(pre_bbw) else np.nan
             vol_mult_arr[i] = round(cur_vol_mult, 2)
 
             # ------------------------------------------
-            # 條件 1：均線高度壓縮糾結 + 布林帶寬近 60 日低檔壓縮 (< 12%)
+            # 條件 1：均線高度壓縮糾結 + 布林帶寬近 60 日低檔壓縮（皆檢核突破前一日 i-1）
             # ------------------------------------------
             if max_spread_5d > max_spread_pct:
                 continue
 
-            if np.isnan(cur_bbw) or cur_bbw >= bbw_max_pct:
+            if np.isnan(pre_bbw) or pre_bbw >= bbw_max_pct:
                 continue
 
-            bbw_hist_start = max(0, i - bbw_lookback + 1)
-            bbw_hist = bbw[bbw_hist_start:i + 1]
+            bbw_hist_start = max(0, i - bbw_lookback)
+            bbw_hist = bbw[bbw_hist_start:i]
             bbw_hist = bbw_hist[~np.isnan(bbw_hist)]
             if len(bbw_hist) < 20:
                 continue
-            if cur_bbw > float(np.quantile(bbw_hist, bbw_low_q)):
+            if pre_bbw > float(np.quantile(bbw_hist, bbw_low_q)):
                 continue
 
             # ------------------------------------------
-            # 條件 2：排除「連續穿插」鋸齒雜訊區
+            # 條件 2：排除「連續穿插」鋸齒雜訊區（檢核突破前 10 日 i-10 ~ i-1）
             # ------------------------------------------
-            chop_start = i - chop_win + 1
-            ma20_diff = closes[chop_start:i + 1] - ma20[chop_start:i + 1]
+            chop_start = i - chop_win
+            ma20_diff = closes[chop_start:i] - ma20[chop_start:i]
             if np.any(np.isnan(ma20_diff)):
                 continue
             if MASqueezeBreakoutStrategy._count_series_crosses(ma20_diff) > max_ma20_crosses:
                 continue
 
-            kd_diff = k_vals[chop_start:i + 1] - d_vals[chop_start:i + 1]
+            kd_diff = k_vals[chop_start:i] - d_vals[chop_start:i]
             if np.any(np.isnan(kd_diff)):
                 continue
             if MASqueezeBreakoutStrategy._count_series_crosses(kd_diff) > max_kd_crosses:
                 continue
 
             # ------------------------------------------
-            # 條件 3：一陽穿多線實心長紅突破 + 量能與流動性
+            # 條件 3：一陽穿多線實心長紅突破（支援原定義與貼線點火）+ 量能與流動性
             # ------------------------------------------
             body_pct = (c_i - o_i) / o_i * 100.0
             upper_shadow_pct = (h_i - c_i) / c_i * 100.0
             if body_pct < min_body_pct or upper_shadow_pct > max_upper_shadow_pct:
                 continue
 
-            open_below_cnt = int(np.sum(o_i < cur_mas))
             close_above_all = bool(np.all(c_i > cur_mas))
-            if open_below_cnt < min_open_below or not close_above_all:
+            if not close_above_all:
+                continue
+
+            open_below_cnt = int(np.sum(o_i < cur_mas))
+            prev_ma_max = float(np.max(prev_mas))
+            cur_ma_max = float(np.max(cur_mas))
+            cond_classic_pierce = open_below_cnt >= min_open_below
+            cond_tight_ignition = (
+                prev_c <= prev_ma_max * (1.0 + prev_c_above_pct / 100.0)
+                and o_i <= cur_ma_max * (1.0 + open_above_pct / 100.0)
+            )
+            if not (cond_classic_pierce or cond_tight_ignition):
                 continue
 
             if cur_vol_mult <= min_vol_mult_5ma or v_i <= min_vol_lots:
                 continue
 
             # ------------------------------------------
-            # 條件 4：雙指標低檔同步翻多共振（KD 平滑上升無頂背離 + MACD 綠柱收斂或剛翻紅）
+            # 條件 4：雙指標低檔同步翻多共振（KD 平滑上升無頂背離 + MACD 綠柱收斂翻揚）
             # ------------------------------------------
             if np.isnan(k_vals[i]) or np.isnan(d_vals[i]) or np.isnan(k_vals[i - 1]):
                 continue
             if not (k_vals[i] > d_vals[i] and k_vals[i] >= k_vals[i - 1]):
                 continue
 
-            # KD 前波低點至今呈平滑上升弧度
             kd_seg = k_vals[max(0, i - kd_low_lb + 1):i + 1]
             if np.any(np.isnan(kd_seg)) or len(kd_seg) < 5:
                 continue
@@ -282,7 +301,6 @@ class MASqueezeBreakoutStrategy:
                 if down_steps > 1:
                     continue
 
-            # 檢查 KD 無高檔頂背離（價格創高但 K 值未創高且前高處於高檔區）
             div_start = max(0, i - kd_div_lb + 1)
             mid_pt = div_start + (i - div_start + 1) // 2
             older_p_max = float(np.max(highs[div_start:mid_pt]))
@@ -292,15 +310,23 @@ class MASqueezeBreakoutStrategy:
             if older_k_max >= kd_high_th and recent_p_max > older_p_max and recent_k_max < older_k_max:
                 continue
 
-            # MACD 前波明顯綠柱修正 (< -0.15) 且當日收斂接近零軸 (>= -0.10) 或剛翻紅 (<= 0.25)
+            # MACD 前波曾有明顯綠柱修正（絕對值 < -0.15 或相對股價 < -0.25%），
+            # 且突破當日柱體翻揚收斂（>= -0.10 且相對股價 <= +1.50%，避免高價股/漲停誤殺）
             cur_hist = macd_hist[i]
             prev_hist = macd_hist[i - 1]
             prior_hists = macd_hist[max(0, i - macd_prior_lb):i]
+            prior_closes = closes[max(0, i - macd_prior_lb):i]
             if np.isnan(cur_hist) or np.isnan(prev_hist) or np.all(np.isnan(prior_hists)):
                 continue
-            if float(np.nanmin(prior_hists)) >= macd_prior_min:
+
+            prior_min_hist = float(np.nanmin(prior_hists))
+            prior_hist_pct = prior_hists / (prior_closes + 1e-8) * 100.0
+            prior_min_pct = float(np.nanmin(prior_hist_pct))
+            if not (prior_min_hist < macd_prior_min or prior_min_pct < macd_prior_min_pct):
                 continue
-            if not (macd_cur_min <= cur_hist <= macd_cur_max):
+
+            cur_hist_pct = float(cur_hist / c_i * 100.0)
+            if cur_hist < macd_cur_min or cur_hist_pct > macd_cur_max_pct:
                 continue
             if cur_hist <= prev_hist:
                 continue
