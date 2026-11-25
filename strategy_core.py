@@ -90,29 +90,6 @@ DEFAULT_CONFIG = {
         "reset_body_atr_mult": 1.0,
         "reset_consec_days": 3,
         "enable_inst_filter": False
-    },
-    "ma_squeeze_breakout_params": {
-        "squeeze_lookback_days": 5,
-        "ma_max_spread_ratio": 0.06,
-        "bb_window": 20,
-        "bbw_max_ratio": 0.12,
-        "bbw_low_lookback": 60,
-        "bbw_low_quantile": 0.50,
-        "choppy_lookback_days": 10,
-        "max_ma20_crosses": 2,
-        "max_kd_crosses": 2,
-        "min_body_pct": 0.035,
-        "max_upper_shadow_pct": 0.015,
-        "min_open_below_mas": 2,
-        "min_vol_ma5_mult": 1.8,
-        "min_vol_lots": 1500.0,
-        "kd_wave_lookback": 20,
-        "top_div_lookback": 30,
-        "top_div_k_threshold": 70.0,
-        "macd_wave_lookback": 30,
-        "macd_prior_green_min": -0.15,
-        "macd_today_min": -0.10,
-        "macd_today_max": 0.25
     }
 }
 
@@ -4184,4 +4161,14 @@ class WyckoffAccumulationAnalyzer:
                         support = np.nan
                         resistance = np.nan
                         last_event = "SC"
-                        last_event_date = cur_dt
+                        last_event_date = cur_dt_str
+
+            return {
+                "威科夫狀態": state,
+                "威科夫TR支撐價": round(float(support), 2) if pd.notna(support) else np.nan,
+                "威科夫TR壓力價": round(float(resistance), 2) if pd.notna(resistance) else np.nan,
+                "威科夫最近事件": last_event,
+                "威科夫事件日期": last_event_date
+            }
+        except Exception:
+            return WyckoffAccumulationAnalyzer.empty_result("計算異常")
