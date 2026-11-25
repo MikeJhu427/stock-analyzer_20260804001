@@ -5,7 +5,7 @@ import warnings
 import datetime
 import time
 import re
-import importlib 
+import importlib
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -15,8 +15,10 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import streamlit as st
 import strategy_core as core
+import ma_squeeze_strategy as msq
 
 importlib.reload(core)
+importlib.reload(msq)
 warnings.filterwarnings("ignore")
 
 OUTPUT_COLUMN_CONFIG = {
@@ -103,12 +105,15 @@ def _calc_display_width(text) -> int:
     return sum(2 if ord(ch) > 127 else 1 for ch in s)
 
 def _format_scan_excel_sheet(writer, sheet_name: str = "Sheet1"):
-    """為全市場掃描匯出之 Excel 套用威科夫與實體量數值格式及自動欄寬調整。"""
+    """為全市場掃描匯出之 Excel 套用威科夫、實體量與均線壓縮突破數值格式及自動欄寬調整。"""
     try:
         ws = writer.sheets.get(sheet_name)
         if ws is None:
             return
         two_dec_cols = {
+            "均線壓縮極差(%)",
+            "壓縮布林帶寬(%)",
+            "突破量比(5MA)",
             "威科夫TR支撐價",
             "威科夫TR壓力價",
             "當沖張數",
@@ -136,7 +141,7 @@ def _format_scan_excel_sheet(writer, sheet_name: str = "Sheet1"):
         pass
 
 def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=None) -> list:
-    """組合 Web 端全市場掃描報表的完整欄位順序（既有欄位＋背離欄位＋威科夫 5 項欄位＋8 項實體量新增欄位）。"""
+    """組合 Web 端全市場掃描報表的完整欄位順序（既有欄位＋獨立均線壓縮欄位＋背離欄位＋威科夫 5 項欄位＋8 項實體量新增欄位）。"""
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if config_dict.get("enable_30d_backtest", False):
         base_cols.append('近30日觸發次數')
@@ -144,6 +149,9 @@ def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=No
         '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
     ])
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
+    for col in msq.MA_SQUEEZE_COLUMNS:
+        if col not in base_cols:
+            base_cols.append(col)
     base_cols.extend([
         '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
         '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', 'KD金叉判定', 'MACD金叉判定', '當日收盤', '月均量(張)'
@@ -284,7 +292,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
     else:
         st.caption(f"資料更新時間：{vol_res['eval_time']} ｜ 時間戳標準：台北時間 (UTC+8) ｜ 資料來源：Yahoo Finance")
 
-        # 體制與交易訊號燈號看板
         sev = vol_res.get("severity", "info")
         banner_md = (
             f"### {vol_res['regime']} ── {vol_res['state_label']}\n\n"
@@ -300,7 +307,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
         else:
             st.info(banner_md)
 
-        # 關鍵觸發提醒區塊（含狀態 C HV20/ATR14% 觸發提醒、VVIX、恐慌高點下移背離、科技股高危）
         if vol_res.get("alert_reminders"):
             for rem in vol_res["alert_reminders"]:
                 if "🚨" in rem:
@@ -313,7 +319,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
         st.markdown("---")
         snap = vol_res["snapshot"]
 
-        # 核心指標卡片
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(
             "^VIX (美股大盤恐慌)",
@@ -372,9 +377,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
         metrics_df = pd.DataFrame(vol_res["metrics_table"])
         st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
-    # ------------------------------------------------
-    # 外資實質資金流向（匯率＋現貨買賣超連動）監控區塊
-    # ------------------------------------------------
     st.markdown("---")
     st.subheader("💱 外資資金流向監控（匯率＋現貨買賣超連動）")
     try:
@@ -456,7 +458,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
             gridspec_kw={"height_ratios": [1.3, 1.4, 1.1, 1.2]}
         )
 
-        # Panel 1: ^TWII & MAs
         if not twii_h.empty:
             ax1.plot(twii_h.index, twii_h["Close"], label="TWII Close", color="#1f77b4", linewidth=1.8)
             ax1.plot(twii_h.index, twii_h["MA5"], label="5MA", color="purple", linestyle=":", linewidth=1.2)
@@ -467,7 +468,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
             ax1.grid(True, linestyle="--", alpha=0.45)
             ax1.legend(loc="upper left", ncol=4, fontsize=9)
 
-        # Panel 2: ^VIX & ^VXN vs 5MA & 20D BB Upper
         if not vix_h.empty:
             ax2.plot(vix_h.index, vix_h["Close"], label="VIX", color="#d62728", linewidth=1.8)
             ax2.plot(vix_h.index, vix_h["MA5"], label="VIX 5MA", color="#d62728", linestyle=":", alpha=0.8, linewidth=1.2)
@@ -483,7 +483,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
         ax2.grid(True, linestyle="--", alpha=0.45)
         ax2.legend(loc="upper left", ncol=4, fontsize=8)
 
-        # Panel 3: ^VVIX & Tech Spread (VXN - VIX)
         if not vvix_h.empty:
             ax3.plot(vvix_h.index, vvix_h["Close"], label="VVIX", color="#9467bd", linewidth=1.8)
             ax3.plot(vvix_h.index, vvix_h["MA20"], label="VVIX 20MA", color="#c5b0d5", linestyle="--", linewidth=1.4)
@@ -498,7 +497,6 @@ if selected_page == "🛡️ 跨市場波動率監控":
         ax3.set_title("Tail Risk (^VVIX) & Tech Risk Premium (VXN - VIX)", fontsize=12, fontweight="bold")
         ax3.grid(True, linestyle="--", alpha=0.45)
 
-        # Panel 4: ^TWII Local Volatility (HV20 & ATR14%)
         if not twii_h.empty:
             ax4.plot(twii_h.index, twii_h["HV20"], label="TWII HV20 (%)", color="#2ca02c", linewidth=1.8)
             ax4.plot(twii_h.index, twii_h["HV20_MA20"], label="HV20 20MA", color="#2ca02c", linestyle="--", alpha=0.8, linewidth=1.3)
@@ -667,7 +665,7 @@ elif selected_page == "📊 單檔深度解析":
 # 頁籤 3：全市場智慧掃描
 # ----------------------------------------------------
 elif selected_page == "🚀 全市場智慧掃描":
-    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的，並進行多級別背離、均線扣抵、威科夫吸籌偵測與入選標的實體波段留倉量判定。")
+    st.write("系統將自動抓取全部普通股，尋找符合「低檔翻轉」、「VCP收斂」、「雙指標共振」或「回測走揚年線」等標的（並獨立並行「均線壓縮一陽穿多線」策略），並進行多級別背離、均線扣抵、威科夫吸籌偵測與入選標的實體波段留倉量判定。")
 
     with st.expander("⚙️ 掃描與背離參數設定", expanded=True):
         profile_names = list(st.session_state.config["profiles"].keys())
@@ -810,11 +808,19 @@ elif selected_page == "🚀 全市場智慧掃描":
                         df['MACD_Cross_Recent'] = df['MACD_Cross'].rolling(window=config_dict["reso_cross_days"], min_periods=1).max() >= 1
 
                         df = core.ScanEngine.calculate_all_phase1_scores(df, config_dict)
+
+                        # 獨立並行策略：均線極致壓縮後一陽穿多線（不與既有 8 大策略混算）
+                        sq_res_df = msq.MASqueezeBreakoutStrategy.evaluate(df)
+                        for sq_col in sq_res_df.columns:
+                            df[sq_col] = sq_res_df[sq_col]
+
                         if scan_target_mode == "指定個股測試":
                             st.session_state.test_stock_df = pd.concat([df, expert_res_df], axis=1)
                             st.session_state.test_ticker_name = stock_dict.get(ticker, ticker)
 
                         best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
+                        pass_ma_squeeze = False
+                        sq_best_row, sq_best_offset, sq_best_vol_mult = None, 0, 0.0
 
                         for offset in range(config_dict["lookback_end"], config_dict["lookback_start"] + 1):
                             if len(df) <= offset + 1: continue
@@ -826,6 +832,11 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 is_pass, combo = core.ScanEngine.check_algo_pass(t_row, config_dict, algo_mode, force_pass)
                                 if is_pass and (combo > best_combined_score or best_row is None):
                                     best_combined_score, best_row, best_offset, best_vol_mult = combo, t_row, offset, vol_mult
+
+                            if bool(t_row.get('MA_Squeeze_Pass', False)):
+                                pass_ma_squeeze = True
+                                if sq_best_row is None:
+                                    sq_best_row, sq_best_offset, sq_best_vol_mult = t_row, offset, vol_mult
 
                         pass_60m_adv = False
                         adv_60m_data = None
@@ -857,21 +868,25 @@ elif selected_page == "🚀 全市場智慧掃描":
                                             pass_60m_adv = True
                                             adv_60m_data = triggered_rows.iloc[-1]
 
-                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or force_pass:
+                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or pass_ma_squeeze or force_pass:
                             if best_row is None:
-                                best_row = df.iloc[-1]
-                                best_offset = 0
-                                prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
-                                best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
+                                if pass_ma_squeeze and sq_best_row is not None:
+                                    best_row, best_offset, best_vol_mult = sq_best_row, sq_best_offset, sq_best_vol_mult
+                                else:
+                                    best_row = df.iloc[-1]
+                                    best_offset = 0
+                                    prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
+                                    best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
 
                             count_30d = 0
                             if config_dict["enable_30d_backtest"]:
                                 for b_offset in range(best_offset + 1, min(len(df)-1, best_offset + 31)):
                                     c_row = df.iloc[-1 - b_offset]
+                                    c_pass = False
                                     if c_row.get('Vol_MA20', 0) >= config_dict["min_vol_ma20"]:
                                         c_pass, _ = core.ScanEngine.check_algo_pass(c_row, config_dict, algo_mode, False)
-                                        if c_pass:
-                                            count_30d += 1
+                                    if c_pass or bool(c_row.get('MA_Squeeze_Pass', False)):
+                                        count_30d += 1
 
                             last_expert = expert_res_df.iloc[-1 - best_offset]
                             rec_status = "✅ 建議參考" if float(best_row['K']) < config_dict.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
@@ -895,6 +910,8 @@ elif selected_page == "🚀 全市場智慧掃描":
                             
                             dynamic_metrics = core.ScanEngine.get_all_metrics(best_row, adv_src)
                             base_info.update(dynamic_metrics)
+                            sq_src = sq_best_row if (pass_ma_squeeze and sq_best_row is not None) else best_row
+                            base_info.update(msq.MASqueezeBreakoutStrategy.get_metrics(sq_src))
                             
                             reversal_candidates[ticker] = base_info
                     except Exception: pass
@@ -972,13 +989,14 @@ elif selected_page == "🚀 全市場智慧掃描":
                             if res_tags: has_daily_div = True
 
                     base_tags = core.ScanEngine.generate_base_tags(item, config_dict)
+                    base_tags.extend(msq.MASqueezeBreakoutStrategy.get_tags(item))
                     div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
                     
                     if pass_60m_adv and adv_60m_data is not None:
                         sig_name = "【🔥 60分K底倉突破】" if adv_60m_data.get('Adv_Signal_A') else "【🔥 60分K右肩回測】"
                         base_tags.insert(0, sig_name)
 
-                    item["演算法建議結果"] = " & ".join(base_tags) + div_tag
+                    item["演算法建議結果"] = " & ".join(base_tags) + div_tag if base_tags else "觀察標的" + div_tag
                     candidate_daily_dfs[ticker] = daily_df
                     candidate_full_tickers[item["股票代號"]] = ticker
                     final_results.append(item)
@@ -1017,7 +1035,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                 res_df = res_df.sort_values(by=sort_keys, ascending=False).reset_index(drop=True)
             res_df.index = res_df.index + 1
         else:
-            # 0 檔符合條件時仍保留完整原有欄位＋威科夫＋8 項實體量新增欄位的空表結構
+            # 0 檔符合條件時仍保留完整原有欄位＋均線壓縮＋威科夫＋8 項實體量新增欄位的空表結構
             cols = _build_app_scan_columns(config_dict, div_pairs)
             res_df = pd.DataFrame(columns=cols)
 
