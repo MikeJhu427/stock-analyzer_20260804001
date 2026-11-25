@@ -15,7 +15,7 @@ MA_SQUEEZE_COLUMNS = [
 
 MA_SQUEEZE_DEFAULT_PARAMS = {
     "ma_squeeze_window": 5,
-    "ma_max_spread_pct": 6.0,
+    "ma_max_spread_pct": 7.0,
     "bbw_max_pct": 12.0,
     "bbw_lookback": 60,
     "bbw_low_quantile": 0.50,
