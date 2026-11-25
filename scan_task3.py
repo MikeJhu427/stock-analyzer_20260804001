@@ -7,6 +7,7 @@ from copy import copy
 import numpy as np
 import pandas as pd
 import strategy_core as core
+import ma_squeeze_strategy as msq
 
 CONFIG = core.DEFAULT_CONFIG.copy()
 MAIN_SCAN_SHEET_NAME = "全市場掃描結果"
@@ -107,7 +108,7 @@ def _merge_foreign_flow_history(flow_res: dict) -> pd.DataFrame:
 
 
 def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None) -> list:
-    """組合主掃描報表的完整欄位順序（既有欄位＋背離欄位＋威科夫 5 項欄位＋8 項實體量新增欄位），確保 0 檔空表結構一致。"""
+    """組合主掃描報表的完整欄位順序（既有欄位＋獨立均線壓縮欄位＋背離欄位＋威科夫 5 項欄位＋8 項實體量新增欄位），確保 0 檔空表結構一致。"""
     base_cols = ['股票代號', '股票名稱', '觸發日期']
     if config.get("enable_30d_backtest", False):
         base_cols.append('近30日觸發次數')
@@ -115,6 +116,9 @@ def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None
         '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
     ])
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
+    for col in msq.MA_SQUEEZE_COLUMNS:
+        if col not in base_cols:
+            base_cols.append(col)
     base_cols.extend([
         '今日漲跌幅(%)', '當日成交量(張)', '量增倍數',
         '當日KD(K值)', '進場位置建議', '建議水位', '多週期KD', '盤整過濾', 'DIF', '當日收盤', '月均量(張)'
@@ -146,13 +150,16 @@ def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None
 
 
 def _format_main_scan_sheet(writer, sheet_name: str = MAIN_SCAN_SHEET_NAME):
-    """為「全市場掃描結果」工作表套用威科夫與實體量數值格式及自動欄寬調整。"""
+    """為「全市場掃描結果」工作表套用威科夫、實體量與均線壓縮突破數值格式及自動欄寬調整。"""
     try:
         ws = writer.sheets.get(sheet_name)
         if ws is None:
             return
 
         two_dec_cols = {
+            "均線壓縮極差(%)",
+            "壓縮布林帶寬(%)",
+            "突破量比(5MA)",
             "威科夫TR支撐價",
             "威科夫TR壓力價",
             "當沖張數",
@@ -525,7 +532,7 @@ def run_full_scan():
     stock_dict = core.fetch_all_tw_stocks()
     tickers = list(stock_dict.keys())
     liquidity_min_vol_lots = float(CONFIG.get("phase1_liquidity_min_vol_ma20_lots", 300))
-    print(f"✅ 成功獲取 {len(tickers)} 檔標的，開始執行第一階段篩選（流動性濾網：20日均量 > {liquidity_min_vol_lots:.0f} 張）...")
+    print(f"✅ 成功獲取 {len(tickers)} 檔標的，開始執行第一階段篩選（流動性濾網：20日均量 > {liquidity_min_vol_lots:.0f} 張，含獨立均線壓縮一陽穿多線並行）...")
 
     div_pairs = [(CONFIG["div_recent_w"], CONFIG["div_older_w"])] if CONFIG["use_single_div"] else [(5, 20), (5, 60), (20, 60)]
     max_older_w = max(pair[1] for pair in div_pairs)
@@ -581,7 +588,15 @@ def run_full_scan():
                     df['MA60'] = df['Close'].rolling(60).mean()
 
                     df = core.ScanEngine.calculate_all_phase1_scores(df, CONFIG)
+
+                    # 獨立並行策略：均線極致壓縮後一陽穿多線（不與既有 8 大策略混算）
+                    sq_res_df = msq.MASqueezeBreakoutStrategy.evaluate(df)
+                    for sq_col in sq_res_df.columns:
+                        df[sq_col] = sq_res_df[sq_col]
+
                     best_combined_score, best_row, best_offset, best_vol_mult = -1, None, 0, 0.0
+                    pass_ma_squeeze = False
+                    sq_best_row, sq_best_offset, sq_best_vol_mult = None, 0, 0.0
 
                     for offset in range(CONFIG["lookback_end"], CONFIG["lookback_start"] + 1):
                         if len(df) <= offset + 1: continue
@@ -593,6 +608,11 @@ def run_full_scan():
                             is_pass, combo_score = core.ScanEngine.check_algo_pass(t_row, CONFIG, CONFIG['algo_mode'])
                             if is_pass and (combo_score > best_combined_score or best_row is None):
                                 best_combined_score, best_row, best_offset, best_vol_mult = combo_score, t_row, offset, vol_mult
+
+                        if bool(t_row.get('MA_Squeeze_Pass', False)):
+                            pass_ma_squeeze = True
+                            if sq_best_row is None:
+                                sq_best_row, sq_best_offset, sq_best_vol_mult = t_row, offset, vol_mult
 
                     pass_60m_adv = False
                     adv_60m_data = None
@@ -619,21 +639,26 @@ def run_full_scan():
                                         pass_60m_adv = True
                                         adv_60m_data = triggered_rows.iloc[-1]
 
-                    if (best_row is not None and best_combined_score >= 0) or pass_60m_adv:
+                    if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or pass_ma_squeeze:
                         if best_row is None:
-                            best_row = df.iloc[-1]
-                            best_offset = 0
-                            prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
-                            best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
+                            if pass_ma_squeeze and sq_best_row is not None:
+                                best_row, best_offset, best_vol_mult = sq_best_row, sq_best_offset, sq_best_vol_mult
+                            else:
+                                best_row = df.iloc[-1]
+                                best_offset = 0
+                                prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
+                                best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
 
                         count_30d = 0
                         if CONFIG["enable_30d_backtest"]:
                             for b_offset in range(best_offset + 1, min(len(df)-1, best_offset + 31)):
                                 c_row = df.iloc[-1 - b_offset]
                                 if pd.isna(c_row.get('Vol_MA20')): continue
+                                c_pass = False
                                 if c_row['Vol_MA20'] >= CONFIG["min_vol_ma20"]:
                                     c_pass, _ = core.ScanEngine.check_algo_pass(c_row, CONFIG, CONFIG['algo_mode'])
-                                    if c_pass: count_30d += 1
+                                if c_pass or bool(c_row.get('MA_Squeeze_Pass', False)):
+                                    count_30d += 1
 
                         last_expert = expert_res_df.iloc[-1 - best_offset]
                         rec_status = "✅ 建議參考" if float(best_row['K']) < CONFIG.get("cross_position_threshold", 70) else "⚠️ 位置偏高"
@@ -660,6 +685,8 @@ def run_full_scan():
                         
                         dynamic_metrics = core.ScanEngine.get_all_metrics(best_row, adv_src)
                         base_info.update(dynamic_metrics)
+                        sq_src = sq_best_row if (pass_ma_squeeze and sq_best_row is not None) else best_row
+                        base_info.update(msq.MASqueezeBreakoutStrategy.get_metrics(sq_src))
                         
                         reversal_candidates[ticker] = base_info
                 except Exception: continue
@@ -744,6 +771,7 @@ def run_full_scan():
                         if res_tags: has_daily_div = True
 
                 base_tags = core.ScanEngine.generate_base_tags(item, CONFIG)
+                base_tags.extend(msq.MASqueezeBreakoutStrategy.get_tags(item))
                 div_tag = " + 雙級別共振" if (has_daily_div and pass_60m_adv) else (" + 日K背離" if has_daily_div else (" + 60分K背離" if pass_60m_adv else " (無背離)"))
                 
                 if pass_60m_adv and adv_60m_data is not None:
@@ -787,10 +815,10 @@ def run_full_scan():
         res_df.index = res_df.index + 1
 
         print("📊 掃描完成！最終報表標的預覽：")
-        preview_cols = ['股票代號', '股票名稱', '演算法建議結果', '實體量是否更新至指定日期', '實體留倉量(張)', '實體量比', '實體量能判讀']
+        preview_cols = ['股票代號', '股票名稱', '演算法建議結果', '均線壓縮一陽穿多線', '實體量是否更新至指定日期', '實體留倉量(張)', '實體量比', '實體量能判讀']
         print(res_df[[c for c in preview_cols if c in res_df.columns]].to_string())
     else:
-        # 0 檔符合條件時仍保留完整原有欄位＋威科夫＋8 項新增實體量欄位的空表結構
+        # 0 檔符合條件時仍保留完整原有欄位＋均線壓縮＋威科夫＋8 項新增實體量欄位的空表結構
         cols = _build_scan_output_columns(CONFIG, div_pairs)
         res_df = pd.DataFrame(columns=cols)
         print("💡 今日全市場無符合條件標的，將保留完整欄位標頭之空表結構進行報表匯出。")
