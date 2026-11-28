@@ -6,7 +6,7 @@ import strategy_core as core
 MA_SQUEEZE_TAG = "均線壓縮一陽穿多線"
 MA_SQUEEZE_LOOKBACK_COL = "均線壓縮一陽穿多線回測滿足次數"
 MA_SQUEEZE_IGNITION_STRENGTH_COL = "飆股點火強度(當日)"
-MA_SQUEEZE_IGNITION_LOOKBACK_COL = "均線壓縮飆股點火5日回測次數"
+MA_SQUEEZE_IGNITION_LOOKBACK_COL = "均線壓縮飆股點火30日回測次數"
 MA_SQUEEZE_LEAD_COLUMNS = [
     MA_SQUEEZE_LOOKBACK_COL,
     MA_SQUEEZE_IGNITION_STRENGTH_COL,
@@ -487,12 +487,12 @@ class MASqueezeBreakoutStrategy:
     def count_lookback_passes(
         df: Optional[pd.DataFrame],
         base_offset: int = 0,
-        lookback_days: int = 5
+        lookback_days: int = 30
     ) -> int:
         """
         統計基準日（不含基準日當天）往前 lookback_days 個交易日內，
         符合「均線壓縮一陽穿多線」(MA_Squeeze_Pass == True) 的總次數。
-        例如 base_offset=0、lookback_days=5 時，檢查 iloc[-6:-1]（前 1~5 個交易日）。
+        例如 base_offset=0、lookback_days=30 時，檢查 iloc[-31:-1]（前 1~30 個交易日）。
         """
         if df is None or df.empty or "MA_Squeeze_Pass" not in df.columns:
             return 0
@@ -508,7 +508,7 @@ class MASqueezeBreakoutStrategy:
     def count_ignition_lookback_passes(
         df: Optional[pd.DataFrame],
         base_offset: int = 0,
-        lookback_days: int = 5
+        lookback_days: int = 30
     ) -> int:
         """
         統計基準日（不含基準日當天）往前 lookback_days 個交易日內，
@@ -529,7 +529,7 @@ class MASqueezeBreakoutStrategy:
         df: Optional[pd.DataFrame],
         row,
         base_offset: int = 0,
-        lookback_days: int = 5
+        lookback_days: int = 30
     ) -> Dict:
         """回傳放置於「演算法建議結果」後方之獨立欄位字典。"""
         sq_cnt = MASqueezeBreakoutStrategy.count_lookback_passes(df, base_offset=base_offset, lookback_days=lookback_days)

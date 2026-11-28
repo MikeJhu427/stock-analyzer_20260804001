@@ -918,11 +918,11 @@ elif selected_page == "🚀 全市場智慧掃描":
                                             pass_60m_adv = True
                                             adv_60m_data = triggered_rows.iloc[-1]
 
-                        sq_prev5d_default = msq.MASqueezeBreakoutStrategy.count_lookback_passes(
-                            df, base_offset=config_dict["lookback_end"], lookback_days=5
+                        sq_prev30d_default = msq.MASqueezeBreakoutStrategy.count_lookback_passes(
+                            df, base_offset=config_dict["lookback_end"], lookback_days=30
                         )
 
-                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or pass_ma_squeeze or sq_prev5d_default > 0 or force_pass:
+                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or pass_ma_squeeze or sq_prev30d_default > 0 or force_pass:
                             if best_row is None:
                                 if pass_ma_squeeze and sq_best_row is not None:
                                     best_row, best_offset, best_vol_mult = sq_best_row, sq_best_offset, sq_best_vol_mult
@@ -933,7 +933,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                                     best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
 
                             sq_lead_metrics = msq.MASqueezeBreakoutStrategy.get_lead_metrics(
-                                df, best_row, base_offset=best_offset, lookback_days=5
+                                df, best_row, base_offset=best_offset, lookback_days=30
                             )
 
                             count_30d = 0
