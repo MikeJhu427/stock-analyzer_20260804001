@@ -81,6 +81,17 @@ def get_foreign_fund_flow_report():
         return {"status": "error", "msg": f"外資資金流向監控載入異常：{str(e)}"}
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def get_zhu_market_structure_report():
+    try:
+        res = core.ZhuTechnicalSystemAnalyzer.evaluate_market_structure(session=core.get_yf_session())
+        if not res or res.get("status") != "success":
+            get_zhu_market_structure_report.clear()
+        return res
+    except Exception as e:
+        get_zhu_market_structure_report.clear()
+        return {"status": "error", "msg": f"朱氏大盤結構載入異常：{str(e)}"}
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_safe_haven_market_gate():
     try:
         res = core.BearMarketSafeHavenStrategy.evaluate_market_gate(session=core.get_yf_session())
@@ -120,7 +131,12 @@ def _format_scan_excel_sheet(writer, sheet_name: str = "Sheet1"):
             "當沖率(%)",
             "實體留倉量(張)",
             "實體20日均量(張)",
-            "實體量比"
+            "實體量比",
+            "朱氏_1/2中線價",
+            "朱氏_大量變盤高點",
+            "朱氏_大量變盤低點",
+            "朱氏_5MA乖離率(%)",
+            "朱氏_硬停損參考價"
         }
         headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
         for col_idx, col_name in enumerate(headers, start=1):
@@ -170,6 +186,9 @@ def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=No
         if col not in all_cols:
             all_cols.append(col)
     for col in core.REAL_TURNOVER_COLUMNS:
+        if col not in all_cols:
+            all_cols.append(col)
+    for col in core.ZHU_SYSTEM_COLUMNS:
         if col not in all_cols:
             all_cols.append(col)
     return all_cols
@@ -282,6 +301,7 @@ if selected_page == "🛡️ 跨市場波動率監控":
         if st.button("🔄 重新整理最新數據", type="primary", use_container_width=True):
             get_volatility_monitor_report.clear()
             get_foreign_fund_flow_report.clear()
+            get_zhu_market_structure_report.clear()
             st.rerun()
 
     with st.spinner("⏳ 正在透過 yfinance 抓取跨市場波動率與加權指數資料..."):
@@ -519,6 +539,24 @@ if selected_page == "🛡️ 跨市場波動率監控":
         st.pyplot(fig)
         plt.close(fig)
 
+    st.markdown("---")
+    st.subheader("📐 朱氏大盤道氏趨勢結構與大量變盤線（獨立邏輯）")
+    try:
+        zhu_mkt = get_zhu_market_structure_report()
+        if not isinstance(zhu_mkt, dict) or zhu_mkt.get("status") != "success":
+            st.warning(f"⚠️ {zhu_mkt.get('msg', '無法載入朱氏大盤結構資料。') if isinstance(zhu_mkt, dict) else '資料異常'}")
+        else:
+            zm = zhu_mkt["metrics"]
+            st.caption(f"最新交易日：{zhu_mkt['latest_date']} ｜ 收盤：{zhu_mkt['latest_close']:,.2f} ｜ 獨立運算邏輯（不影響上方既有波動率體制與外資流向判讀）")
+            zc1, zc2, zc3, zc4 = st.columns(4)
+            zc1.metric("朱氏_道氏趨勢結構", zm["朱氏_道氏趨勢結構"])
+            zc2.metric("朱氏_1/2中線價", f"{zm['朱氏_1/2中線價']:,.2f}" if pd.notna(zm["朱氏_1/2中線價"]) else "-", delta=zm["朱氏_打腳位階判定"], delta_color="off")
+            zc3.metric("朱氏_20MA扣抵狀態", zm["朱氏_20MA扣抵狀態"], delta=zm["朱氏_20MA三日不破狀態"], delta_color="off")
+            zc4.metric("朱氏_大量變盤線狀態", zm["朱氏_大量變盤線狀態"], delta=zm["朱氏_乖離防追高提醒"], delta_color="off")
+            st.dataframe(core.ZhuTechnicalSystemAnalyzer.to_market_report_dataframe(zhu_mkt), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"⚠️ 朱氏大盤結構獨立區塊顯示異常：{str(e)}")
+
 # ----------------------------------------------------
 # 頁籤 2：單檔深度解析
 # ----------------------------------------------------
@@ -660,6 +698,18 @@ elif selected_page == "📊 單檔深度解析":
                 plt.setp(ax3.get_xticklabels(), rotation=45, ha='right', fontsize=10)
                 plt.tight_layout()
                 st.pyplot(fig); plt.close(fig)
+
+                st.markdown("---")
+                st.subheader("📐 朱氏技術分析體系獨立診斷（獨立邏輯，不影響上方既有分數）")
+                zhu_single = core.ZhuTechnicalSystemAnalyzer.evaluate(df, config_dict)
+                zs1, zs2, zs3, zs4 = st.columns(4)
+                zs1.metric("朱氏_道氏趨勢結構", zhu_single["朱氏_道氏趨勢結構"])
+                zs2.metric("朱氏_1/2中線價", f"{zhu_single['朱氏_1/2中線價']:.2f}" if pd.notna(zhu_single["朱氏_1/2中線價"]) else "-", delta=zhu_single["朱氏_打腳位階判定"], delta_color="off")
+                zs3.metric("朱氏_右側收盤過前高", zhu_single["朱氏_右側收盤過前高確認"], delta=zhu_single["朱氏_20MA三日不破狀態"], delta_color="off")
+                zs4.metric("朱氏_硬停損參考價", f"{zhu_single['朱氏_硬停損參考價']:.2f}" if pd.notna(zhu_single["朱氏_硬停損參考價"]) else "-", delta=zhu_single["朱氏_移動停利參考(5MA/10MA)"], delta_color="off")
+
+                zhu_single_rows = [{"獨立檢核欄位": k, "判讀結果 / 參考值": "-" if pd.isna(zhu_single[k]) else zhu_single[k]} for k in core.ZHU_SYSTEM_COLUMNS]
+                st.dataframe(pd.DataFrame(zhu_single_rows), use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------
 # 頁籤 3：全市場智慧掃描
@@ -937,6 +987,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                     item['短天期均線差異(%)'] = "-"
                     item['短均線糾結狀態'] = "-"
                     item.update(core.WyckoffAccumulationAnalyzer.empty_result("資料不足"))
+                    item.update(core.ZhuTechnicalSystemAnalyzer.empty_result("資料不足"))
 
                     try:
                         if isinstance(long_data.columns, pd.MultiIndex):
@@ -967,6 +1018,9 @@ elif selected_page == "🚀 全市場智慧掃描":
 
                             wyk_res = core.WyckoffAccumulationAnalyzer.evaluate(long_df, config_dict)
                             item.update(wyk_res)
+
+                            zhu_res = core.ZhuTechnicalSystemAnalyzer.evaluate(long_df, config_dict)
+                            item.update(zhu_res)
 
                             if config_dict["use_weekly_filter"]:
                                 wk_res = core.WeeklyAnalysisStrategy.evaluate(long_df, div_pairs, config_dict["recent_lows_cnt"], config_dict["older_lows_cnt"], config_dict["pivot_left"], config_dict["pivot_right"], config_dict["require_cross_confirm"], config_dict["reso_cross_days"], 'Low' if config_dict["reso_price_basis"] == "最低價 (Low)" else 'Close')
@@ -1362,6 +1416,18 @@ elif selected_page == "📐 幾何型態滿足點測距":
                 st.markdown("---")
                 render_pattern_result(res_mode2, "3. 模式二：影線極值模型（包含盤中插針、斷頭踩踏與極端低點）")
 
+                st.markdown("---")
+                st.markdown("#### 4. 朱氏 1/2 中線位階與三日不破法則（獨立參考，不影響上方既有測距）")
+                zhu_geo = core.ZhuTechnicalSystemAnalyzer.evaluate(df)
+                zg1, zg2, zg3 = st.columns(3)
+                zg1.metric("朱氏_1/2中線價", f"{zhu_geo['朱氏_1/2中線價']:.2f}" if pd.notna(zhu_geo["朱氏_1/2中線價"]) else "-")
+                zg2.metric("朱氏_打腳位階判定", zhu_geo["朱氏_打腳位階判定"])
+                zg3.metric("朱氏_20MA三日不破狀態", zhu_geo["朱氏_20MA三日不破狀態"])
+                if res_mode1.get("bull") and pd.notna(res_mode1["bull"].get("neckline")):
+                    st.info(f"**模式一 W 底頸線三日不破檢核**：{core.ZhuTechnicalSystemAnalyzer.evaluate_three_day_level(df, res_mode1['bull']['neckline'], days=3)}")
+                if res_mode1.get("bear") and pd.notna(res_mode1["bear"].get("neckline")):
+                    st.info(f"**模式一 M 頭頸線三日不破檢核**：{core.ZhuTechnicalSystemAnalyzer.evaluate_three_day_level(df, res_mode1['bear']['neckline'], days=3)}")
+
 # ----------------------------------------------------
 # 頁籤 6：量化型態狀態機 
 # ----------------------------------------------------
@@ -1535,6 +1601,18 @@ elif selected_page == "🤖 量化型態狀態機 (程式A)":
                     st.success(f"**當前主導狀態**：{' ； '.join(dict.fromkeys(final_states))}")
                 else:
                     st.warning("**當前主導狀態**：目前無已確認之水平反轉型態或趨勢線突破，市場處於軌道內整理或單向波段中。")
+
+                st.markdown("---")
+                st.markdown("### 六、朱氏技術分析體系獨立參考（不影響上方既有狀態機參數與結論）")
+                zhu_q = core.ZhuTechnicalSystemAnalyzer.evaluate(df)
+                zq1, zq2, zq3, zq4 = st.columns(4)
+                zq1.metric("朱氏_道氏趨勢結構", zhu_q["朱氏_道氏趨勢結構"])
+                zq2.metric("朱氏_1/2中線價", f"{zhu_q['朱氏_1/2中線價']:.2f}" if pd.notna(zhu_q["朱氏_1/2中線價"]) else "-", delta=zhu_q["朱氏_打腳位階判定"], delta_color="off")
+                zq3.metric("朱氏_大量變盤線狀態", zhu_q["朱氏_大量變盤線狀態"])
+                zq4.metric("朱氏_硬停損參考價", f"{zhu_q['朱氏_硬停損參考價']:.2f}" if pd.notna(zhu_q["朱氏_硬停損參考價"]) else "-", delta=zhu_q["朱氏_移動停利參考(5MA/10MA)"], delta_color="off")
+                for lbl, pat_obj in [("實體 W 底頸線", close_patterns.get("W")), ("實體 M 頭頸線", close_patterns.get("M"))]:
+                    if pat_obj is not None:
+                        st.info(f"**{lbl} 三日不破檢核**：{core.ZhuTechnicalSystemAnalyzer.evaluate_three_day_level(df, pat_obj.neckline.price, days=3)}")
 
 # ----------------------------------------------------
 # 頁籤 7：空頭避風港強勢股（方案 B）

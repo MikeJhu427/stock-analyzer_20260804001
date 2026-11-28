@@ -90,6 +90,15 @@ DEFAULT_CONFIG = {
         "reset_body_atr_mult": 1.0,
         "reset_consec_days": 3,
         "enable_inst_filter": False
+    },
+    "zhu_system_params": {
+        "swing_order": 5,
+        "three_day_days": 3,
+        "pivot_vol_mult": 1.5,
+        "pivot_lookback_days": 20,
+        "bias5_high_th": 5.0,
+        "bias5_low_th": -5.0,
+        "stop_loss_lookback": 5
     }
 }
 
@@ -4172,3 +4181,355 @@ class WyckoffAccumulationAnalyzer:
             }
         except Exception:
             return WyckoffAccumulationAnalyzer.empty_result("計算異常")
+# ==========================================
+# 朱氏技術分析實戰體系獨立模組（獨立邏輯與獨立欄位，不干擾既有策略與欄位）
+# ==========================================
+ZHU_SYSTEM_COLUMNS = [
+    "朱氏_道氏趨勢結構",
+    "朱氏_5MA扣抵狀態",
+    "朱氏_20MA扣抵狀態",
+    "朱氏_1/2中線價",
+    "朱氏_打腳位階判定",
+    "朱氏_20MA三日不破狀態",
+    "朱氏_右側收盤過前高確認",
+    "朱氏_大量變盤線狀態",
+    "朱氏_大量變盤高點",
+    "朱氏_大量變盤低點",
+    "朱氏_5MA乖離率(%)",
+    "朱氏_乖離防追高提醒",
+    "朱氏_硬停損參考價",
+    "朱氏_移動停利參考(5MA/10MA)"
+]
+
+
+class ZhuTechnicalSystemAnalyzer:
+    """
+    獨立封裝之「朱氏技術分析實戰體系」純運算分析器：
+    1. 道氏趨勢結構（頭頭高/底底高、頭頭低/底底低、盤整趨勢）
+    2. 均線扣抵預判（5MA / 20MA 扣低助漲或扣高反壓）
+    3. 二分之一中線法則（前波高低點 1/2 中線與打腳強弱位階）
+    4. 三日不破／不過法則（20MA 及任意指定頸線三日收盤確認）
+    5. 右側收盤過前高確認（13:30 收盤過前高且收紅 vs 盤中過高留上影）
+    6. 大量變盤線偵測（1.5 倍以上 5MA 巨量 K 棒高低點突破／跌破）
+    7. 5MA 乖離率防追高與風控參考價（硬停損價、5MA/10MA 移動停利參考）
+    所有邏輯與輸出欄位均完全獨立於既有策略與報表欄位。
+    """
+
+    @staticmethod
+    def empty_result(reason: str = "資料不足") -> Dict:
+        return {
+            "朱氏_道氏趨勢結構": reason,
+            "朱氏_5MA扣抵狀態": "-",
+            "朱氏_20MA扣抵狀態": "-",
+            "朱氏_1/2中線價": np.nan,
+            "朱氏_打腳位階判定": reason,
+            "朱氏_20MA三日不破狀態": "-",
+            "朱氏_右側收盤過前高確認": "-",
+            "朱氏_大量變盤線狀態": "-",
+            "朱氏_大量變盤高點": np.nan,
+            "朱氏_大量變盤低點": np.nan,
+            "朱氏_5MA乖離率(%)": np.nan,
+            "朱氏_乖離防追高提醒": "-",
+            "朱氏_硬停損參考價": np.nan,
+            "朱氏_移動停利參考(5MA/10MA)": "-"
+        }
+
+    @staticmethod
+    def _merge_params(config: Optional[Dict] = None) -> Dict:
+        params = DEFAULT_CONFIG["zhu_system_params"].copy()
+        if isinstance(config, dict):
+            if "zhu_system_params" in config and isinstance(config["zhu_system_params"], dict):
+                params.update(config["zhu_system_params"])
+            else:
+                for k in params.keys():
+                    if k in config:
+                        params[k] = config[k]
+        return params
+
+    @staticmethod
+    def _normalize_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = df.copy()
+        if isinstance(out.columns, pd.MultiIndex):
+            lv0 = out.columns.get_level_values(0)
+            lv1 = out.columns.get_level_values(1)
+            if "Close" in lv0:
+                out.columns = lv0
+            elif "Close" in lv1:
+                out.columns = lv1
+            else:
+                return pd.DataFrame()
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()]
+        req = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in out.columns for c in req):
+            return pd.DataFrame()
+        out = out[req].copy()
+        for c in req:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        out = out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if out.empty:
+            return pd.DataFrame()
+        idx = pd.to_datetime(out.index)
+        try:
+            if idx.tz is not None:
+                idx = idx.tz_convert("Asia/Taipei").tz_localize(None)
+        except Exception:
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+        out.index = idx.normalize()
+        return out[~out.index.duplicated(keep="last")].sort_index()
+
+    @staticmethod
+    def _calc_koudi_status(closes: np.ndarray, period: int) -> str:
+        """比對最新收盤價與 N 日前扣抵收盤價，判定均線扣抵助漲或反壓。"""
+        if len(closes) <= period:
+            return "資料不足"
+        cur_c = float(closes[-1])
+        ref_c = float(closes[-1 - period])
+        if np.isnan(cur_c) or np.isnan(ref_c) or ref_c <= 0:
+            return "資料不足"
+        if cur_c > ref_c * 1.002:
+            return f"扣低助漲(扣{ref_c:.2f})"
+        elif cur_c < ref_c * 0.998:
+            return f"扣高反壓(扣{ref_c:.2f})"
+        return f"扣抵持平(扣{ref_c:.2f})"
+
+    @staticmethod
+    def evaluate_three_day_level(
+        df: Optional[pd.DataFrame],
+        level_price: float,
+        days: int = 3
+    ) -> str:
+        """獨立檢核指定價位（如頸線或均線）是否符合「三日不破／不過法則」。"""
+        if df is None or df.empty or pd.isna(level_price) or level_price <= 0 or len(df) < days:
+            return "資料不足"
+        recent_closes = pd.to_numeric(df["Close"].iloc[-days:], errors="coerce").values
+        if np.any(np.isnan(recent_closes)):
+            return "資料不足"
+        if np.all(recent_closes > level_price):
+            return f"✅ 連續{days}日收盤站穩({level_price:.2f})"
+        if np.all(recent_closes < level_price):
+            return f"🔴 連續{days}日收盤站不回({level_price:.2f})"
+        return f"🟡 測試觀察中({level_price:.2f})"
+
+    @staticmethod
+    def evaluate(df: Optional[pd.DataFrame], config: Optional[Dict] = None) -> Dict:
+        """
+        執行單一標的之朱氏技術分析獨立診斷，回傳 ZHU_SYSTEM_COLUMNS 完整字典。
+        """
+        try:
+            work = ZhuTechnicalSystemAnalyzer._normalize_df(df)
+            if work.empty or len(work) < 25:
+                return ZhuTechnicalSystemAnalyzer.empty_result("資料不足")
+
+            params = ZhuTechnicalSystemAnalyzer._merge_params(config)
+            swing_order = max(2, int(params["swing_order"]))
+            three_days = max(2, int(params["three_day_days"]))
+            pivot_vol_mult = float(params["pivot_vol_mult"])
+            pivot_lb = max(5, int(params["pivot_lookback_days"]))
+            bias5_hi = float(params["bias5_high_th"])
+            bias5_lo = float(params["bias5_low_th"])
+            sl_lb = max(2, int(params["stop_loss_lookback"]))
+
+            opens = work["Open"].values
+            highs = work["High"].values
+            lows = work["Low"].values
+            closes = work["Close"].values
+            vols = work["Volume"].values
+
+            ma5_s = work["Close"].rolling(5).mean()
+            ma10_s = work["Close"].rolling(10).mean()
+            ma20_s = work["Close"].rolling(20).mean()
+            vol_ma5_s = work["Volume"].rolling(5).mean()
+
+            cur_o = float(opens[-1])
+            cur_h = float(highs[-1])
+            cur_l = float(lows[-1])
+            cur_c = float(closes[-1])
+            prev_h = float(highs[-2])
+            cur_ma5 = float(ma5_s.iloc[-1])
+            cur_ma10 = float(ma10_s.iloc[-1])
+            cur_ma20 = float(ma20_s.iloc[-1])
+
+            # 1. 道氏趨勢結構（近 90 日內之最近兩高與兩低）
+            sub_len = min(len(work), 90)
+            sub_h = highs[-sub_len:]
+            sub_l = lows[-sub_len:]
+            high_idx = argrelextrema(sub_h, np.greater, order=swing_order)[0]
+            low_idx = argrelextrema(sub_l, np.less, order=swing_order)[0]
+
+            if len(high_idx) >= 2 and len(low_idx) >= 2:
+                h1, h2 = float(sub_h[high_idx[-2]]), float(sub_h[high_idx[-1]])
+                l1, l2 = float(sub_l[low_idx[-2]]), float(sub_l[low_idx[-1]])
+                if h2 > h1 and l2 > l1:
+                    dow_trend = "多頭趨勢(頭頭高/底底高)"
+                elif h2 < h1 and l2 < l1:
+                    dow_trend = "空頭趨勢(頭頭低/底底低)"
+                else:
+                    dow_trend = "盤整趨勢(高不過高/低不破低)"
+            else:
+                dow_trend = "盤整/波段樣本不足"
+
+            # 2. 均線扣抵狀態（5MA / 20MA）
+            koudi_5 = ZhuTechnicalSystemAnalyzer._calc_koudi_status(closes, 5)
+            koudi_20 = ZhuTechnicalSystemAnalyzer._calc_koudi_status(closes, 20)
+
+            # 3. 二分之一中線法則（前波高低點與打腳強弱位階）
+            if len(high_idx) >= 1 and len(low_idx) >= 1:
+                wave_high = float(sub_h[high_idx[-1]])
+                wave_low = float(sub_l[low_idx[-1]])
+                if wave_high <= wave_low:
+                    wave_high = float(np.max(highs[-20:]))
+                    wave_low = float(np.min(lows[-20:]))
+            else:
+                wave_high = float(np.max(highs[-20:]))
+                wave_low = float(np.min(lows[-20:]))
+
+            midpoint_val = round(wave_low + (wave_high - wave_low) / 2.0, 2) if wave_high > wave_low else np.nan
+            if pd.isna(midpoint_val):
+                foot_status = "資料不足"
+            elif cur_c >= wave_high:
+                foot_status = "突破前高(多頭強勢延伸)"
+            elif cur_c >= midpoint_val:
+                foot_status = "守穩1/2中線(強勢N字打腳)"
+            elif cur_c >= wave_low:
+                foot_status = "跌破1/2中線(弱勢W底測試)"
+            else:
+                foot_status = "跌破前低(空頭續跌C波)"
+
+            # 4. 20MA 三日不破／不過法則
+            ma20_tail = ma20_s.iloc[-three_days:].values
+            c_tail = closes[-three_days:]
+            if np.any(np.isnan(ma20_tail)):
+                three_day_ma20 = "資料不足"
+            elif np.all(c_tail > ma20_tail):
+                three_day_ma20 = f"三日站穩20MA"
+            elif np.all(c_tail < ma20_tail):
+                three_day_ma20 = f"三日站不回20MA"
+            else:
+                three_day_ma20 = "20MA測試觀察中"
+
+            # 5. 右側收盤過前高確認
+            if cur_c > prev_h and cur_c > cur_o:
+                right_confirm = "✅ 收盤過前高確認"
+            elif cur_h > prev_h and cur_c <= prev_h:
+                right_confirm = "⚠️ 盤中過高留上影(無效)"
+            else:
+                right_confirm = "❌ 未過前高"
+
+            # 6. 大量變盤線偵測（近 pivot_lb 日內成交量 >= 1.5 倍前日 5MA 均量之最新巨量 K 棒）
+            pivot_status = "無大量變盤線"
+            pivot_high = np.nan
+            pivot_low = np.nan
+            vol_ma5_vals = vol_ma5_s.values
+            search_start = max(5, len(work) - pivot_lb)
+            pivot_idx = None
+            for idx in range(len(work) - 1, search_start - 1, -1):
+                v_ref = vol_ma5_vals[idx - 1]
+                if pd.notna(v_ref) and v_ref > 0 and vols[idx] >= v_ref * pivot_vol_mult:
+                    pivot_idx = idx
+                    break
+
+            if pivot_idx is not None:
+                pivot_high = round(float(highs[pivot_idx]), 2)
+                pivot_low = round(float(lows[pivot_idx]), 2)
+                p_date_str = work.index[pivot_idx].strftime("%m/%d")
+                if pivot_idx == len(work) - 1:
+                    pivot_status = f"⏳ 大量變盤線當日形成({p_date_str})"
+                elif cur_c > pivot_high:
+                    pivot_status = f"🚀 突破大量高點({p_date_str}轉多/空單停利)"
+                elif cur_c < pivot_low:
+                    pivot_status = f"🚨 跌破大量低點({p_date_str}轉空/多單警戒)"
+                else:
+                    pivot_status = f"⏳ 大量區間整理({p_date_str})"
+
+            # 7. 5MA 乖離率防追高與風控參考價
+            bias5_pct = round((cur_c - cur_ma5) / (cur_ma5 + 1e-8) * 100.0, 2) if pd.notna(cur_ma5) and cur_ma5 > 0 else np.nan
+            if pd.isna(bias5_pct):
+                bias5_alert = "-"
+            elif bias5_pct >= bias5_hi:
+                bias5_alert = "⚠️ 5MA正乖離過大(勿追高/待回測)"
+            elif bias5_pct <= bias5_lo:
+                bias5_alert = "❄️ 5MA負乖離過大(防技術反彈)"
+            else:
+                bias5_alert = "正常區間"
+
+            hard_sl = round(float(np.min(lows[-sl_lb:])), 2)
+            ma_trail_str = (
+                f"5MA:{cur_ma5:.2f} / 10MA:{cur_ma10:.2f}"
+                if pd.notna(cur_ma5) and pd.notna(cur_ma10)
+                else "-"
+            )
+
+            return {
+                "朱氏_道氏趨勢結構": dow_trend,
+                "朱氏_5MA扣抵狀態": koudi_5,
+                "朱氏_20MA扣抵狀態": koudi_20,
+                "朱氏_1/2中線價": midpoint_val,
+                "朱氏_打腳位階判定": foot_status,
+                "朱氏_20MA三日不破狀態": three_day_ma20,
+                "朱氏_右側收盤過前高確認": right_confirm,
+                "朱氏_大量變盤線狀態": pivot_status,
+                "朱氏_大量變盤高點": pivot_high,
+                "朱氏_大量變盤低點": pivot_low,
+                "朱氏_5MA乖離率(%)": bias5_pct,
+                "朱氏_乖離防追高提醒": bias5_alert,
+                "朱氏_硬停損參考價": hard_sl,
+                "朱氏_移動停利參考(5MA/10MA)": ma_trail_str
+            }
+        except Exception:
+            return ZhuTechnicalSystemAnalyzer.empty_result("計算異常")
+
+    @staticmethod
+    def evaluate_market_structure(
+        session=None,
+        twii_df: Optional[pd.DataFrame] = None,
+        config: Optional[Dict] = None
+    ) -> Dict:
+        """獨立評估台股加權指數 (^TWII) 之朱氏道氏結構、1/2 中線、均線扣抵與大量變盤線。"""
+        tw_tz = datetime.timezone(datetime.timedelta(hours=8))
+        eval_time_str = datetime.datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+        try:
+            df = twii_df
+            if df is None or df.empty:
+                df = BearMarketSafeHavenStrategy.fetch_twii_data(session=session, period="6mo")
+            norm_df = ZhuTechnicalSystemAnalyzer._normalize_df(df)
+            if norm_df.empty or len(norm_df) < 25:
+                return {
+                    "status": "error",
+                    "eval_time": eval_time_str,
+                    "msg": "無法取得足夠的加權指數 (^TWII) 日線資料。"
+                }
+            metrics = ZhuTechnicalSystemAnalyzer.evaluate(norm_df, config=config)
+            latest_date = norm_df.index[-1].strftime("%Y-%m-%d")
+            latest_close = round(float(norm_df["Close"].iloc[-1]), 2)
+            return {
+                "status": "success",
+                "eval_time": eval_time_str,
+                "latest_date": latest_date,
+                "latest_close": latest_close,
+                "metrics": metrics
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "eval_time": eval_time_str,
+                "msg": f"朱氏大盤結構分析異常：{str(e)}"
+            }
+
+    @staticmethod
+    def to_market_report_dataframe(res: Optional[Dict]) -> pd.DataFrame:
+        """將大盤朱氏結構分析結果轉為獨立工作表 DataFrame。"""
+        if not isinstance(res, dict) or res.get("status") != "success":
+            err = res.get("msg", "資料異常") if isinstance(res, dict) else "無資料"
+            return pd.DataFrame([{"項目": "狀態", "數值 / 判讀": err}])
+        rows = [
+            {"項目": "資料日期", "數值 / 判讀": res.get("latest_date", "-")},
+            {"項目": "檢核時間 (UTC+8)", "數值 / 判讀": res.get("eval_time", "-")},
+            {"項目": "^TWII 最新收盤", "數值 / 判讀": res.get("latest_close", "-")}
+        ]
+        for col in ZHU_SYSTEM_COLUMNS:
+            val = res.get("metrics", {}).get(col, "-")
+            rows.append({"項目": col, "數值 / 判讀": "-" if pd.isna(val) else val})
+        return pd.DataFrame(rows)

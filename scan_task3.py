@@ -14,6 +14,7 @@ MAIN_SCAN_SHEET_NAME = "全市場掃描結果"
 FOREIGN_FLOW_SHEET_NAME = "外資資金流向監控"
 FOREIGN_FLOW_HISTORY_FILE = "foreign_fund_flow_history.xlsx"
 SAFE_HAVEN_SHEET_NAME = "空頭避風港_方案B"
+ZHU_MARKET_SHEET_NAME = "朱氏大盤趨勢與變盤線"
 
 
 def _calc_display_width(text) -> int:
@@ -146,6 +147,9 @@ def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None
     for col in core.REAL_TURNOVER_COLUMNS:
         if col not in all_cols:
             all_cols.append(col)
+    for col in core.ZHU_SYSTEM_COLUMNS:
+        if col not in all_cols:
+            all_cols.append(col)
     return all_cols
 
 
@@ -166,7 +170,12 @@ def _format_main_scan_sheet(writer, sheet_name: str = MAIN_SCAN_SHEET_NAME):
             "當沖率(%)",
             "實體留倉量(張)",
             "實體20日均量(張)",
-            "實體量比"
+            "實體量比",
+            "朱氏_1/2中線價",
+            "朱氏_大量變盤高點",
+            "朱氏_大量變盤低點",
+            "朱氏_5MA乖離率(%)",
+            "朱氏_硬停損參考價"
         }
 
         headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
@@ -404,7 +413,8 @@ def export_scan_reports(
     vol_report_df: pd.DataFrame,
     foreign_flow_df: pd.DataFrame,
     safe_haven_excel_df: pd.DataFrame,
-    export_format: str = "xlsx"
+    export_format: str = "xlsx",
+    zhu_market_df: pd.DataFrame = None
 ):
     """
     統一報表匯出介面（支援 .xlsx 與 .csv，預設 .xlsx）：
@@ -461,6 +471,12 @@ def export_scan_reports(
                     _format_safe_haven_sheet(writer, SAFE_HAVEN_SHEET_NAME, ref_sheet_name=MAIN_SCAN_SHEET_NAME)
                 except Exception as pbe:
                     print(f"⚠️ 寫入「{SAFE_HAVEN_SHEET_NAME}」工作表失敗，維持主報表匯出：{pbe}")
+                if zhu_market_df is not None and not zhu_market_df.empty:
+                    try:
+                        zhu_market_df.to_excel(writer, sheet_name=ZHU_MARKET_SHEET_NAME, index=False)
+                        _format_main_scan_sheet(writer, ZHU_MARKET_SHEET_NAME)
+                    except Exception as zme:
+                        print(f"⚠️ 寫入「{ZHU_MARKET_SHEET_NAME}」工作表失敗，維持主報表匯出：{zme}")
             buffer.seek(0)
             xlsx_bytes = buffer.read()
 
@@ -527,6 +543,23 @@ def run_full_scan():
         )
     else:
         print(f"⚠️ 外資資金流向監控警告：{flow_res.get('msg', '資料取得失敗')}")
+
+    print("🚀 [Step 0.6] 執行朱氏大盤道氏趨勢結構與大量變盤線（獨立邏輯）...")
+    try:
+        zhu_market_res = core.ZhuTechnicalSystemAnalyzer.evaluate_market_structure(session=yf_session, config=CONFIG)
+        zhu_market_df = core.ZhuTechnicalSystemAnalyzer.to_market_report_dataframe(zhu_market_res)
+        if zhu_market_res.get("status") == "success":
+            zm = zhu_market_res["metrics"]
+            print(
+                f"📐 [^TWII {zhu_market_res['latest_date']}] {zm['朱氏_道氏趨勢結構']} | "
+                f"1/2中線：{zm['朱氏_1/2中線價']} ({zm['朱氏_打腳位階判定']}) | "
+                f"20MA扣抵：{zm['朱氏_20MA扣抵狀態']} | 變盤線：{zm['朱氏_大量變盤線狀態']}"
+            )
+        else:
+            print(f"⚠️ 朱氏大盤結構監控警告：{zhu_market_res.get('msg', '資料異常')}")
+    except Exception as ze:
+        zhu_market_df = core.ZhuTechnicalSystemAnalyzer.to_market_report_dataframe({"status": "error", "msg": str(ze)})
+        print(f"⚠️ 朱氏大盤結構監控異常：{ze}")
 
     print("🚀 [Step 1] 初始化：正在獲取台股上市櫃清單...")
     stock_dict = core.fetch_all_tw_stocks()
@@ -717,6 +750,7 @@ def run_full_scan():
                 item['短天期均線差異(%)'] = "-"
                 item['短均線糾結狀態'] = "-"
                 item.update(core.WyckoffAccumulationAnalyzer.empty_result("資料不足"))
+                item.update(core.ZhuTechnicalSystemAnalyzer.empty_result("資料不足"))
 
                 try:
                     if isinstance(long_data.columns, pd.MultiIndex):
@@ -749,6 +783,9 @@ def run_full_scan():
 
                         wyk_res = core.WyckoffAccumulationAnalyzer.evaluate(long_df, CONFIG)
                         item.update(wyk_res)
+
+                        zhu_res = core.ZhuTechnicalSystemAnalyzer.evaluate(long_df, CONFIG)
+                        item.update(zhu_res)
 
                         if CONFIG["use_weekly_filter"]:
                             wk_res = core.WeeklyAnalysisStrategy.evaluate(long_df, div_pairs, CONFIG["recent_lows_cnt"], CONFIG["older_lows_cnt"], CONFIG["pivot_left"], CONFIG["pivot_right"], CONFIG["require_cross_confirm"], CONFIG["reso_cross_days"], 'Low' if CONFIG["reso_price_basis"] == "最低價 (Low)" else 'Close')
@@ -829,7 +866,8 @@ def run_full_scan():
         vol_report_df=vol_report_df,
         foreign_flow_df=foreign_flow_df,
         safe_haven_excel_df=safe_haven_excel_df,
-        export_format=export_fmt
+        export_format=export_fmt,
+        zhu_market_df=zhu_market_df
     )
 
 
