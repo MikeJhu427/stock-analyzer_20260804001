@@ -114,7 +114,7 @@ def _build_scan_output_columns(config: dict, div_pairs: list, existing_cols=None
     if config.get("enable_30d_backtest", False):
         base_cols.append('近30日觸發次數')
     base_cols.extend([
-        '演算法建議結果', msq.MA_SQUEEZE_LOOKBACK_COL, '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
+        '演算法建議結果', *msq.MA_SQUEEZE_LEAD_COLUMNS, '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態'
     ])
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
     for col in msq.MA_SQUEEZE_COLUMNS:
@@ -686,8 +686,8 @@ def run_full_scan():
                                 prev_v = df['Volume_Lots'].iloc[-2 - best_offset] if len(df) > best_offset + 1 else np.nan
                                 best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
 
-                        sq_prev5d_count = msq.MASqueezeBreakoutStrategy.count_lookback_passes(
-                            df, base_offset=best_offset, lookback_days=5
+                        sq_lead_metrics = msq.MASqueezeBreakoutStrategy.get_lead_metrics(
+                            df, best_row, base_offset=best_offset, lookback_days=5
                         )
 
                         count_30d = 0
@@ -711,7 +711,7 @@ def run_full_scan():
                             "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
                             "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                             "近30日觸發次數": count_30d if CONFIG["enable_30d_backtest"] else "-",
-                            msq.MA_SQUEEZE_LOOKBACK_COL: sq_prev5d_count,
+                            **sq_lead_metrics,
                             "當日收盤": round(float(best_row['Close']), 2),
                             "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
                             "當日成交量(張)": int(best_row['Volume_Lots']),
@@ -861,7 +861,7 @@ def run_full_scan():
         res_df.index = res_df.index + 1
 
         print("📊 掃描完成！最終報表標的預覽：")
-        preview_cols = ['股票代號', '股票名稱', '演算法建議結果', msq.MA_SQUEEZE_LOOKBACK_COL, '均線壓縮一陽穿多線', '實體量是否更新至指定日期', '實體留倉量(張)', '實體量比', '實體量能判讀']
+        preview_cols = ['股票代號', '股票名稱', '演算法建議結果', *msq.MA_SQUEEZE_LEAD_COLUMNS, '均線壓縮一陽穿多線', '實體量是否更新至指定日期', '實體留倉量(張)', '實體量比', '實體量能判讀']
         print(res_df[[c for c in preview_cols if c in res_df.columns]].to_string())
     else:
         # 0 檔符合條件時仍保留完整原有欄位＋均線壓縮＋威科夫＋8 項新增實體量欄位的空表結構

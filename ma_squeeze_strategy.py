@@ -5,6 +5,13 @@ import strategy_core as core
 
 MA_SQUEEZE_TAG = "均線壓縮一陽穿多線"
 MA_SQUEEZE_LOOKBACK_COL = "均線壓縮一陽穿多線回測滿足次數"
+MA_SQUEEZE_IGNITION_STRENGTH_COL = "飆股點火強度(當日)"
+MA_SQUEEZE_IGNITION_LOOKBACK_COL = "均線壓縮飆股點火5日回測次數"
+MA_SQUEEZE_LEAD_COLUMNS = [
+    MA_SQUEEZE_LOOKBACK_COL,
+    MA_SQUEEZE_IGNITION_STRENGTH_COL,
+    MA_SQUEEZE_IGNITION_LOOKBACK_COL
+]
 
 MA_SQUEEZE_COLUMNS = [
     "均線壓縮一陽穿多線",
@@ -38,7 +45,12 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "macd_prior_min_hist": -0.15,
     "macd_prior_min_pct": -0.25,
     "macd_cur_min_hist": -0.10,
-    "macd_cur_max_pct": 1.50
+    "macd_cur_max_pct": 1.50,
+    "ignition_bb_break_pct": 1.5,
+    "ignition_max_upper_shadow_pct": 1.0,
+    "ignition_high_lookback": 60,
+    "ignition_min_kd_spread": 12.0,
+    "ignition_min_macd_hist_pct": 0.30
 }
 
 
@@ -89,6 +101,7 @@ class MASqueezeBreakoutStrategy:
         std20 = close.rolling(20).std()
         bb_upper = out["SQ_MA20"] + 2.0 * std20
         bb_lower = out["SQ_MA20"] - 2.0 * std20
+        out["SQ_BB_Upper"] = bb_upper
         out["SQ_BBW_Pct"] = (bb_upper - bb_lower) / (out["SQ_MA20"] + 1e-8) * 100.0
         out["SQ_Vol_MA5"] = out["Volume_Lots"].astype(float).rolling(5).mean()
 
@@ -110,7 +123,10 @@ class MASqueezeBreakoutStrategy:
                 "MA_Squeeze_Diag",
                 "MA_Squeeze_Spread_Pct",
                 "MA_Squeeze_BBW_Pct",
-                "MA_Squeeze_Vol_Mult5"
+                "MA_Squeeze_Vol_Mult5",
+                "MA_Squeeze_Ignition_Score",
+                "MA_Squeeze_Ignition_Pass",
+                "MA_Squeeze_Ignition_Label"
             ])
 
         res = pd.DataFrame(index=df.index)
@@ -119,6 +135,9 @@ class MASqueezeBreakoutStrategy:
         res["MA_Squeeze_Spread_Pct"] = np.nan
         res["MA_Squeeze_BBW_Pct"] = np.nan
         res["MA_Squeeze_Vol_Mult5"] = np.nan
+        res["MA_Squeeze_Ignition_Score"] = 0
+        res["MA_Squeeze_Ignition_Pass"] = False
+        res["MA_Squeeze_Ignition_Label"] = "0/3(無)"
 
         if len(df) < 66:
             return res
@@ -142,6 +161,7 @@ class MASqueezeBreakoutStrategy:
         ma20 = work["SQ_MA20"].astype(float).values
         ma60 = work["SQ_MA60"].astype(float).values
         ma120 = work["SQ_MA120"].astype(float).values
+        bb_upper_vals = work["SQ_BB_Upper"].astype(float).values
         bbw = work["SQ_BBW_Pct"].astype(float).values
 
         k_vals = work["K"].astype(float).values
@@ -177,11 +197,20 @@ class MASqueezeBreakoutStrategy:
         macd_cur_min = float(cfg["macd_cur_min_hist"])
         macd_cur_max_pct = float(cfg["macd_cur_max_pct"])
 
+        ign_bb_break_pct = float(cfg["ignition_bb_break_pct"])
+        ign_max_ushadow_pct = float(cfg["ignition_max_upper_shadow_pct"])
+        ign_high_lb = int(cfg["ignition_high_lookback"])
+        ign_min_kd_spread = float(cfg["ignition_min_kd_spread"])
+        ign_min_macd_pct = float(cfg["ignition_min_macd_hist_pct"])
+
         pass_arr = np.zeros(len(work), dtype=bool)
         diag_arr = np.full(len(work), "樣本不足", dtype=object)
         spread_arr = np.full(len(work), np.nan, dtype=float)
         bbw_arr = np.full(len(work), np.nan, dtype=float)
         vol_mult_arr = np.full(len(work), np.nan, dtype=float)
+        ign_score_arr = np.zeros(len(work), dtype=int)
+        ign_pass_arr = np.zeros(len(work), dtype=bool)
+        ign_label_arr = np.full(len(work), "0/3(無)", dtype=object)
 
         start_idx = max(60 + sq_win, chop_win + 1, macd_prior_lb + 1, kd_div_lb + 1)
 
@@ -196,6 +225,40 @@ class MASqueezeBreakoutStrategy:
             if any(np.isnan([o_i, h_i, c_i, v_i, prev_c, v_ma5_prev])) or o_i <= 0 or c_i <= 0 or prev_c <= 0 or v_ma5_prev <= 0:
                 diag_arr[i] = "價量缺值或為零"
                 continue
+
+            # ------------------------------------------
+            # 獨立邏輯：三大飆股點火強度檢核（不影響原有 MA_Squeeze_Pass 判定）
+            # 1. 強破布林上軌：收盤 > BB_Upper * (1 + 1.5%) 且 上影線 <= 1.0%
+            # 2. 突破近 60 日新高：收盤 >= 過去 60 個交易日最高價（吃掉前高套牢）
+            # 3. 動能爆發力：KD 開口 (K - D) >= 12 且 MACD_Hist / Close >= 0.30%
+            # ------------------------------------------
+            ign_hits = []
+            bb_u_i = bb_upper_vals[i]
+            ushadow_i = (h_i - c_i) / c_i * 100.0
+            if pd.notna(bb_u_i) and bb_u_i > 0 and (c_i > bb_u_i * (1.0 + ign_bb_break_pct / 100.0)) and (ushadow_i <= ign_max_ushadow_pct):
+                ign_hits.append("強破布林")
+
+            if i >= ign_high_lb:
+                prior_60d_high = float(np.nanmax(highs[i - ign_high_lb:i]))
+                if pd.notna(prior_60d_high) and prior_60d_high > 0 and c_i >= prior_60d_high:
+                    ign_hits.append("創60日新高")
+
+            if pd.notna(k_vals[i]) and pd.notna(d_vals[i]) and pd.notna(macd_hist[i]):
+                kd_spread_i = float(k_vals[i] - d_vals[i])
+                macd_pct_i = float(macd_hist[i] / c_i * 100.0)
+                if kd_spread_i >= ign_min_kd_spread and macd_pct_i >= ign_min_macd_pct:
+                    ign_hits.append("動能爆發")
+
+            ign_cnt = len(ign_hits)
+            ign_score_arr[i] = ign_cnt
+            if ign_cnt == 3:
+                ign_label_arr[i] = f"🔥 3/3全中({'+'.join(ign_hits)})"
+            elif ign_cnt == 2:
+                ign_label_arr[i] = f"⚡ 2/3({'+'.join(ign_hits)})"
+            elif ign_cnt == 1:
+                ign_label_arr[i] = f"1/3({'+'.join(ign_hits)})"
+            else:
+                ign_label_arr[i] = "0/3(無)"
 
             # 突破前 5 個交易日（i-5 ~ i-1）檢核均線是否具備完整 120MA
             pre_start = i - sq_win
@@ -392,12 +455,17 @@ class MASqueezeBreakoutStrategy:
 
             pass_arr[i] = True
             diag_arr[i] = "✅ 全部通過"
+            if ign_score_arr[i] == 3:
+                ign_pass_arr[i] = True
 
         res["MA_Squeeze_Pass"] = pass_arr
         res["MA_Squeeze_Diag"] = diag_arr
         res["MA_Squeeze_Spread_Pct"] = spread_arr
         res["MA_Squeeze_BBW_Pct"] = bbw_arr
         res["MA_Squeeze_Vol_Mult5"] = vol_mult_arr
+        res["MA_Squeeze_Ignition_Score"] = ign_score_arr
+        res["MA_Squeeze_Ignition_Pass"] = ign_pass_arr
+        res["MA_Squeeze_Ignition_Label"] = ign_label_arr
         return res
 
     @staticmethod
@@ -435,6 +503,43 @@ class MASqueezeBreakoutStrategy:
         start_pos = max(0, end_pos - int(lookback_days))
         seg = df["MA_Squeeze_Pass"].iloc[start_pos:end_pos]
         return int(seg.fillna(False).astype(bool).sum())
+
+    @staticmethod
+    def count_ignition_lookback_passes(
+        df: Optional[pd.DataFrame],
+        base_offset: int = 0,
+        lookback_days: int = 5
+    ) -> int:
+        """
+        統計基準日（不含基準日當天）往前 lookback_days 個交易日內，
+        同時滿足「均線壓縮一陽穿多線」且「3 項飆股點火特徵全中」(MA_Squeeze_Ignition_Pass == True) 的總次數。
+        """
+        if df is None or df.empty or "MA_Squeeze_Ignition_Pass" not in df.columns:
+            return 0
+        n = len(df)
+        end_pos = n - 1 - int(base_offset)
+        if end_pos <= 0:
+            return 0
+        start_pos = max(0, end_pos - int(lookback_days))
+        seg = df["MA_Squeeze_Ignition_Pass"].iloc[start_pos:end_pos]
+        return int(seg.fillna(False).astype(bool).sum())
+
+    @staticmethod
+    def get_lead_metrics(
+        df: Optional[pd.DataFrame],
+        row,
+        base_offset: int = 0,
+        lookback_days: int = 5
+    ) -> Dict:
+        """回傳放置於「演算法建議結果」後方之獨立欄位字典。"""
+        sq_cnt = MASqueezeBreakoutStrategy.count_lookback_passes(df, base_offset=base_offset, lookback_days=lookback_days)
+        ign_cnt = MASqueezeBreakoutStrategy.count_ignition_lookback_passes(df, base_offset=base_offset, lookback_days=lookback_days)
+        ign_lbl = row.get("MA_Squeeze_Ignition_Label", "0/3(無)") if row is not None else "0/3(無)"
+        return {
+            MA_SQUEEZE_LOOKBACK_COL: sq_cnt,
+            MA_SQUEEZE_IGNITION_STRENGTH_COL: str(ign_lbl) if pd.notna(ign_lbl) else "0/3(無)",
+            MA_SQUEEZE_IGNITION_LOOKBACK_COL: ign_cnt
+        }
 
     @staticmethod
     def get_tags(item: Dict) -> list:

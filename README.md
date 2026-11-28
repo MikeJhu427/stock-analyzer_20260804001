@@ -232,3 +232,10 @@ export GAS_SECRET_TOKEN="你的自訂安全性Token"
 * **欄位名稱**：`均線壓縮一陽穿多線回測滿足次數`（緊接於 `演算法建議結果` 正後方，其餘既有欄位依序往右遞延）。
 * **計算規則**：由 `ma_squeeze_strategy.MASqueezeBreakoutStrategy.count_lookback_passes(df, base_offset, lookback_days=5)` 統一計算，統計**不含基準日當天、往前 5 個交易日**內滿足 `MA_Squeeze_Pass == True` 之總次數。
 * **入選規則**：即使標的於基準日當日未命中任何策略，只要往前 5 個交易日內滿足次數 $> 0$，即自動納入最終掃描清單（`scan_task3.py` 與 `app.py` 同步適用）。
+### 🔥 均線壓縮「飆股點火強度」獨立欄位與 5 日回測
+* **獨立欄位位置**：緊接於 `演算法建議結果` 與 `均線壓縮一陽穿多線回測滿足次數` 正後方，依序新增 `飆股點火強度(當日)` 與 `均線壓縮飆股點火5日回測次數`，其餘既有欄位往右遞延（不干擾原本 `MA_Squeeze_Pass` 與 8 大策略分數）。
+* **三大獨立量化特徵**：
+  1. **強破布林上軌**：收盤價 $> 	ext{BB\_Upper} 	imes 1.015$（強破上軌逾 $1.5\%$）且上影線 $\le 1.0\%$。
+  2. **突破近 60 日新高**：收盤價 $\ge$ 過去 60 個交易日最高價（吃掉前高套牢）。
+  3. **動能爆發力**：KD 開口 $(K - D) \ge 12.0$ 且 $	ext{MACD\_Hist} / 	ext{Close} 	imes 100\% \ge 0.30\%$。
+* **5 日回測統計**：`MASqueezeBreakoutStrategy.count_ignition_lookback_passes(df, base_offset, lookback_days=5)` 統計不含基準日當天、往前 5 個交易日內同時滿足「均線壓縮一陽穿多線」且「3 項飆股點火全中」的總次數。
