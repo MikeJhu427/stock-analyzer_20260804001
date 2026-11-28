@@ -54,7 +54,7 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "monthly_kd_n": 9,
     "monthly_kd_m1": 3,
     "monthly_kd_m2": 3,
-    "monthly_kd_gc_lookback_months": 3,
+    "monthly_kd_gc_lookback_months": 6,
     "monthly_kd_flat_tol": 1e-6
 }
 
@@ -624,7 +624,7 @@ class MASqueezeBreakoutStrategy:
                 continue
 
             # ------------------------------------------
-            # 條件 5：還原月K的 K、D 近 3 個月內發生金叉且金叉後無死叉（不強迫 K、D 不可往下走，當日與回測同邏輯）
+            # 條件 5：還原月K的 K、D 近 6 個月內發生金叉且金叉後無死叉（不強迫 K、D 不可往下走，當日與回測同邏輯）
             # ------------------------------------------
             if not mk_gc_pass_vals[i]:
                 diag_arr[i] = str(mk_gc_diag_vals[i])
@@ -632,7 +632,7 @@ class MASqueezeBreakoutStrategy:
 
             pass_arr[i] = True
             diag_arr[i] = "✅ 全部通過"
-            if ign_score_arr[i] == 3:
+            if ign_score_arr[i] == 6:
                 ign_pass_arr[i] = True
 
         res["MA_Squeeze_Pass"] = pass_arr
