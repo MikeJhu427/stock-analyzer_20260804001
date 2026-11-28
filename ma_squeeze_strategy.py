@@ -54,6 +54,7 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "monthly_kd_n": 9,
     "monthly_kd_m1": 3,
     "monthly_kd_m2": 3,
+    "monthly_kd_gc_lookback_months": 3,
     "monthly_kd_flat_tol": 1e-6
 }
 
@@ -90,15 +91,21 @@ class MASqueezeBreakoutStrategy:
         df: pd.DataFrame,
         n: int = 9,
         m1: int = 3,
-        m2: int = 3
+        m2: int = 3,
+        gc_lookback_months: int = 3,
+        flat_tol: float = 1e-6
     ) -> pd.DataFrame:
         """
-        計算無未來函數（Point-in-Time）之還原月K KD(n, m1, m2)：
+        計算無未來函數（Point-in-Time）之還原月K KD(n, m1, m2) 與近 N 個月金叉濾網：
         - 若輸入 df 含 'Adj Close' 欄位，會先以 Adj Close / Close 比例還原 High/Low/Close；
           若無 'Adj Close'（yfinance auto_adjust=True 預設），則直接採用已還原之 OHLC。
         - 每個交易日 i 僅使用「過去已完成月份」加上「當月截至交易日 i 的累積高低與收盤價」，
           完全排除未來函數，確保當日判定與過去 30 日回測邏輯 100% 一致。
-        回傳含 SQ_MK、SQ_MD、SQ_Prev_MK、SQ_Prev_MD 之 DataFrame。
+        - 條件 5 規則：
+          1. 近 gc_lookback_months 個月內（含當月截至當日）還原月K之 K、D 曾發生金叉（K > D 且前月 K <= D）。
+          2. 金叉發生後至當日止不得出現死叉（每個後續月份至當日皆須維持 K > D）。
+          3. 金叉發生當月起至當日止，月 K 線只能往上走或走平（不得下彎，K_u >= K_{u-1} - flat_tol）。
+        回傳含 SQ_MK、SQ_MD、SQ_Prev_MK、SQ_Prev_MD、SQ_MK_GC_Pass、SQ_MK_GC_Diag 之 DataFrame。
         """
         idx_orig = df.index
         out = pd.DataFrame(index=idx_orig)
@@ -106,6 +113,8 @@ class MASqueezeBreakoutStrategy:
         out["SQ_MD"] = np.nan
         out["SQ_Prev_MK"] = np.nan
         out["SQ_Prev_MD"] = np.nan
+        out["SQ_MK_GC_Pass"] = False
+        out["SQ_MK_GC_Diag"] = "未過5:還原月KD樣本不足"
 
         if df is None or df.empty:
             return out
@@ -155,9 +164,11 @@ class MASqueezeBreakoutStrategy:
         m_k = m_rsv.ewm(com=m1 - 1, adjust=False).mean()
         m_d = m_k.ewm(com=m2 - 1, adjust=False).mean()
 
-        # 每個月份 m 對應「前一個已完成月份 (m-1)」的 K、D，以及「前 n-1 個已完成月份」的高低極值
-        prev_k_map = m_k.shift(1).to_dict()
-        prev_d_map = m_d.shift(1).to_dict()
+        # 每個月份 m 對應「前 1 ~ L 個已完成月份」的 K、D
+        L = max(1, int(gc_lookback_months))
+        lag_k_maps = {lag: m_k.shift(lag).to_dict() for lag in range(1, L + 1)}
+        lag_d_maps = {lag: m_d.shift(lag).to_dict() for lag in range(1, L + 1)}
+
         prev_low_map = m_agg["Low"].shift(1).rolling(window=max(1, n - 1), min_periods=1).min().to_dict()
         prev_high_map = m_agg["High"].shift(1).rolling(window=max(1, n - 1), min_periods=1).max().to_dict()
 
@@ -165,8 +176,8 @@ class MASqueezeBreakoutStrategy:
         mtd_high = work_m.groupby("YM")["High"].cummax().values
         mtd_low = work_m.groupby("YM")["Low"].cummin().values
 
-        prev_k_arr = np.array([prev_k_map.get(p, np.nan) for p in ym], dtype=float)
-        prev_d_arr = np.array([prev_d_map.get(p, np.nan) for p in ym], dtype=float)
+        prev_k_arr = np.array([lag_k_maps[1].get(p, np.nan) for p in ym], dtype=float)
+        prev_d_arr = np.array([lag_d_maps[1].get(p, np.nan) for p in ym], dtype=float)
         prev_low_arr = np.array([prev_low_map.get(p, np.nan) for p in ym], dtype=float)
         prev_high_arr = np.array([prev_high_map.get(p, np.nan) for p in ym], dtype=float)
 
@@ -179,10 +190,64 @@ class MASqueezeBreakoutStrategy:
         cur_mk = (1.0 - alpha_k) * prev_k_arr + alpha_k * rsv_pit
         cur_md = (1.0 - alpha_d) * prev_d_arr + alpha_d * cur_mk
 
+        # 組合每個交易日 i 的 (L + 1) 個月度 KD 序列：[M_{-L}, ..., M_{-1}, M_0(PIT)]
+        n_rows = len(df)
+        lag_k_arrs = {lag: np.array([lag_k_maps[lag].get(p, np.nan) for p in ym], dtype=float) for lag in range(1, L + 1)}
+        lag_d_arrs = {lag: np.array([lag_d_maps[lag].get(p, np.nan) for p in ym], dtype=float) for lag in range(1, L + 1)}
+
+        gc_pass_arr = np.zeros(n_rows, dtype=bool)
+        gc_diag_arr = np.full(n_rows, "未過5:還原月KD樣本不足", dtype=object)
+
+        for i in range(n_rows):
+            ks = [lag_k_arrs[lag][i] for lag in range(L, 0, -1)] + [cur_mk[i]]
+            ds = [lag_d_arrs[lag][i] for lag in range(L, 0, -1)] + [cur_md[i]]
+
+            if np.isnan(ks[-1]) or np.isnan(ds[-1]) or np.isnan(ks[-2]) or np.isnan(ds[-2]):
+                gc_diag_arr[i] = "未過5:還原月KD樣本不足"
+                continue
+
+            # 由最近月 M_0 往回找近 L 個月（u = L, L-1, ..., 1）最近一次金叉
+            gc_pos = None
+            for u in range(L, 0, -1):
+                if any(np.isnan([ks[u], ds[u], ks[u - 1], ds[u - 1]])):
+                    continue
+                if ks[u] > ds[u] and ks[u - 1] <= ds[u - 1]:
+                    gc_pos = u
+                    break
+
+            if gc_pos is None:
+                gc_diag_arr[i] = f"未過5:近{L}月還原月KD無金叉(月K:{ks[-1]:.1f},月D:{ds[-1]:.1f})"
+                continue
+
+            # 檢查金叉後至當日不可出現死叉（每個月份皆須維持 K > D）
+            has_death_cross = False
+            for u in range(gc_pos, L + 1):
+                if np.isnan(ks[u]) or np.isnan(ds[u]) or ks[u] <= ds[u]:
+                    has_death_cross = True
+                    break
+            if has_death_cross:
+                gc_diag_arr[i] = f"未過5:還原月KD金叉後死叉(月K:{ks[-1]:.1f},月D:{ds[-1]:.1f})"
+                continue
+
+            # 檢查金叉發生當月起至當日，月 K 只能往上走或走平（不得往下走）
+            k_turned_down = False
+            for u in range(gc_pos, L + 1):
+                if np.isnan(ks[u]) or np.isnan(ks[u - 1]) or ks[u] < ks[u - 1] - flat_tol:
+                    k_turned_down = True
+                    break
+            if k_turned_down:
+                gc_diag_arr[i] = f"未過5:還原月K金叉後下彎(月K:{ks[-1]:.1f}<-{ks[-2]:.1f})"
+                continue
+
+            gc_pass_arr[i] = True
+            gc_diag_arr[i] = "✅ 還原月KD符合"
+
         out["SQ_MK"] = cur_mk
         out["SQ_MD"] = cur_md
         out["SQ_Prev_MK"] = prev_k_arr
         out["SQ_Prev_MD"] = prev_d_arr
+        out["SQ_MK_GC_Pass"] = gc_pass_arr
+        out["SQ_MK_GC_Diag"] = gc_diag_arr
         return out
 
     @staticmethod
@@ -276,13 +341,12 @@ class MASqueezeBreakoutStrategy:
             work,
             n=int(cfg["monthly_kd_n"]),
             m1=int(cfg["monthly_kd_m1"]),
-            m2=int(cfg["monthly_kd_m2"])
+            m2=int(cfg["monthly_kd_m2"]),
+            gc_lookback_months=int(cfg["monthly_kd_gc_lookback_months"]),
+            flat_tol=float(cfg["monthly_kd_flat_tol"])
         )
-        mk_vals = mkd_df["SQ_MK"].astype(float).values
-        md_vals = mkd_df["SQ_MD"].astype(float).values
-        prev_mk_vals = mkd_df["SQ_Prev_MK"].astype(float).values
-        prev_md_vals = mkd_df["SQ_Prev_MD"].astype(float).values
-        mkd_tol = float(cfg["monthly_kd_flat_tol"])
+        mk_gc_pass_vals = mkd_df["SQ_MK_GC_Pass"].astype(bool).values
+        mk_gc_diag_vals = mkd_df["SQ_MK_GC_Diag"].astype(object).values
 
         sq_win = int(cfg["ma_squeeze_window"])
         max_spread_pct = float(cfg["ma_max_spread_pct"])
@@ -570,16 +634,10 @@ class MASqueezeBreakoutStrategy:
                 continue
 
             # ------------------------------------------
-            # 條件 5：還原月K的 K 線與 D 線皆只能往上走或走平（否則不算，回測同邏輯）
+            # 條件 5：還原月K的 K、D 近 3 個月內發生金叉、金叉後無死叉且月 K 不得往下走（當日與回測同邏輯）
             # ------------------------------------------
-            mk_i, md_i = mk_vals[i], md_vals[i]
-            pmk_i, pmd_i = prev_mk_vals[i], prev_md_vals[i]
-            if any(np.isnan([mk_i, md_i, pmk_i, pmd_i])):
-                diag_arr[i] = "未過5:還原月KD樣本不足"
-                continue
-
-            if not (mk_i >= pmk_i - mkd_tol and md_i >= pmd_i - mkd_tol):
-                diag_arr[i] = f"未過5:還原月KD下彎(月K:{mk_i:.1f}<-{pmk_i:.1f},月D:{md_i:.1f}<-{pmd_i:.1f})"
+            if not mk_gc_pass_vals[i]:
+                diag_arr[i] = str(mk_gc_diag_vals[i])
                 continue
 
             pass_arr[i] = True
