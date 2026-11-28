@@ -162,7 +162,7 @@ def _build_app_scan_columns(config_dict: dict, div_pairs: list, existing_cols=No
     if config_dict.get("enable_30d_backtest", False):
         base_cols.append('近30日觸發次數')
     base_cols.extend([
-        '演算法建議結果', '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
+        '演算法建議結果', msq.MA_SQUEEZE_LOOKBACK_COL, '均線最大最小差異百分比(%)', '均線糾結狀態', '短天期均線差異(%)', '短均線糾結狀態', '當日KD(K值)'
     ])
     base_cols.extend(core.ScanEngine.get_all_metric_keys())
     for col in msq.MA_SQUEEZE_COLUMNS:
@@ -918,15 +918,23 @@ elif selected_page == "🚀 全市場智慧掃描":
                                             pass_60m_adv = True
                                             adv_60m_data = triggered_rows.iloc[-1]
 
-                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or pass_ma_squeeze or force_pass:
+                        sq_prev5d_default = msq.MASqueezeBreakoutStrategy.count_lookback_passes(
+                            df, base_offset=config_dict["lookback_end"], lookback_days=5
+                        )
+
+                        if (best_row is not None and best_combined_score >= 0) or pass_60m_adv or pass_ma_squeeze or sq_prev5d_default > 0 or force_pass:
                             if best_row is None:
                                 if pass_ma_squeeze and sq_best_row is not None:
                                     best_row, best_offset, best_vol_mult = sq_best_row, sq_best_offset, sq_best_vol_mult
                                 else:
-                                    best_row = df.iloc[-1]
-                                    best_offset = 0
-                                    prev_v = df['Volume_Lots'].iloc[-2] if len(df) > 1 else np.nan
+                                    best_offset = config_dict["lookback_end"]
+                                    best_row = df.iloc[-1 - best_offset]
+                                    prev_v = df['Volume_Lots'].iloc[-2 - best_offset] if len(df) > best_offset + 1 else np.nan
                                     best_vol_mult = (best_row['Volume_Lots'] / prev_v) if pd.notna(prev_v) and prev_v > 0 else 0.0
+
+                            sq_prev5d_count = msq.MASqueezeBreakoutStrategy.count_lookback_passes(
+                                df, base_offset=best_offset, lookback_days=5
+                            )
 
                             count_30d = 0
                             if config_dict["enable_30d_backtest"]:
@@ -948,6 +956,7 @@ elif selected_page == "🚀 全市場智慧掃描":
                                 "股票代號": ticker.split('.')[0], "股票名稱": stock_dict[ticker],
                                 "觸發日期": best_row.name.strftime('%Y-%m-%d'),
                                 "近30日觸發次數": count_30d if config_dict["enable_30d_backtest"] else "-",
+                                msq.MA_SQUEEZE_LOOKBACK_COL: sq_prev5d_count,
                                 "當日收盤": round(float(best_row['Close']), 2), "今日漲跌幅(%)": round(float(best_row['Pct_Change']), 2),
                                 "當日成交量(張)": int(best_row['Volume_Lots']), "量增倍數": round(best_vol_mult, 2), "月均量(張)": int(best_row['Vol_MA20']),
                                 "DIF": round(float(best_row['MACD']), 3), "當日KD(K值)": round(float(best_row['K']), 2),

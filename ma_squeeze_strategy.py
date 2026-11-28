@@ -4,6 +4,7 @@ from typing import Dict, Optional
 import strategy_core as core
 
 MA_SQUEEZE_TAG = "均線壓縮一陽穿多線"
+MA_SQUEEZE_LOOKBACK_COL = "均線壓縮一陽穿多線回測滿足次數"
 
 MA_SQUEEZE_COLUMNS = [
     "均線壓縮一陽穿多線",
@@ -413,6 +414,27 @@ class MASqueezeBreakoutStrategy:
             "壓縮布林帶寬(%)": round(float(bbw), 2) if pd.notna(bbw) else np.nan,
             "突破量比(5MA)": round(float(vol_m), 2) if pd.notna(vol_m) else np.nan
         }
+
+    @staticmethod
+    def count_lookback_passes(
+        df: Optional[pd.DataFrame],
+        base_offset: int = 0,
+        lookback_days: int = 5
+    ) -> int:
+        """
+        統計基準日（不含基準日當天）往前 lookback_days 個交易日內，
+        符合「均線壓縮一陽穿多線」(MA_Squeeze_Pass == True) 的總次數。
+        例如 base_offset=0、lookback_days=5 時，檢查 iloc[-6:-1]（前 1~5 個交易日）。
+        """
+        if df is None or df.empty or "MA_Squeeze_Pass" not in df.columns:
+            return 0
+        n = len(df)
+        end_pos = n - 1 - int(base_offset)
+        if end_pos <= 0:
+            return 0
+        start_pos = max(0, end_pos - int(lookback_days))
+        seg = df["MA_Squeeze_Pass"].iloc[start_pos:end_pos]
+        return int(seg.fillna(False).astype(bool).sum())
 
     @staticmethod
     def get_tags(item: Dict) -> list:
