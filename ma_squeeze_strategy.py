@@ -104,7 +104,7 @@ class MASqueezeBreakoutStrategy:
         - 條件 5 規則：
           1. 近 gc_lookback_months 個月內（含當月截至當日）還原月K之 K、D 曾發生金叉（K > D 且前月 K <= D）。
           2. 金叉發生後至當日止不得出現死叉（每個後續月份至當日皆須維持 K > D）。
-          3. 金叉發生當月起至當日止，月 K 線只能往上走或走平（不得下彎，K_u >= K_{u-1} - flat_tol）。
+          3. 不強迫金叉後月 K 與月 D 不能往下走（只要未發生死叉即算符合）。
         回傳含 SQ_MK、SQ_MD、SQ_Prev_MK、SQ_Prev_MD、SQ_MK_GC_Pass、SQ_MK_GC_Diag 之 DataFrame。
         """
         idx_orig = df.index
@@ -227,16 +227,6 @@ class MASqueezeBreakoutStrategy:
                     break
             if has_death_cross:
                 gc_diag_arr[i] = f"未過5:還原月KD金叉後死叉(月K:{ks[-1]:.1f},月D:{ds[-1]:.1f})"
-                continue
-
-            # 檢查金叉發生當月起至當日，月 K 只能往上走或走平（不得往下走）
-            k_turned_down = False
-            for u in range(gc_pos, L + 1):
-                if np.isnan(ks[u]) or np.isnan(ks[u - 1]) or ks[u] < ks[u - 1] - flat_tol:
-                    k_turned_down = True
-                    break
-            if k_turned_down:
-                gc_diag_arr[i] = f"未過5:還原月K金叉後下彎(月K:{ks[-1]:.1f}<-{ks[-2]:.1f})"
                 continue
 
             gc_pass_arr[i] = True
@@ -634,7 +624,7 @@ class MASqueezeBreakoutStrategy:
                 continue
 
             # ------------------------------------------
-            # 條件 5：還原月K的 K、D 近 3 個月內發生金叉、金叉後無死叉且月 K 不得往下走（當日與回測同邏輯）
+            # 條件 5：還原月K的 K、D 近 3 個月內發生金叉且金叉後無死叉（不強迫 K、D 不可往下走，當日與回測同邏輯）
             # ------------------------------------------
             if not mk_gc_pass_vals[i]:
                 diag_arr[i] = str(mk_gc_diag_vals[i])
