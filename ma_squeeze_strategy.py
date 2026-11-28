@@ -92,7 +92,7 @@ class MASqueezeBreakoutStrategy:
         n: int = 9,
         m1: int = 3,
         m2: int = 3,
-        gc_lookback_months: int = 3,
+        gc_lookback_months: int = 12,
         flat_tol: float = 1e-6
     ) -> pd.DataFrame:
         """
@@ -632,7 +632,7 @@ class MASqueezeBreakoutStrategy:
 
             pass_arr[i] = True
             diag_arr[i] = "✅ 全部通過"
-            if ign_score_arr[i] == 12:
+            if ign_score_arr[i] == 3:
                 ign_pass_arr[i] = True
 
         res["MA_Squeeze_Pass"] = pass_arr
