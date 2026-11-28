@@ -571,7 +571,7 @@ def run_full_scan():
     max_older_w = max(pair[1] for pair in div_pairs)
     extra_buffer_days = 30 if CONFIG["enable_30d_backtest"] else 0
     total_needed_days = CONFIG["lookback_start"] + max_older_w + CONFIG["pivot_left"] + 70 + extra_buffer_days
-    dl_period = "3mo" if total_needed_days <= 60 else "6mo" if total_needed_days <= 120 else "1y"
+    dl_period = "2y"  # 確保還原月K KD(9,3,3) 與 30 日回測具備完整 2 年收斂樣本（對齊 app.py）
     
     common_stock_set = set(core.BearMarketSafeHavenStrategy.filter_common_stocks(stock_dict).keys())
     plan_b_daily_cache = {}

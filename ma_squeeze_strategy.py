@@ -50,7 +50,11 @@ MA_SQUEEZE_DEFAULT_PARAMS = {
     "ignition_max_upper_shadow_pct": 1.0,
     "ignition_high_lookback": 60,
     "ignition_min_kd_spread": 12.0,
-    "ignition_min_macd_hist_pct": 0.30
+    "ignition_min_macd_hist_pct": 0.30,
+    "monthly_kd_n": 9,
+    "monthly_kd_m1": 3,
+    "monthly_kd_m2": 3,
+    "monthly_kd_flat_tol": 1e-6
 }
 
 
@@ -80,6 +84,106 @@ class MASqueezeBreakoutStrategy:
         if len(non_zero) < 2:
             return 0
         return int(np.sum(non_zero[1:] != non_zero[:-1]))
+
+    @staticmethod
+    def _compute_monthly_kd_point_in_time(
+        df: pd.DataFrame,
+        n: int = 9,
+        m1: int = 3,
+        m2: int = 3
+    ) -> pd.DataFrame:
+        """
+        計算無未來函數（Point-in-Time）之還原月K KD(n, m1, m2)：
+        - 若輸入 df 含 'Adj Close' 欄位，會先以 Adj Close / Close 比例還原 High/Low/Close；
+          若無 'Adj Close'（yfinance auto_adjust=True 預設），則直接採用已還原之 OHLC。
+        - 每個交易日 i 僅使用「過去已完成月份」加上「當月截至交易日 i 的累積高低與收盤價」，
+          完全排除未來函數，確保當日判定與過去 30 日回測邏輯 100% 一致。
+        回傳含 SQ_MK、SQ_MD、SQ_Prev_MK、SQ_Prev_MD 之 DataFrame。
+        """
+        idx_orig = df.index
+        out = pd.DataFrame(index=idx_orig)
+        out["SQ_MK"] = np.nan
+        out["SQ_MD"] = np.nan
+        out["SQ_Prev_MK"] = np.nan
+        out["SQ_Prev_MD"] = np.nan
+
+        if df is None or df.empty:
+            return out
+
+        dt_idx = pd.to_datetime(idx_orig)
+        try:
+            if dt_idx.tz is not None:
+                dt_idx = dt_idx.tz_convert("Asia/Taipei").tz_localize(None)
+        except Exception:
+            if dt_idx.tz is not None:
+                dt_idx = dt_idx.tz_localize(None)
+
+        high_s = pd.to_numeric(df["High"], errors="coerce").astype(float).values.copy()
+        low_s = pd.to_numeric(df["Low"], errors="coerce").astype(float).values.copy()
+        close_s = pd.to_numeric(df["Close"], errors="coerce").astype(float).values.copy()
+
+        # 若未預先 auto_adjust 且具備 Adj Close，自動進行除權息還原
+        if "Adj Close" in df.columns:
+            adj_c = pd.to_numeric(df["Adj Close"], errors="coerce").astype(float).values
+            valid_ratio = (~np.isnan(adj_c)) & (~np.isnan(close_s)) & (close_s > 0)
+            ratio = np.ones_like(close_s)
+            ratio[valid_ratio] = adj_c[valid_ratio] / close_s[valid_ratio]
+            high_s = high_s * ratio
+            low_s = low_s * ratio
+            close_s = close_s * ratio
+
+        ym = dt_idx.to_period("M")
+        work_m = pd.DataFrame({
+            "High": high_s,
+            "Low": low_s,
+            "Close": close_s,
+            "YM": ym
+        })
+
+        # 依月分彙整各月完整 OHLC（用以取得各已完成月份的基準月K與月KD）
+        m_agg = work_m.groupby("YM", sort=True).agg(
+            High=("High", "max"),
+            Low=("Low", "min"),
+            Close=("Close", "last")
+        )
+        if len(m_agg) < 2:
+            return out
+
+        m_low_min = m_agg["Low"].rolling(window=n, min_periods=1).min()
+        m_high_max = m_agg["High"].rolling(window=n, min_periods=1).max()
+        m_rsv = (m_agg["Close"] - m_low_min) / (m_high_max - m_low_min + 1e-8) * 100.0
+        m_k = m_rsv.ewm(com=m1 - 1, adjust=False).mean()
+        m_d = m_k.ewm(com=m2 - 1, adjust=False).mean()
+
+        # 每個月份 m 對應「前一個已完成月份 (m-1)」的 K、D，以及「前 n-1 個已完成月份」的高低極值
+        prev_k_map = m_k.shift(1).to_dict()
+        prev_d_map = m_d.shift(1).to_dict()
+        prev_low_map = m_agg["Low"].shift(1).rolling(window=max(1, n - 1), min_periods=1).min().to_dict()
+        prev_high_map = m_agg["High"].shift(1).rolling(window=max(1, n - 1), min_periods=1).max().to_dict()
+
+        # 當月截至當日 i 的累積最高價與最低價（無未來資料）
+        mtd_high = work_m.groupby("YM")["High"].cummax().values
+        mtd_low = work_m.groupby("YM")["Low"].cummin().values
+
+        prev_k_arr = np.array([prev_k_map.get(p, np.nan) for p in ym], dtype=float)
+        prev_d_arr = np.array([prev_d_map.get(p, np.nan) for p in ym], dtype=float)
+        prev_low_arr = np.array([prev_low_map.get(p, np.nan) for p in ym], dtype=float)
+        prev_high_arr = np.array([prev_high_map.get(p, np.nan) for p in ym], dtype=float)
+
+        low_nm = np.fmin(prev_low_arr, mtd_low)
+        high_nm = np.fmax(prev_high_arr, mtd_high)
+        rsv_pit = (close_s - low_nm) / (high_nm - low_nm + 1e-8) * 100.0
+
+        alpha_k = 1.0 / float(m1)
+        alpha_d = 1.0 / float(m2)
+        cur_mk = (1.0 - alpha_k) * prev_k_arr + alpha_k * rsv_pit
+        cur_md = (1.0 - alpha_d) * prev_d_arr + alpha_d * cur_mk
+
+        out["SQ_MK"] = cur_mk
+        out["SQ_MD"] = cur_md
+        out["SQ_Prev_MK"] = prev_k_arr
+        out["SQ_Prev_MD"] = prev_d_arr
+        return out
 
     @staticmethod
     def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -167,6 +271,18 @@ class MASqueezeBreakoutStrategy:
         k_vals = work["K"].astype(float).values
         d_vals = work["D"].astype(float).values
         macd_hist = work["MACD_Hist"].astype(float).values
+
+        mkd_df = MASqueezeBreakoutStrategy._compute_monthly_kd_point_in_time(
+            work,
+            n=int(cfg["monthly_kd_n"]),
+            m1=int(cfg["monthly_kd_m1"]),
+            m2=int(cfg["monthly_kd_m2"])
+        )
+        mk_vals = mkd_df["SQ_MK"].astype(float).values
+        md_vals = mkd_df["SQ_MD"].astype(float).values
+        prev_mk_vals = mkd_df["SQ_Prev_MK"].astype(float).values
+        prev_md_vals = mkd_df["SQ_Prev_MD"].astype(float).values
+        mkd_tol = float(cfg["monthly_kd_flat_tol"])
 
         sq_win = int(cfg["ma_squeeze_window"])
         max_spread_pct = float(cfg["ma_max_spread_pct"])
@@ -451,6 +567,19 @@ class MASqueezeBreakoutStrategy:
 
             if cur_hist <= prev_hist:
                 diag_arr[i] = f"未過4:MACD未翻揚({prev_hist:.3f}->{cur_hist:.3f})"
+                continue
+
+            # ------------------------------------------
+            # 條件 5：還原月K的 K 線與 D 線皆只能往上走或走平（否則不算，回測同邏輯）
+            # ------------------------------------------
+            mk_i, md_i = mk_vals[i], md_vals[i]
+            pmk_i, pmd_i = prev_mk_vals[i], prev_md_vals[i]
+            if any(np.isnan([mk_i, md_i, pmk_i, pmd_i])):
+                diag_arr[i] = "未過5:還原月KD樣本不足"
+                continue
+
+            if not (mk_i >= pmk_i - mkd_tol and md_i >= pmd_i - mkd_tol):
+                diag_arr[i] = f"未過5:還原月KD下彎(月K:{mk_i:.1f}<-{pmk_i:.1f},月D:{md_i:.1f}<-{pmd_i:.1f})"
                 continue
 
             pass_arr[i] = True
